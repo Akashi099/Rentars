@@ -1,10 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import { AlertCircle, CheckCircle2, XCircle, AlertTriangle, Loader2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, XCircle, Loader2 } from 'lucide-react';
 import { normaliseStatus, TENANT_TRANSITIONS } from '@/types/booking';
 import type { Booking } from '@/types/booking';
 import { useBookingActions } from '@/hooks/useBookingActions';
+import DisputeButton from './DisputeButton';
+import DisputeModal from './DisputeModal';
 
 interface Props {
   booking: Booking;
@@ -23,8 +25,7 @@ interface Props {
  *   Disputed  → (no actions — awaiting admin resolution)
  */
 export default function BookingLifecycleActions({ booking, onBookingUpdated }: Props) {
-  const [disputeReason, setDisputeReason] = useState('');
-  const [showDisputeForm, setShowDisputeForm] = useState(false);
+  const [isDisputeModalOpen, setIsDisputeModalOpen] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
 
   const status      = normaliseStatus(booking.status);
@@ -33,7 +34,7 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
   const { pendingAction, actionError, confirm, complete, cancel, dispute, clearError } =
     useBookingActions(booking.id, (updated) => {
       onBookingUpdated(updated);
-      setShowDisputeForm(false);
+      setIsDisputeModalOpen(false);
       setShowCancelConfirm(false);
     });
 
@@ -108,27 +109,22 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
         )}
 
         {/* Dispute */}
-        {transitions.includes('dispute') && !showDisputeForm && (
-          <button
-            type="button"
-            disabled={isLoading}
-            onClick={() => { setShowDisputeForm(true); setShowCancelConfirm(false); clearError(); }}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-400
-              text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40
-              text-sm font-medium hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50 transition
-              focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
-          >
-            <AlertTriangle size={15} aria-hidden="true" />
-            Open dispute
-          </button>
-        )}
+        <DisputeButton
+          booking={booking}
+          disabled={isLoading}
+          onClick={() => {
+            setIsDisputeModalOpen(true);
+            setShowCancelConfirm(false);
+            clearError();
+          }}
+        />
 
         {/* Cancel */}
         {transitions.includes('cancel') && !showCancelConfirm && (
           <button
             type="button"
             disabled={isLoading}
-            onClick={() => { setShowCancelConfirm(true); setShowDisputeForm(false); clearError(); }}
+            onClick={() => { setShowCancelConfirm(true); setIsDisputeModalOpen(false); clearError(); }}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-300
               dark:border-gray-600 text-gray-700 dark:text-gray-300
               text-sm font-medium hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50 transition
@@ -176,53 +172,19 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
         </div>
       )}
 
-      {/* Dispute form inline */}
-      {showDisputeForm && (
-        <div className="p-4 rounded-lg border border-amber-200 dark:border-amber-800
-          bg-amber-50 dark:bg-amber-950/30 space-y-3">
-          <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
-            Open a dispute
-          </p>
-          <p className="text-xs text-amber-700 dark:text-amber-400">
-            Describe the issue. Your escrow funds will be held until an admin reviews and resolves
-            the dispute.
-          </p>
-          <textarea
-            rows={3}
-            value={disputeReason}
-            onChange={(e) => setDisputeReason(e.target.value)}
-            placeholder="Describe the issue with this booking…"
-            aria-label="Dispute reason"
-            className="w-full border border-amber-300 dark:border-amber-700 rounded-lg px-3 py-2 text-sm
-              bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 resize-none
-              focus:outline-none focus:ring-2 focus:ring-amber-500"
-          />
-          <div className="flex gap-2">
-            <button
-              type="button"
-              disabled={isLoading || !disputeReason.trim()}
-              onClick={handleDispute}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-600 text-white
-                text-sm font-medium hover:bg-amber-700 disabled:opacity-50 transition
-                focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
-            >
-              {pendingAction === 'dispute' ? (
-                <Loader2 size={14} className="animate-spin" aria-hidden="true" />
-              ) : null}
-              Submit dispute
-            </button>
-            <button
-              type="button"
-              onClick={() => { setShowDisputeForm(false); setDisputeReason(''); }}
-              className="px-4 py-2 rounded-lg border border-amber-300 dark:border-amber-700 text-sm
-                text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40
-                focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Dispute Modal */}
+      <DisputeModal
+        isOpen={isDisputeModalOpen}
+        onClose={() => setIsDisputeModalOpen(false)}
+        onSubmit={async (reason) => {
+          const res = await dispute(reason);
+          return res !== null;
+        }}
+        bookingId={booking.id}
+        isSubmitting={pendingAction === 'dispute'}
+        error={actionError}
+        onClearError={clearError}
+      />
     </div>
   );
 }
