@@ -77,6 +77,11 @@ const envSchema = z.object({
   HCAPTCHA_SECRET_KEY: z.string().optional(),
   HCAPTCHA_ENABLED: z.string().optional(),
 
+  // ── Email webhook ─────────────────────────────────────────────────────────
+  // HMAC-SHA256 secret used to verify inbound delivery-status webhooks from
+  // the SMTP/ESP provider.  When unset all webhook requests are rejected.
+  EMAIL_WEBHOOK_SECRET: z.string().optional(),
+
   // ── Booking rate limits ────────────────────────────────────────────────────
   // Per-user rate limit window for booking creation, in milliseconds.
   // Default: 60 000 ms (1 minute).
