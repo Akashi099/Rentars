@@ -47,7 +47,11 @@ export type AdminScope =
   | 'admin:ratelimits:read'
   // Refund / financial
   | 'admin:refunds:approve'    // HIGH-RISK: financial action, dual-approval required
-  | 'admin:reconciliation:read';
+  | 'admin:reconciliation:read'
+  // Support cases — Issue #847
+  | 'admin:support:read'       // view cases, notes, related entities
+  | 'admin:support:manage'     // update status, assign, add notes
+  | 'admin:support:audit:read';// view immutable audit trail for a case
 
 // ── Scopes that require dual approval ────────────────────────────────────────
 
@@ -79,6 +83,9 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:ratelimits:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:support:read',
+    'admin:support:manage',
+    'admin:support:audit:read',
   ],
   moderator: [
     'admin:dashboard:read',
@@ -92,6 +99,9 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:disputes:read',
     'admin:disputes:resolve',
     'admin:audit:read',
+    'admin:support:read',
+    'admin:support:manage',
+    'admin:support:audit:read',
   ],
   support: [
     'admin:users:read',
@@ -100,6 +110,9 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:disputes:read',
     'admin:ratelimits:read',
     'admin:audit:read',
+    'admin:support:read',
+    'admin:support:manage',
+    'admin:support:audit:read',
   ],
   finance: [
     'admin:bookings:read',
@@ -107,6 +120,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:refunds:approve',
     'admin:reconciliation:read',
     'admin:audit:read',
+    'admin:support:read',
   ],
 };
 

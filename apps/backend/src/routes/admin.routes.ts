@@ -113,4 +113,29 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
+// ── Support cases (staff view) ────────────────────────────────────────────────
+// Scope: admin:support:read    → admin, moderator, support, finance
+// Scope: admin:support:manage  → admin, moderator, support
+// Scope: admin:support:audit:read → admin, moderator, support
+import {
+  listStaffCasesHandler,
+  getStaffCaseHandler,
+  updateCaseStatusHandler,
+  assignCaseHandler,
+  addStaffNoteHandler,
+  getStaffCaseNotesHandler,
+  getCaseAuditHandler,
+} from '@/controllers/supportCase.controller.js';
+
+// List and read
+router.get('/support/cases',              requireScope('admin:support:read'),       listStaffCasesHandler);
+router.get('/support/cases/:id',          requireScope('admin:support:read'),       getStaffCaseHandler);
+router.get('/support/cases/:id/notes',    requireScope('admin:support:read'),       getStaffCaseNotesHandler);
+// Manage
+router.patch('/support/cases/:id/status', requireScope('admin:support:manage'),     updateCaseStatusHandler);
+router.post('/support/cases/:id/assign',  requireScope('admin:support:manage'),     assignCaseHandler);
+router.post('/support/cases/:id/notes',   requireScope('admin:support:manage'),     addStaffNoteHandler);
+// Audit trail
+router.get('/support/cases/:id/audit',   requireScope('admin:support:audit:read'), getCaseAuditHandler);
+
 export default router;
