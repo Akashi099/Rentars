@@ -6,9 +6,13 @@ import {
   getNotifications,
   getNotificationsCursor,
   getPreferences,
+  getUnreadCount,
   markAllAsRead,
   markAsRead,
+  bulkMarkAsRead,
   updatePreferences,
+  type NotificationCategory,
+  VALID_NOTIFICATION_CATEGORIES,
 } from '../services/notification.service.js';
 import {
   type PushSubscription,
@@ -25,7 +29,90 @@ export async function listNotifications(req: AuthRequest, res: Response): Promis
   }
 
   const pagination = (req as AuthRequest & { parsedPagination?: { page: number; pageSize: number } }).parsedPagination;
-  const result = await getNotifications(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20);
+
+  // Optional category filter from query string.
+  const categoryParam = typeof req.query.category === 'string' ? req.query.category : null;
+  const category: NotificationCategory | null =
+    categoryParam && VALID_NOTIFICATION_CATEGORIES.includes(categoryParam as NotificationCategory)
+      ? (categoryParam as NotificationCategory)
+      : null;
+
+  const result = await getNotifications(userId, pagination?.page ?? 1, pagination?.pageSize ?? 20, category);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/notifications/cursor
+ * Cursor-based paginated list with optional category filter.
+ */
+export async function listNotificationsCursorHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
+  const limitParam = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 20;
+  const limit = Number.isFinite(limitParam) ? limitParam : 20;
+
+  // Optional category filter.
+  const categoryParam = typeof req.query.category === 'string' ? req.query.category : null;
+  const category: NotificationCategory | null =
+    categoryParam && VALID_NOTIFICATION_CATEGORIES.includes(categoryParam as NotificationCategory)
+      ? (categoryParam as NotificationCategory)
+      : null;
+
+  const result = await getNotificationsCursor(userId, cursor, limit, category);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/notifications/unread-count
+ * Returns the count of unread notifications for the authenticated user.
+ */
+export async function unreadCountHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await getUnreadCount(userId);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ unread: result.data });
+}
+
+/**
+ * POST /api/v1/notifications/bulk-read
+ * Mark specific notification IDs as read.  The user_id scope ensures
+ * authorization — a user can only mark their own notifications.
+ */
+export async function bulkReadNotifications(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { notificationIds } = req.body as { notificationIds: string[] };
+  if (!Array.isArray(notificationIds) || notificationIds.length === 0) {
+    res.status(400).json({ error: 'notificationIds must be a non-empty array' });
+    return;
+  }
+
+  const result = await bulkMarkAsRead(userId, notificationIds);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
