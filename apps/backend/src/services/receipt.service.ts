@@ -49,6 +49,14 @@ export interface ReceiptData {
   escrowId?:       string;
   onChainId?:      number;
   createdAt:       string;
+  /**
+   * Display-currency fields — informational only, never used for settlement.
+   * See: docs/I18N_CURRENCY_POLICY.md §3
+   */
+  displayCurrency?: string;        // ISO 4217 code, e.g. "EUR"
+  displayAmount?:   number | null; // converted amount at booking time
+  rateTimestampMs?: number;        // Unix ms when rate was fetched
+  rateStale?:       boolean;       // whether the rate was stale at booking time
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -128,6 +136,14 @@ export async function fetchReceiptData(
     tenantEmail = (userResult.data   as { email?: string }         | null)?.email         ?? undefined;
   }
 
+  // Retrieve display-currency snapshot stored at booking time (informational only)
+  const bookingRow = b as typeof b & {
+    display_currency?: string | null;
+    display_amount?: number | null;
+    rate_timestamp_ms?: number | null;
+    rate_stale?: boolean | null;
+  };
+
   return {
     success: true,
     data: {
@@ -148,6 +164,10 @@ export async function fetchReceiptData(
       escrowId:    b.escrow_id,
       onChainId:   b.on_chain_id,
       createdAt:   b.created_at,
+      displayCurrency: bookingRow.display_currency ?? undefined,
+      displayAmount:   bookingRow.display_amount   ?? null,
+      rateTimestampMs: bookingRow.rate_timestamp_ms ?? undefined,
+      rateStale:       bookingRow.rate_stale        ?? undefined,
     },
   };
 }
@@ -251,6 +271,36 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
 
   item('Total', `${data.total.toFixed(2)} USDC`, true, BLUE);
   y += 12;
+
+  // ── Display currency conversion note (informational only) ────────────────
+  if (data.displayCurrency && data.displayCurrency !== 'USD' && data.displayAmount != null) {
+    const rateLabel = data.rateTimestampMs
+      ? new Date(data.rateTimestampMs).toUTCString()
+      : 'unknown';
+    const staleNote = data.rateStale ? ' (rate may be outdated)' : '';
+    pdf.hline(ML, PdfBuilder.PAGE_HEIGHT - y, W, LINE);
+    y += 10;
+    pdf.text('Display Currency (informational only)', ML, y, { size: 9, bold: true, colour: DARK });
+    y += 14;
+    pdf.text('Settlement amount', ML, y,           { size: 7, colour: MUTED });
+    pdf.text(`${data.total.toFixed(2)} USDC`,   ML + W - 120, y, { size: 8, colour: DARK, width: 120, align: 'right' });
+    y += 12;
+    const dispFormatted = new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: data.displayCurrency,
+    }).format(data.displayAmount);
+    pdf.text(`Approx. ${data.displayCurrency} amount`, ML, y,           { size: 7, colour: MUTED });
+    pdf.text(`${dispFormatted}${staleNote}`,            ML + W - 120, y, { size: 8, colour: AMBER, width: 120, align: 'right' });
+    y += 12;
+    pdf.text('Rate timestamp', ML, y,       { size: 7, colour: MUTED });
+    pdf.text(rateLabel,        ML, y + 10,  { size: 7, colour: MUTED });
+    y += 22;
+    pdf.text(
+      'Prices shown in a local currency are estimates only. "USD $" is not guaranteed.',
+      ML, y, { size: 7, colour: MUTED },
+    );
+    y += 12;
+  }
 
   // ── Blockchain reference ─────────────────────────────────────────────────
   if (data.escrowId || data.onChainId !== undefined) {
