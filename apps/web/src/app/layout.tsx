@@ -5,6 +5,7 @@ import { AuthProvider } from '@/hooks/useUserRole';
 import { Navbar } from '@/components/layout/Navbar';
 import { I18nProvider } from '@/lib/i18n/context';
 import { OfflineBanner } from '@/components/shared/OfflineBanner';
+import { WebVitalsReporter } from '@/components/shared/WebVitalsReporter';
 import { isValidLocale, DEFAULT_LOCALE, LOCALE_COOKIE, type Locale } from '@/lib/i18n/config';
 import { WalletProvider } from '@/context/WalletContext';
 import './globals.css';
@@ -66,6 +67,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <I18nProvider initialLocale={initialLocale}>
         <AuthProvider>
           <WalletProvider>
+            <WebVitalsReporter />
             <OfflineBanner />
             <Navbar />
             <main id="main-content" tabIndex={-1}>

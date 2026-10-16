@@ -30,20 +30,60 @@ export function toHealthStatus(result: PromiseSettledResult<boolean | null>): He
 }
 
 /**
- * Detailed health check endpoint that verifies:
- * - API is running
- * - Database connectivity
- * - Redis connectivity (if configured)
- * - Blockchain RPC status
- *
- * Each dependency is probed concurrently with a bounded timeout. Returns
- * HTTP 503 with status "degraded" if any configured dependency is down.
+ * GET /health — lightweight liveness probe.
+ * 
+ * Returns 200 if the process is running and can handle HTTP requests.
+ * Does NOT check dependencies (database, Redis, RPC) — use /health/ready for that.
+ * 
+ * Use this for:
+ * - Kubernetes livenessProbe
+ * - Load balancer health checks that only care if the process is alive
+ * - Fast smoke tests immediately after deployment
  */
-router.get('/health', async (_req: Request, res: Response) => {
+router.get('/health', (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'Rentars API 🚀',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * GET /health/ready — dependency-aware readiness probe.
+ * 
+ * Verifies:
+ * - Database connectivity and schema compatibility
+ * - Redis connectivity (if configured)
+ * - Blockchain RPC status (if configured)
+ *
+ * Each dependency is probed concurrently with a bounded timeout.
+ * Returns HTTP 503 if any required dependency is unavailable.
+ * 
+ * Use this for:
+ * - Kubernetes readinessProbe
+ * - Post-deploy verification that all dependencies are healthy
+ * - Monitoring alerts for degraded service
+ */
+router.get('/health/ready', async (_req: Request, res: Response) => {
+  const PROBE_TIMEOUT_MS = 5000;
+
+  const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error('Probe timeout')), timeoutMs)
+      ),
+    ]);
+  };
+
   const [databaseResult, redisResult, blockchainResult] = await Promise.allSettled([
-    pingDatabase(),
-    process.env.REDIS_URL ? pingRedis() : Promise.resolve(null),
-    process.env.STELLAR_RPC_URL ? getRpcHealth() : Promise.resolve(null),
+    withTimeout(pingDatabase(), PROBE_TIMEOUT_MS),
+    process.env.REDIS_URL
+      ? withTimeout(pingRedis(), PROBE_TIMEOUT_MS)
+      : Promise.resolve(null),
+    process.env.STELLAR_RPC_URL
+      ? withTimeout(getRpcHealth(), PROBE_TIMEOUT_MS)
+      : Promise.resolve(null),
   ]);
 
   const checks: Record<'database' | 'redis' | 'blockchain', HealthStatus> = {
@@ -52,10 +92,12 @@ router.get('/health', async (_req: Request, res: Response) => {
     blockchain: toHealthStatus(blockchainResult),
   };
 
-  const degraded = Object.values(checks).some((check) => check === 'error');
+  // Database is always required; others are optional
+  const notReady = checks.database === 'error' ||
+    (process.env.REDIS_URL && checks.redis === 'error');
 
-  res.status(degraded ? 503 : 200).json({
-    status: degraded ? 'degraded' : 'ok',
+  res.status(notReady ? 503 : 200).json({
+    status: notReady ? 'not_ready' : 'ready',
     service: 'Rentars API 🚀',
     timestamp: new Date().toISOString(),
     checks,
