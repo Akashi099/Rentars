@@ -1,6 +1,6 @@
 name: Bug report
 description: Something is broken or behaving incorrectly.
-labels: [bug, triage]
+labels: [bug, "status:triage", "owner:unassigned"]
 body:
   - type: markdown
     attributes:

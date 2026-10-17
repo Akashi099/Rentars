@@ -1,6 +1,6 @@
 name: Engineering task / chore
 description: Refactor, dependency upgrade, technical debt, or internal improvement.
-labels: [chore, triage]
+labels: [chore, "status:triage", "owner:unassigned"]
 body:
   - type: dropdown
     id: area
