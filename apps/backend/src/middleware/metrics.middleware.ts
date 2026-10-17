@@ -322,6 +322,27 @@ export const blockchainRpcDurationSeconds = createHistogram(
   [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
 );
 
+// ── Database domain ───────────────────────────────────────────────────────────
+
+/**
+ * Database query duration.
+ * Labels: operation, outcome (success|error|timeout)
+ */
+export const dbQueryDurationSeconds = createHistogram(
+  'db_query_duration_seconds',
+  'Database query duration in seconds, labelled by operation and outcome.',
+  [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+);
+
+/**
+ * Queries exceeding the slow-query threshold.
+ * Labels: operation
+ */
+export const dbSlowQueriesTotal = createCounter(
+  'db_slow_queries_total',
+  'Database queries exceeding the slow-query threshold, labelled by operation.',
+);
+
 // ── Auth domain ───────────────────────────────────────────────────────────────
 
 /**
