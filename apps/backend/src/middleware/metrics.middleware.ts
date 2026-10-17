@@ -343,6 +343,17 @@ export const dbSlowQueriesTotal = createCounter(
   'Database queries exceeding the slow-query threshold, labelled by operation.',
 );
 
+// ── Cache domain ──────────────────────────────────────────────────────────────
+
+/**
+ * Cache operations.
+ * Labels: result (hit|miss|error), domain (e.g. cache)
+ */
+export const cacheOperationsTotal = createCounter(
+  'cache_operations_total',
+  'Redis cache operations, labelled by result (hit|miss|error) and domain.',
+);
+
 // ── Auth domain ───────────────────────────────────────────────────────────────
 
 /**
