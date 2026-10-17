@@ -515,6 +515,74 @@ jobs:
             apps/web/test-results/
           retention-days: 14
 
+  # ─── Job 7b: Visual regression (#828) ───────────────────────────────────────
+  # Captures deterministic desktop + mobile baselines for the critical routes
+  # (home, search, property detail, dashboard, booking, auth, error) and diffs
+  # them on pull requests. Volatile content (maps, charts, timestamps, wallet
+  # addresses) is masked in apps/web/e2e/visual-regression.spec.ts so only
+  # real layout regressions — clipping, overlap, missing controls — are reported.
+  #
+  # Baseline maintenance is documented in
+  # apps/web/e2e/VISUAL_REGRESSION.md and reviewed through pull requests.
+  #
+  # Local reproduction:
+  #   cd apps/web
+  #   yarn playwright test e2e/visual-regression.spec.ts --project=chromium
+  #   yarn playwright test e2e/visual-regression.spec.ts --project=chromium --update-snapshots
+  visual-regression:
+    name: Frontend — Visual Regression (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    needs: frontend-checks
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ['chromium', 'mobile-chrome']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        run: yarn playwright install --with-deps ${{ matrix.project == 'mobile-chrome' && 'chromium' || matrix.project }}
+
+      - name: Build Next.js app
+        working-directory: apps/web
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          NEXT_PUBLIC_SUPABASE_URL: https://mock.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: mock-anon-key
+        run: yarn build
+
+      - name: Run visual regression tests
+        working-directory: apps/web
+        env:
+          CI: true
+          PLAYWRIGHT_BASE_URL: http://localhost:3001
+          NEXT_PUBLIC_API_URL: http://localhost:3000
+          PORT: "3001"
+        run: yarn playwright test e2e/visual-regression.spec.ts --project=${{ matrix.project }}
+
+      - name: Upload visual diff artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-${{ matrix.project }}
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+          retention-days: 14
+
   # ─── Job 8: Documentation link check ────────────────────────────────────────
   # Verifies that all relative file paths referenced in Markdown docs exist in
   # the repository. Broken links (e.g. after a file rename) fail this job.
