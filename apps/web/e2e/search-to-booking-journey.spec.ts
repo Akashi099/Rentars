@@ -19,7 +19,8 @@ import { test, expect, type Page, type Route } from '@playwright/test';
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const PROPERTY_ID = 'fixture-property-id';
+const TEST_RUN = Date.now().toString(36);
+const PROPERTY_ID = 'fixture-property-' + TEST_RUN;
 
 const FIXTURE_PROPERTY = {
   id: PROPERTY_ID,
@@ -46,14 +47,14 @@ const FIXTURE_PROPERTY = {
 const FIXTURE_PROPERTIES = [FIXTURE_PROPERTY];
 
 const FIXTURE_BOOKING = {
-  id: 'fixture-booking-id',
+  id: 'fixture-booking-' + TEST_RUN,
   property_id: PROPERTY_ID,
   status: 'Pending',
   check_in: '2027-10-01',
   check_out: '2027-10-05',
   total_price: 600,
   guest_count: 2,
-  escrow_id: 'fixture-escrow-id',
+  escrow_id: 'fixture-escrow-' + TEST_RUN,
 };
 
 // ─── Network mock helper ──────────────────────────────────────────────────────
