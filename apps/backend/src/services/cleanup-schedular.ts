@@ -1,6 +1,8 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
+import { runRetentionJobs, type RetentionOptions } from './retention.service.js';
+import { env } from '@/config/env.js';
 
 const bookingService = new BookingService();
 
@@ -174,5 +176,31 @@ async function runBookingExpiryCleanup(): Promise<void> {
     }
   } else {
     console.error(`[expiry] Cleanup failed: ${result.error}`);
+  }
+}
+
+/**
+ * Run one full data-retention sweep, guarding against overlapping runs so two
+ * scheduled invocations can never mutate the same tables concurrently.
+ * Returns the per-class summary, or null when a run was already in progress.
+ */
+async function runDataRetention(
+  options: RetentionOptions & { label?: string } = {},
+): Promise<void> {
+  if (retentionRunning) {
+    console.log(`[retention] Skipping ${options.label ?? 'run'} — previous sweep still in progress`);
+    return;
+  }
+  retentionRunning = true;
+  try {
+    const summary = await runRetentionJobs({ dryRun: options.dryRun, batchSize: options.batchSize });
+    console.log(
+      `[retention] ${summary.dry_run ? 'Dry-run' : 'Cleanup'} (${options.label ?? 'scheduled'}) — ` +
+      `${summary.total_deleted} deleted, ${summary.total_eligible} eligible, ` +
+      `${summary.total_held_skipped} held, ${summary.elapsed_ms}ms` +
+      (summary.failed_classes.length ? `, failures: ${summary.failed_classes.join(',')}` : ''),
+    );
+  } finally {
+    retentionRunning = false;
   }
 }
