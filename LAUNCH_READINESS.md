@@ -231,6 +231,8 @@ Performance, Privacy, Monitoring, Backup, Support.
 |---|---|---|---|---|
 | | | | | |
 
+> **SLO reference.** Measurable objectives, alert thresholds, burn-rate rules, and error-budget policy for all critical journeys are defined in [`docs/SLO.md`](./SLO.md).
+
 ---
 
 ## Section 9 — Backup and recovery

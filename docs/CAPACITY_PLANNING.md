@@ -210,5 +210,6 @@ All metrics are exposed at `GET /metrics` (Prometheus format).
 - Search implementation details: [`SEARCH_IMPLEMENTATION.md`](../SEARCH_IMPLEMENTATION.md)
 - Operational runbooks with latency SLOs: [`apps/backend/RUNBOOKS.md`](../apps/backend/RUNBOOKS.md)
 - Alerting thresholds: [RUNBOOKS.md — Alerting Thresholds Reference](../apps/backend/RUNBOOKS.md#alerting-thresholds-reference)
+- **SLIs, SLOs, error budgets, and alert rules: [`docs/SLO.md`](./SLO.md)**
 - Deployment infrastructure: [`DEPLOYMENT.md`](../DEPLOYMENT.md)
 - Architecture overview: [`ARCHITECTURE.md`](../ARCHITECTURE.md)
