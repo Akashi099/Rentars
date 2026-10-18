@@ -321,6 +321,7 @@ All endpoints are prefixed with `/api/v1`. The full OpenAPI spec is at
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Testnet and mainnet deployment, rollback, monitoring |
 | [`apps/backend/RUNBOOKS.md`](apps/backend/RUNBOOKS.md) | On-call incident response procedures |
 | [`docs/INCIDENT_REVIEW_TEMPLATE.md`](docs/INCIDENT_REVIEW_TEMPLATE.md) | Post-incident review template |
+| [`docs/RECOVERY_RUNBOOK.md`](docs/RECOVERY_RUNBOOK.md) | Cross-component recovery: DB, storage, Redis, contracts, RPC, email, frontend; monthly drill |
 | [`docs/CAPACITY_PLANNING.md`](docs/CAPACITY_PLANNING.md) | Throughput targets, benchmarking, scaling triggers |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 

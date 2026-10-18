@@ -304,6 +304,8 @@ Set up alerts for:
 
 ## See Also
 
+- [`docs/RECOVERY_RUNBOOK.md`](./RECOVERY_RUNBOOK.md) — Full cross-component recovery runbook; this document is the database-only drill referenced by its §6.2.
+- [`scripts/recovery-drill.sh`](../scripts/recovery-drill.sh) — Multi-component drill (DB restore + cache rebuild + sync resume + booking lookup + reconciliation).
 - [DEPLOYMENT.md](../DEPLOYMENT.md) — Deployment procedures and rollback
 - [admin-runbooks.md](./admin-runbooks.md) — Operational runbooks
 - PostgreSQL [pg_dump documentation](https://www.postgresql.org/docs/current/app-pgdump.html)
