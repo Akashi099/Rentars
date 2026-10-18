@@ -19,6 +19,7 @@
     "test:contract": "bun test tests/contract.test.ts",
     "test:property-based": "bun test tests/unit/property-based.test.ts",
     "test:concurrency": "bun test tests/integration/concurrency.test.ts",
+    "test:performance": "bun test tests/integration/booking-performance.test.ts",
     "test:journey": "bun test tests/integration/booking-journey.test.ts",
     "validate:migrations": "bun run scripts/validate-migrations.ts",
     "db:seed": "bun run database/seed.ts"
