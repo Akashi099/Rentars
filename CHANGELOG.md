@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 2026-10-18
+
+#### #735 — Reproducible development and CI installs
+- Added `apps/contracts/rust-toolchain.toml` pinning Rust 1.82.0 with
+  `wasm32-unknown-unknown` target and `clippy`/`rustfmt` components; rustup
+  and the contracts CI job now both use the exact declared version.
+- Updated `.nvmrc` from a loose `20` to the exact pinned version `20.18.0`
+  matching `.tool-versions`.
+- Pinned all CI jobs to `node-version: '20.18.0'` and `bun-version: '1.1.38'`
+  (previously `node-version: '20'` and `bun-version: latest`).
+- Updated contracts CI job from `dtolnay/rust-toolchain@stable` to
+  `dtolnay/rust-toolchain@master` with explicit `toolchain: '1.82.0'` so the
+  runner uses the version declared in `rust-toolchain.toml`.
+
+#### #734 — Release versioning across applications and contracts
+- Added `scripts/check-abi-migration-changelog.sh` — fails a PR when contract
+  ABI files (`apps/contracts/*.json`) or migration SQL files
+  (`apps/backend/database/migrations/*.sql`) change without a corresponding
+  `CHANGELOG.md` update; enforces explicit release notes for schema or ABI
+  changes.
+- Added `Check ABI and migration changes are documented` step to the
+  `release-validation` CI job; the job now runs with `fetch-depth: 0` so the
+  diff against the base branch is always available.
+- Added `docs/releases/compatibility.md` — documents what to write in
+  the changelog for additive vs. breaking ABI/schema changes, explains
+  the release manifest fields, and specifies the rollout order requirement
+  for breaking changes.
+
+#### #733 — Deployment preview smoke tests with environment identity
+- Added `deployment_id` and `environment` inputs to
+  `.github/workflows/smoke-tests.yml`; failures now carry
+  `[env=<name> deploy=<id>]` annotations so the broken deployment is
+  identifiable without inspecting CI logs.
+- Added `Publish smoke test summary` step that writes environment, deployment
+  ID, API/frontend URLs, status, and run link to the GitHub Actions job summary.
+- Updated artifact name to include environment and deployment ID for
+  unambiguous identification across concurrent deployments.
+- Updated `apps/web/e2e/smoke.spec.ts` to prefix every assertion failure
+  message with `[env=... deploy=...]` context from `SMOKE_DEPLOYMENT_ID`
+  and `SMOKE_ENVIRONMENT` environment variables.
+
+#### #732 — Dependency and secret scanning gates
+- Added `apps/contracts/.cargo/audit.toml` — per-finding suppression config
+  for `cargo audit`; each suppressed advisory requires a reason, expiry date,
+  and GitHub issue link; the CI job now passes `--config .cargo/audit.toml`
+  explicitly.
+
 ### Added — 2026-09-25
 
 #### #576 — Reproducible lockfile and runtime checks
