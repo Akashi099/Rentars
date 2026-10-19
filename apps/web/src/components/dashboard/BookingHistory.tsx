@@ -26,8 +26,8 @@ interface BookingHistoryProps {
     checkIn: Date;
     checkOut: Date;
     totalPrice: number;
-    status: 'pending' | 'confirmed' | 'completed' | 'cancelled';
-    escrowStatus: 'locked' | 'released' | 'refunded';
+    status: 'pending' | 'confirmed' | 'completed' | 'cancelled' | 'escrow_reconcile_failed';
+    escrowStatus?: 'locked' | 'released' | 'refunded' | 'pending' | 'manual_review';
     thumbnail?: string;
   }>;
   statusFilter: BookingStatus;

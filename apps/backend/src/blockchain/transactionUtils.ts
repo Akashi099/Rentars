@@ -125,8 +125,7 @@ export function extractReturnValue(
  */
 export async function getEstimatedNetworkFeeInUSDC(): Promise<number> {
   try {
-    const server = getSorobanServer();
-    const feeStroops = await estimateTransactionFee(server);
+    const feeStroops = await estimateTransactionFee();
     return Number(feeStroops) / 10_000_000;
   } catch (err) {
     console.warn(`[fee-conversion] Failed to convert fee to USDC: ${(err as Error).message}`);
@@ -139,6 +138,7 @@ export type TransactionStatus = 'pending' | 'success' | 'failed' | 'not_found';
 export interface TransactionStatusResult {
   status: TransactionStatus;
   response?: rpc.Api.GetTransactionResponse;
+  error?: string;
 }
 
 /**
@@ -170,7 +170,8 @@ export async function getTransactionStatus(
 
     return { status: 'pending' };
   } catch (err) {
-    console.error(`[transaction-status] Failed to get status for ${txHash}: ${(err as Error).message}`);
-    return { status: 'failed' };
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[transaction-status] Failed to get status for ${txHash}: ${message}`);
+    return { status: 'not_found', error: message };
   }
 }

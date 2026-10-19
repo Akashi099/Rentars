@@ -35,6 +35,7 @@ export interface Notification {
   type: NotificationType;
   data: Record<string, unknown>;
   read: boolean;
+  idempotency_key?: string | null;
   created_at?: string;
 }
 
@@ -95,20 +96,161 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
 export async function createNotification(
   userId: string,
   type: NotificationType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  idempotencyKey?: string,
 ): Promise<ServiceResponse<Notification>> {
   if (!VALID_NOTIFICATION_TYPES.includes(type)) {
     return { success: false, error: `Unknown notification type: ${type}` };
   }
 
-  const { data: notification, error } = await supabase
-    .from('notifications')
-    .insert({ user_id: userId, type, data })
-    .select()
-    .single();
+  const row = {
+    user_id: userId,
+    type,
+    data,
+    ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+  };
+  const { data: notification, error } = await (
+    idempotencyKey
+      ? supabase
+          .from('notifications')
+          .upsert(row, { onConflict: 'user_id,idempotency_key', ignoreDuplicates: true })
+          .select()
+          .maybeSingle()
+      : supabase
+          .from('notifications')
+          .insert(row)
+          .select()
+          .single()
+  );
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: notification as Notification };
+  if (notification) return { success: true, data: notification as Notification };
+
+  const { data: existing, error: lookupError } = await supabase
+    .from('notifications')
+    .select()
+    .eq('user_id', userId)
+    .eq('idempotency_key', idempotencyKey!)
+    .single();
+  if (lookupError || !existing) {
+    return { success: false, error: lookupError?.message ?? 'Idempotent notification could not be loaded' };
+  }
+  return { success: true, data: existing as Notification };
+}
+
+export async function enqueueNotificationOutbox(
+  userId: string,
+  type: NotificationType,
+  data: Record<string, unknown>,
+  dedupeKey: string,
+): Promise<ServiceResponse<void>> {
+  if (!userId || !dedupeKey) {
+    return { success: false, error: 'userId and dedupeKey are required' };
+  }
+  if (!VALID_NOTIFICATION_TYPES.includes(type)) {
+    return { success: false, error: `Unknown notification type: ${type}` };
+  }
+
+  const { error } = await supabase
+    .from('notification_outbox')
+    .upsert(
+      {
+        recipient_id: userId,
+        notification_type: type,
+        data,
+        dedupe_key: dedupeKey,
+      },
+      { onConflict: 'recipient_id,dedupe_key', ignoreDuplicates: true },
+    );
+  if (error) return { success: false, error: error.message };
+  return { success: true };
+}
+
+export async function processNotificationOutbox(
+  limit = 100,
+): Promise<ServiceResponse<{ processed: number; failed: number }>> {
+  const { data: pending, error } = await supabase
+    .from('notification_outbox')
+    .select('*')
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true })
+    .limit(Math.max(1, Math.min(limit, 500)));
+
+  if (error) return { success: false, error: error.message };
+
+  let processed = 0;
+  let failed = 0;
+  for (const row of pending ?? []) {
+    const preferences = await getPreferences(row.recipient_id);
+    if (!preferences.success || !preferences.data) {
+      failed++;
+      const update = await supabase
+        .from('notification_outbox')
+        .update({
+          attempt_count: row.attempt_count + 1,
+          last_error: preferences.error ?? 'Notification preferences unavailable',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', row.id)
+        .eq('status', 'pending');
+      if (update.error) console.error('[NotificationOutbox] Failed to persist retry:', update.error.message);
+      continue;
+    }
+
+    const notificationType = row.notification_type as NotificationType;
+    const enabled = preferences.data.notification_types[notificationType] !== false;
+    if (!enabled) {
+      const suppressed = await supabase
+        .from('notification_outbox')
+        .update({ status: 'suppressed', updated_at: new Date().toISOString() })
+        .eq('id', row.id)
+        .eq('status', 'pending');
+      if (suppressed.error) {
+        failed++;
+        console.error('[NotificationOutbox] Failed to persist suppression:', suppressed.error.message);
+      } else {
+        processed++;
+      }
+      continue;
+    }
+
+    const result = await createNotification(
+      row.recipient_id,
+      notificationType,
+      row.data as Record<string, unknown>,
+      row.dedupe_key,
+    );
+    if (!result.success) {
+      failed++;
+      const update = await supabase
+        .from('notification_outbox')
+        .update({
+          attempt_count: row.attempt_count + 1,
+          last_error: result.error,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', row.id)
+        .eq('status', 'pending');
+      if (update.error) console.error('[NotificationOutbox] Failed to persist retry:', update.error.message);
+      continue;
+    }
+
+    const delivered = await supabase
+      .from('notification_outbox')
+      .update({ status: 'sent', last_error: null, updated_at: new Date().toISOString() })
+      .eq('id', row.id)
+      .eq('status', 'pending');
+    if (delivered.error) {
+      failed++;
+      console.error('[NotificationOutbox] Failed to mark notification sent:', delivered.error.message);
+    } else {
+      processed++;
+    }
+  }
+
+  return failed > 0
+    ? { success: false, error: `${failed} outbox notification(s) will be retried`, data: { processed, failed } }
+    : { success: true, data: { processed, failed } };
 }
 
 export async function getNotifications(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Notification>>> {

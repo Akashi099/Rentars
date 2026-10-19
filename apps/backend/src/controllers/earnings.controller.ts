@@ -7,6 +7,7 @@ import {
   reconcileHostLedger,
   postAdjustment,
   type LedgerDirection,
+  type LedgerCurrency,
 } from '@/services/ledger.service.js';
 
 const earningsService = new EarningsService();
@@ -19,7 +20,18 @@ function validateDateParams(
 ): { from: string; to: string } | null {
   if (typeof from !== 'string' || typeof to !== 'string') return null;
   if (!DATE_RE.test(from) || !DATE_RE.test(to)) return null;
-  return { from, to };
+  const start = new Date(from);
+  const end = new Date(to);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return null;
+  return {
+    from: from.length === 10 ? `${from}T00:00:00.000Z` : from,
+    to: to.length === 10 ? `${to}T23:59:59.999Z` : to,
+  };
+}
+
+function parseCurrency(value: unknown): LedgerCurrency | null {
+  if (value === undefined) return 'USDC';
+  return value === 'USDC' ? 'USDC' : null;
 }
 
 /**
@@ -41,13 +53,16 @@ export async function getHostEarnings(req: AuthRequest, res: Response): Promise<
     return;
   }
 
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  if (!dateRe.test(from) || !dateRe.test(to)) {
+  const dates = validateDateParams(from, to);
+  if (!dates) {
     res.status(422).json({ error: 'from and to must be valid dates in YYYY-MM-DD format' });
     return;
   }
 
-  const result = await earningsService.getHostEarnings(hostId, from, to);
+  const result = await earningsService.getReconciledEarnings(hostId, {
+    ...dates,
+    currency: 'USDC',
+  });
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -79,13 +94,18 @@ export async function getLedgerEntries(req: AuthRequest, res: Response): Promise
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
+  const parsedCurrency = parseCurrency(currency);
+  if (!parsedCurrency) {
+    res.status(422).json({ error: 'currency must be USDC' });
+    return;
+  }
 
   const page  = Math.max(1, Number(req.query.page ?? 1) || 1);
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50) || 50));
 
   const result = await listLedgerEntries(
     hostId,
-    { from: dates.from, to: dates.to, currency: currency === 'USDC' ? 'USDC' : undefined },
+    { ...dates, currency: parsedCurrency },
     page,
     limit,
   );
@@ -123,10 +143,15 @@ export async function getLedgerBalance(req: AuthRequest, res: Response): Promise
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
+  const parsedCurrency = parseCurrency(currency);
+  if (!parsedCurrency) {
+    res.status(422).json({ error: 'currency must be USDC' });
+    return;
+  }
 
   const result = await getHostLedgerBalance(
     hostId,
-    { from: dates.from, to: dates.to, currency: currency === 'USDC' ? 'USDC' : undefined },
+    { ...dates, currency: parsedCurrency },
   );
 
   if (!result.success) {
@@ -161,10 +186,15 @@ export async function getReconciliationReport(req: AuthRequest, res: Response): 
     res.status(422).json({ error: 'from and to are required (YYYY-MM-DD or ISO-8601)' });
     return;
   }
+  const parsedCurrency = parseCurrency(currency);
+  if (!parsedCurrency) {
+    res.status(422).json({ error: 'currency must be USDC' });
+    return;
+  }
 
   const result = await reconcileHostLedger(
     hostId,
-    { from: dates.from, to: dates.to, currency: currency === 'USDC' ? 'USDC' : undefined },
+    { ...dates, currency: parsedCurrency },
   );
 
   if (!result.success) {
@@ -189,6 +219,10 @@ export async function postLedgerAdjustment(req: AuthRequest, res: Response): Pro
   }
 
   const { hostId } = req.params;
+  if (typeof hostId !== 'string' || !hostId.trim()) {
+    res.status(400).json({ error: 'Host ID is required' });
+    return;
+  }
   const { direction, amount, adminNote, bookingId } = req.body as {
     direction?: unknown;
     amount?: unknown;

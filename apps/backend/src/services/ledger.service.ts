@@ -127,7 +127,9 @@ export async function writeLedgerEntry(
 ): Promise<ServiceResponse<LedgerEntry | null>> {
   if (!params.hostId) return { success: false, error: 'hostId is required' };
   if (!params.sourceRef) return { success: false, error: 'sourceRef is required' };
-  if (params.amount < 0) return { success: false, error: 'amount must be non-negative' };
+  if (!Number.isFinite(params.amount) || params.amount < 0) {
+    return { success: false, error: 'amount must be a non-negative finite number' };
+  }
   if (params.entryType === 'adjustment' && !params.adminNote) {
     return { success: false, error: 'adminNote is required for adjustment entries' };
   }
@@ -182,38 +184,31 @@ export async function recordBookingSettlement(
     return { success: false, error: 'grossAmount must be a non-negative finite number' };
   }
 
-  const platformFee = Math.round(grossAmount * PLATFORM_FEE_RATE * 100) / 100;
+  const { error } = await supabase.rpc('record_booking_settlement', {
+    p_host_id: hostId,
+    p_booking_id: bookingId,
+    p_gross_amount: grossAmount,
+  });
+  if (error) return { success: false, error: `Ledger settlement failed: ${error.message}` };
 
-  const [creditResult, feeResult] = await Promise.all([
-    writeLedgerEntry({
-      hostId,
-      bookingId,
-      entryType: 'booking_payment',
-      direction:  'credit',
-      amount:     grossAmount,
-      sourceRef:  `booking_payment:${bookingId}`,
-    }),
-    writeLedgerEntry({
-      hostId,
-      bookingId,
-      entryType: 'platform_fee',
-      direction:  'debit',
-      amount:     platformFee,
-      sourceRef:  `platform_fee:${bookingId}`,
-    }),
-  ]);
+  const { data: entries, error: loadError } = await supabase
+    .from('earnings_ledger_entries')
+    .select('*')
+    .eq('host_id', hostId)
+    .in('source_ref', [`booking_payment:${bookingId}`, `platform_fee:${bookingId}`]);
+  if (loadError) return { success: false, error: `Ledger settlement recorded but could not be read: ${loadError.message}` };
 
-  if (!creditResult.success) return { success: false, error: creditResult.error };
-  if (!feeResult.success)   return { success: false, error: feeResult.error };
+  const creditEntry = ((entries ?? []) as LedgerEntry[]).find((entry) => entry.entry_type === 'booking_payment') ?? null;
+  const feeEntry = ((entries ?? []) as LedgerEntry[]).find((entry) => entry.entry_type === 'platform_fee') ?? null;
 
   await auditLogger.log({
     action: 'payment.confirmed',
     resourceType: 'payment',
     resourceId: bookingId,
-    meta: { hostId, grossAmount, platformFee, event: 'booking_settlement' },
+    meta: { hostId, grossAmount, event: 'booking_settlement' },
   });
 
-  return { success: true, data: { creditEntry: creditResult.data!, feeEntry: feeResult.data! } };
+  return { success: true, data: { creditEntry, feeEntry } };
 }
 
 /**
@@ -228,21 +223,11 @@ export async function recordEscrowRelease(
   hostId: string,
   bookingId: string,
   amount: number,
-  txHash?: string,
+  _txHash?: string,
 ): Promise<ServiceResponse<LedgerEntry | null>> {
-  const sourceRef = txHash
-    ? `escrow_release:${txHash}`
-    : `escrow_release:${bookingId}`;
-
-  return writeLedgerEntry({
-    hostId,
-    bookingId,
-    entryType: 'escrow_release',
-    direction:  'credit',
-    amount,
-    sourceRef,
-    adminNote:  txHash ? `tx:${txHash}` : undefined,
-  });
+  const result = await recordBookingSettlement(hostId, bookingId, amount);
+  if (!result.success) return { success: false, error: result.error };
+  return { success: true, data: result.data?.creditEntry ?? null };
 }
 
 /**
@@ -434,25 +419,45 @@ export async function reconcileHostLedger(
   const entriesResult = await listLedgerEntries(hostId, filter, 1, 200);
   if (!entriesResult.success) return { success: false, error: entriesResult.error };
 
-  const entries  = entriesResult.data!.entries;
+  const entries = [...entriesResult.data!.entries];
+  const pageCount = Math.ceil(entriesResult.data!.total / 200);
+  for (let page = 2; page <= pageCount; page++) {
+    const nextPage = await listLedgerEntries(hostId, filter, page, 200);
+    if (!nextPage.success) return { success: false, error: nextPage.error };
+    entries.push(...nextPage.data!.entries);
+  }
   const balance  = await getHostLedgerBalance(hostId, filter);
   if (!balance.success) return { success: false, error: balance.error };
 
   // 2. Sum settled bookings for the same period (ground truth from booking table)
-  const { data: bookingRows, error: bookingErr } = await supabase
-    .from('bookings')
-    .select('total_price, properties!inner(owner_id)')
-    .eq('properties.owner_id', hostId)
-    .in('status', ['Confirmed', 'Completed'])
+  const { data: paymentRows, error: paymentErr } = await supabase
+    .from('payments')
+    .select('amount_stroops, booking:bookings!inner(properties!inner(owner_id))')
+    .eq('status', 'confirmed')
+    .eq('currency', currency)
+    .eq('booking.properties.owner_id', hostId)
     .gte('updated_at', filter.from)
     .lte('updated_at', filter.to);
 
-  if (bookingErr) return { success: false, error: bookingErr.message };
+  if (paymentErr) return { success: false, error: paymentErr.message };
 
-  const settledGross = ((bookingRows ?? []) as Array<{ total_price: number }>)
-    .reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
+  const settledGross = ((paymentRows ?? []) as Array<{ amount_stroops: string | number }>)
+    .reduce((sum, row) => sum + Number(row.amount_stroops) / 10_000_000, 0);
 
-  const settledNet = Math.round(settledGross * (1 - PLATFORM_FEE_RATE) * 100) / 100;
+  const settledFee = Math.round(settledGross * PLATFORM_FEE_RATE * 10_000_000) / 10_000_000;
+  const { data: refundRows, error: refundError } = await supabase
+    .from('refund_requests')
+    .select('refund_amount')
+    .eq('host_id', hostId)
+    .eq('currency', currency)
+    .eq('status', 'confirmed')
+    .gte('updated_at', filter.from)
+    .lte('updated_at', filter.to);
+  if (refundError) return { success: false, error: refundError.message };
+
+  const confirmedRefunds = ((refundRows ?? []) as Array<{ refund_amount: number | string }>)
+    .reduce((sum, row) => sum + Number(row.refund_amount), 0);
+  const settledNet = Math.round((settledGross - settledFee - confirmedRefunds) * 10_000_000) / 10_000_000;
 
   // 3. Compare ledger net (excl. adjustments) vs settled net
   const ledgerNetWithoutAdjustments = entries

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   signUSDCPaymentTransaction,
   signEscrowFundingTransaction,
@@ -32,20 +32,20 @@ vi.mock('@/lib/stellar', () => ({
 import { getHorizonServer } from '@/lib/stellar';
 
 describe('wallet.service', () => {
-  const mockPublicKey = 'GTEST123456789012345678901234567890123456789012345678';
-  const mockRecipientKey = 'GTEST987654321098765432109876543210987654321098765432';
+  const mockPublicKey = StellarSdk.StrKey.encodeEd25519PublicKey(new Uint8Array(32).fill(1));
+  const mockRecipientKey = StellarSdk.StrKey.encodeEd25519PublicKey(new Uint8Array(32).fill(2));
   const mockSignedXdr = 'signed-xdr-value';
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv('NEXT_PUBLIC_USDC_ISSUER', mockRecipientKey);
   });
+
+  afterEach(() => vi.unstubAllEnvs());
 
   describe('signUSDCPaymentTransaction', () => {
     it('signs USDC payment transaction successfully', async () => {
-      const mockAccount = {
-        account_id: mockPublicKey,
-        sequence: '1',
-      };
+      const mockAccount = new StellarSdk.Account(mockPublicKey, '1');
 
       const mockServer = {
         loadAccount: vi.fn().mockResolvedValue(mockAccount),
@@ -68,7 +68,7 @@ describe('wallet.service', () => {
 
     it('throws error on signing failure', async () => {
       const mockServer = {
-        loadAccount: vi.fn().mockResolvedValue({ account_id: mockPublicKey, sequence: '1' }),
+        loadAccount: vi.fn().mockResolvedValue(new StellarSdk.Account(mockPublicKey, '1')),
       };
 
       vi.mocked(getHorizonServer).mockReturnValue(mockServer as any);
@@ -95,7 +95,7 @@ describe('wallet.service', () => {
 
     it('uses mainnet configuration', async () => {
       const mockServer = {
-        loadAccount: vi.fn().mockResolvedValue({ account_id: mockPublicKey, sequence: '1' }),
+        loadAccount: vi.fn().mockResolvedValue(new StellarSdk.Account(mockPublicKey, '1')),
       };
 
       vi.mocked(getHorizonServer).mockReturnValue(mockServer as any);
@@ -109,10 +109,7 @@ describe('wallet.service', () => {
 
   describe('signEscrowFundingTransaction', () => {
     it('signs escrow funding transaction successfully', async () => {
-      const mockAccount = {
-        account_id: mockPublicKey,
-        sequence: '1',
-      };
+      const mockAccount = new StellarSdk.Account(mockPublicKey, '1');
 
       const mockServer = {
         loadAccount: vi.fn().mockResolvedValue(mockAccount),
@@ -134,7 +131,7 @@ describe('wallet.service', () => {
 
     it('handles user rejection', async () => {
       const mockServer = {
-        loadAccount: vi.fn().mockResolvedValue({ account_id: mockPublicKey, sequence: '1' }),
+        loadAccount: vi.fn().mockResolvedValue(new StellarSdk.Account(mockPublicKey, '1')),
       };
 
       vi.mocked(getHorizonServer).mockReturnValue(mockServer as any);
@@ -152,10 +149,7 @@ describe('wallet.service', () => {
 
   describe('signEscrowReleaseTransaction', () => {
     it('signs escrow release transaction successfully', async () => {
-      const mockAccount = {
-        account_id: mockPublicKey,
-        sequence: '1',
-      };
+      const mockAccount = new StellarSdk.Account(mockPublicKey, '1');
 
       const mockServer = {
         loadAccount: vi.fn().mockResolvedValue(mockAccount),
@@ -176,7 +170,7 @@ describe('wallet.service', () => {
 
     it('handles user rejection on release', async () => {
       const mockServer = {
-        loadAccount: vi.fn().mockResolvedValue({ account_id: mockPublicKey, sequence: '1' }),
+        loadAccount: vi.fn().mockResolvedValue(new StellarSdk.Account(mockPublicKey, '1')),
       };
 
       vi.mocked(getHorizonServer).mockReturnValue(mockServer as any);
@@ -193,7 +187,7 @@ describe('wallet.service', () => {
   });
 
   describe('verifySignedTransaction', () => {
-    it('returns true for valid signed transaction', () => {
+    it('returns true for valid signed transaction', async () => {
       const validXdr = StellarSdk.TransactionBuilder.fromXDR(
         new StellarSdk.TransactionBuilder(
           new StellarSdk.Account(mockPublicKey, '0'),
@@ -208,13 +202,13 @@ describe('wallet.service', () => {
         'Test SDF Network ; September 2015'
       ).toXDR();
 
-      const result = verifySignedTransaction(validXdr, 'testnet');
+      const result = await verifySignedTransaction(validXdr, 'testnet');
 
       expect(result).toBe(true);
     });
 
-    it('returns false for invalid XDR', () => {
-      const result = verifySignedTransaction('invalid-xdr', 'testnet');
+    it('returns false for invalid XDR', async () => {
+      const result = await verifySignedTransaction('invalid-xdr', 'testnet');
 
       expect(result).toBe(false);
     });

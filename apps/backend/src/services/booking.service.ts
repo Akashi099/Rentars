@@ -14,10 +14,15 @@ import {
 } from '@/blockchain/bookingContract.js';
 import { trustlessWorkClient } from '@/blockchain/trustlessWork.js';
 import { loggingService } from './logging.service.js';
-import { createNotification, getPreferences } from './notification.service.js';
+import {
+  createNotification,
+  enqueueNotificationOutbox,
+  getPreferences,
+} from './notification.service.js';
 import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
 import { computeRefund } from './refundPolicy.service.js';
+import { recordBookingSettlement } from './ledger.service.js';
 import {
   createRefundSnapshot,
   createRefundRequest,
@@ -555,24 +560,33 @@ export class BookingService {
 
     // #769 — Snapshot the refund policy at booking creation time so later
     // policy changes don't affect this booking's refund terms.
-    createRefundSnapshot({
+    const snapshotResult = await createRefundSnapshot({
       bookingId: booking.id,
       totalPrice: total_price,
-    }).catch((err) =>
-      console.warn('[BookingService] Failed to create refund snapshot:', err),
-    );
+    });
+    if (!snapshotResult.success) {
+      if (escrowId) {
+        try {
+          await trustlessWorkClient.cancelEscrow(escrowId);
+        } catch (rollbackError) {
+          console.error('[BookingService] Failed to cancel escrow after refund snapshot failure:', rollbackError);
+        }
+      }
+      const { error: deleteError } = await supabase.from('bookings').delete().eq('id', booking.id);
+      if (deleteError) {
+        console.error('[BookingService] Failed to remove booking after refund snapshot failure:', deleteError.message);
+      }
+      return {
+        success: false,
+        error: `Failed to establish booking refund terms: ${snapshotResult.error}`,
+      };
+    }
 
     // Notify tenant (in-app)
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
       () => {},
     );
     incCounter(bookingsCreatedTotal, { property_id });
-
-    // Send detailed booking confirmation emails (tenant + host) — fire-and-forget,
-    // never block the booking creation response.
-    this.sendBookingEmails(booking, prop, tenant_id).catch((err) =>
-      console.warn('[BookingService] Confirmation email dispatch failed:', err),
-    );
 
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -707,7 +721,6 @@ export class BookingService {
     // 4. Compute refund from the booking-time policy snapshot (#769).
     //    Falls back to the live policy if no snapshot exists (legacy bookings).
     let refund;
-    let snapshotId: string | undefined;
 
     const snapshotRefundResult = await computeRefundFromSnapshot(
       bookingId,
@@ -717,7 +730,6 @@ export class BookingService {
 
     if (snapshotRefundResult.success && snapshotRefundResult.data) {
       refund = snapshotRefundResult.data;
-      snapshotId = snapshotRefundResult.data.snapshotId;
     } else {
       // Fallback: compute from the live policy (for legacy bookings without
       // a snapshot).
@@ -732,20 +744,72 @@ export class BookingService {
       }
     }
 
-    // 4a. Create an idempotent refund request tracking the settlement lifecycle.
-    if (hostId && booking.tenant_id) {
-      await createRefundRequest({
+    // Legacy bookings have no booking-time snapshot. Freeze the fallback terms
+    // now so retries use the same policy calculation.
+    if (!snapshotRefundResult.success && booking.total_price !== undefined) {
+      const legacySnapshot = await createRefundSnapshot({
+        bookingId,
+        totalPrice: booking.total_price,
+      });
+      if (!legacySnapshot.success) {
+        return { success: false, error: `Cannot persist refund terms: ${legacySnapshot.error}` };
+      }
+    }
+
+    let refundRequestId: string | undefined;
+    let refundRequestStatus: RefundStatus | undefined;
+    if (refund.refundAmount > 0) {
+      if (!hostId || !booking.tenant_id) {
+        return { success: false, error: 'Cannot create refund request: booking participants could not be resolved' };
+      }
+      const refundRequestResult = await createRefundRequest({
         bookingId,
         tenantId: booking.tenant_id,
         hostId,
         cancelledAt: now,
         destinationEscrowId: booking.escrow_id ?? undefined,
-      }).catch((err) =>
-        console.warn('[BookingService] Failed to create refund request:', err),
-      );
+      });
+      if (!refundRequestResult.success || !refundRequestResult.data) {
+        return {
+          success: false,
+          error: refundRequestResult.error ?? 'Failed to create recoverable refund request',
+        };
+      }
+      refundRequestId = refundRequestResult.data.id;
+      refundRequestStatus = refundRequestResult.data.status;
     }
 
-    // 5. Drive the appropriate escrow action for the refund tier
+    let refundWarning: string | undefined;
+    // Partial refunds cannot be executed by the provider's all-or-nothing
+    // escrow API. Keep those funds locked for operations rather than releasing
+    // the full escrow and claiming a partial refund.
+    if (refund.tier === 'partial' && refund.refundAmount > 0 && refundRequestId) {
+      if (refundRequestStatus !== 'manual_review') {
+        const reviewResult = await transitionRefundStatus(refundRequestId, 'manual_review', {
+          errorMessage: 'Provider does not support partial escrow refunds; manual settlement required',
+          actorId: userId,
+        });
+        if (!reviewResult.success) {
+          return { success: false, error: reviewResult.error ?? 'Failed to route refund for manual review' };
+        }
+      }
+      refundRequestStatus = 'manual_review';
+      refundWarning = 'Your partial refund requires manual review; escrow funds remain locked.';
+    } else if (refundRequestId && !booking.escrow_id) {
+      if (refundRequestStatus !== 'manual_review') {
+        const reviewResult = await transitionRefundStatus(refundRequestId, 'manual_review', {
+          errorMessage: 'No escrow destination is available for refund settlement',
+          actorId: userId,
+        });
+        if (!reviewResult.success) {
+          return { success: false, error: reviewResult.error ?? 'Failed to route refund for manual review' };
+        }
+      }
+      refundRequestStatus = 'manual_review';
+      refundWarning = 'Your refund requires manual review because no escrow destination is available.';
+    }
+
+    // 5. Drive only escrow actions the provider can actually settle.
     if (booking.escrow_id) {
       loggingService.logBlockchainOperation('cancelEscrowRefund', {
         bookingId,
@@ -757,18 +821,58 @@ export class BookingService {
 
       try {
         if (refund.tier === 'full') {
-          // Full refund: return the entire escrow to the tenant.
-          await trustlessWorkClient.cancelEscrow(booking.escrow_id);
-        } else {
-          // Partial or no refund: release the escrow to the host. For a partial
-          // refund the host is then responsible for returning the tenant's
-          // refund_amount (recorded on the booking below).
-          await trustlessWorkClient.releaseEscrow(
-            booking.escrow_id,
-            `Booking cancelled — refund ${refund.refundAmount} (tier: ${refund.tier})`,
-          );
+          if (!refundRequestId) {
+            return { success: false, error: 'Refund request is required before escrow cancellation' };
+          }
+          if (refundRequestStatus !== 'submitted' && refundRequestStatus !== 'confirmed') {
+            const submitResult = await transitionRefundStatus(refundRequestId, 'submitted', { actorId: userId });
+            if (!submitResult.success) {
+              return { success: false, error: submitResult.error ?? 'Failed to submit refund request' };
+            }
+            refundRequestStatus = 'submitted';
+          }
+
+          if (refundRequestStatus !== 'confirmed') {
+            const currentEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+            if (currentEscrow.status !== 'cancelled') {
+              await trustlessWorkClient.cancelEscrow(booking.escrow_id);
+            }
+
+            const settledEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+            if (settledEscrow.status === 'cancelled') {
+              const confirmedResult = await transitionRefundStatus(refundRequestId, 'confirmed', {
+                actorId: userId,
+              });
+              if (!confirmedResult.success) {
+                refundWarning = `Escrow was cancelled but refund confirmation is pending: ${confirmedResult.error}`;
+              } else {
+                refundRequestStatus = 'confirmed';
+              }
+            } else {
+              refundWarning = 'Your refund was submitted and is awaiting escrow confirmation.';
+            }
+          }
+        } else if (refund.refundAmount === 0) {
+          const currentEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+          if (currentEscrow.status !== 'released') {
+            await trustlessWorkClient.releaseEscrow(
+              booking.escrow_id,
+              'Booking cancelled with no eligible refund',
+            );
+          }
+        } else if (refund.tier === 'partial') {
+          // The escrow remains locked while the partial refund is reviewed.
         }
       } catch (err) {
+        if (refundRequestId) {
+          const failedResult = await transitionRefundStatus(refundRequestId, 'failed', {
+            errorMessage: String(err),
+            actorId: userId,
+          });
+          if (!failedResult.success) {
+            console.error('[BookingService] Failed to persist refund failure state:', failedResult.error);
+          }
+        }
         loggingService.logBlockchainOperation(
           'cancelEscrowRefund',
           { bookingId, userId, escrowId: booking.escrow_id, tier: refund.tier },
@@ -807,13 +911,30 @@ export class BookingService {
       refund_amount: refund.refundAmount,
       refund_tier: refund.tier,
       refund_policy_pct: refund.refundPct,
+      refund_status: refundRequestStatus ?? (refund.refundAmount === 0 ? 'not_applicable' : 'requested'),
     };
 
     if (booking.tenant_id) {
-      createNotification(booking.tenant_id, 'booking_cancelled', notificationData).catch(() => {});
+      const queued = await enqueueNotificationOutbox(
+        booking.tenant_id,
+        'booking_cancelled',
+        notificationData,
+        `booking-cancelled:${bookingId}:tenant`,
+      );
+      if (!queued.success) {
+        refundWarning ??= `Booking cancelled, but tenant notification could not be queued: ${queued.error}`;
+      }
     }
     if (hostId) {
-      createNotification(hostId, 'booking_cancelled', notificationData).catch(() => {});
+      const queued = await enqueueNotificationOutbox(
+        hostId,
+        'booking_cancelled',
+        notificationData,
+        `booking-cancelled:${bookingId}:host`,
+      );
+      if (!queued.success) {
+        refundWarning ??= `Booking cancelled, but host notification could not be queued: ${queued.error}`;
+      }
     }
 
     // 8. Update on-chain status (non-fatal)
@@ -843,7 +964,11 @@ export class BookingService {
       }
     }
 
-    return { success: true, data: updatedData as Booking };
+    return {
+      success: true,
+      data: updatedData as Booking,
+      warning: refundWarning,
+    };
   }
 
   // ── Confirm ────────────────────────────────────────────────────────────────
@@ -896,7 +1021,22 @@ export class BookingService {
       });
 
       try {
-        await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking confirmed by tenant');
+        const currentEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+        if (currentEscrow.status !== 'released') {
+          await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking confirmed by tenant');
+        }
+        const settledEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+        if (settledEscrow.status !== 'released') {
+          return { success: false, error: 'Escrow release is pending provider confirmation' };
+        }
+        const ledgerResult = await recordBookingSettlement(
+          hostId,
+          bookingId,
+          booking.total_price ?? 0,
+        );
+        if (!ledgerResult.success) {
+          return { success: false, error: `Escrow was released but earnings ledger update failed: ${ledgerResult.error}` };
+        }
       } catch (err) {
         loggingService.logBlockchainOperation(
           'releaseEscrow',
@@ -988,7 +1128,7 @@ export class BookingService {
 
     const { data: bookingData, error: fetchError } = await supabase
       .from('bookings')
-      .select('*')
+      .select('*, properties!inner(owner_id)')
       .eq('id', bookingId)
       .single();
 
@@ -996,7 +1136,7 @@ export class BookingService {
       return { success: false, error: 'Booking not found' };
     }
 
-    const booking = bookingData as Booking;
+    const booking = bookingData as Booking & { properties: { owner_id: string } };
 
     // State-machine: only Confirmed bookings can be completed
     if (booking.status === 'Completed') {
@@ -1020,7 +1160,8 @@ export class BookingService {
       };
     }
 
-    // Release escrow if still open (idempotent — if already released this is a no-op on TW)
+    // Verify the provider settlement before recording host earnings. This is
+    // idempotent because the ledger uses a booking-scoped source reference.
     if (booking.escrow_id) {
       loggingService.logBlockchainOperation('releaseEscrowComplete', {
         bookingId,
@@ -1029,7 +1170,22 @@ export class BookingService {
       });
 
       try {
-        await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking completed by tenant');
+        const currentEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+        if (currentEscrow.status !== 'released') {
+          await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking completed by tenant');
+        }
+        const settledEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
+        if (settledEscrow.status !== 'released') {
+          return { success: false, error: 'Escrow release is pending provider confirmation' };
+        }
+        const ledgerResult = await recordBookingSettlement(
+          booking.properties.owner_id,
+          bookingId,
+          booking.total_price ?? 0,
+        );
+        if (!ledgerResult.success) {
+          return { success: false, error: `Escrow was released but earnings ledger update failed: ${ledgerResult.error}` };
+        }
       } catch (err) {
         loggingService.logBlockchainOperation(
           'releaseEscrowComplete',
@@ -1037,8 +1193,10 @@ export class BookingService {
           undefined,
           String(err),
         );
-        // Log but don't block — the DB transition must still succeed
-        console.warn('[BookingService] Escrow release on complete failed:', err);
+        return {
+          success: false,
+          error: `Failed to verify escrow release: ${String(err)}`,
+        };
       }
     }
 

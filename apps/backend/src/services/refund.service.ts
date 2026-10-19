@@ -35,9 +35,13 @@
 
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
-import { computeRefund, type RefundPolicyConfig, type RefundComputation, type RefundTierId } from './refundPolicy.service.js';
-import { recordRefundDebit } from './ledger.service.js';
-import { createNotification } from './notification.service.js';
+import {
+  computeRefund,
+  getRefundPolicyConfig,
+  type RefundPolicyConfig,
+  type RefundComputation,
+  type RefundTierId,
+} from './refundPolicy.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -146,12 +150,15 @@ export async function createRefundSnapshot(
   const totalPrice = params.totalPrice;
 
   // Check if a snapshot already exists (idempotent)
-  const { data: existing } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from('refund_policy_snapshots')
     .select('*')
     .eq('booking_id', params.bookingId)
     .maybeSingle();
 
+  if (existingError) {
+    return { success: false, error: `Failed to load refund snapshot: ${existingError.message}` };
+  }
   if (existing) {
     return { success: true, data: rowToSnapshot(existing) };
   }
@@ -275,10 +282,21 @@ export async function createRefundRequest(
   const bookingRow = booking as { id: string; check_in: string; total_price: number; escrow_id: string | null; status: string };
 
   // 2. Compute refund from the snapshot (not the live policy)
+  const snapshotResult = await getRefundSnapshot(params.bookingId);
+  if (!snapshotResult.success) return { success: false, error: snapshotResult.error };
+  if (!snapshotResult.data) {
+    return { success: false, error: 'No refund policy snapshot found for this booking' };
+  }
+
+  const eligibleTotal = Math.min(
+    snapshotResult.data.total_price,
+    Number(bookingRow.total_price),
+  );
   const refundResult = await computeRefundFromSnapshot(
     params.bookingId,
     bookingRow.check_in,
     params.cancelledAt,
+    eligibleTotal,
   );
 
   if (!refundResult.success || !refundResult.data) {
@@ -289,13 +307,16 @@ export async function createRefundRequest(
   const idempotencyKey = params.idempotencyKey ?? `refund:${params.bookingId}`;
 
   // 3. Check for existing request (idempotent)
-  const { data: existing } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from('refund_requests')
     .select('*')
     .eq('booking_id', params.bookingId)
     .eq('idempotency_key', idempotencyKey)
     .maybeSingle();
 
+  if (existingError) {
+    return { success: false, error: `Failed to check existing refund request: ${existingError.message}` };
+  }
   if (existing) {
     return { success: true, data: rowToRefundRequest(existing) };
   }
@@ -325,6 +346,18 @@ export async function createRefundRequest(
     .single();
 
   if (error || !data) {
+    if (error?.code === '23505') {
+      const { data: duplicate, error: duplicateError } = await supabase
+        .from('refund_requests')
+        .select('*')
+        .eq('booking_id', params.bookingId)
+        .eq('idempotency_key', idempotencyKey)
+        .maybeSingle();
+      if (duplicateError) {
+        return { success: false, error: `Failed to load duplicate refund request: ${duplicateError.message}` };
+      }
+      if (duplicate) return { success: true, data: rowToRefundRequest(duplicate) };
+    }
     return { success: false, error: `Failed to create refund request: ${error?.message ?? 'unknown'}` };
   }
 
@@ -404,11 +437,17 @@ export async function transitionRefundStatus(
     .from('refund_requests')
     .update(updatePayload)
     .eq('id', refundId)
+    .eq('status', currentRequest.status)
     .select()
-    .single();
+    .maybeSingle();
 
   if (updateErr || !updated) {
-    return { success: false, error: `Failed to update refund status: ${updateErr?.message ?? 'unknown'}` };
+    return {
+      success: false,
+      error: updateErr?.message
+        ? `Failed to update refund status: ${updateErr.message}`
+        : 'Refund status changed concurrently; reload and retry',
+    };
   }
 
   const request = rowToRefundRequest(updated);
@@ -426,29 +465,6 @@ export async function transitionRefundStatus(
       errorMessage: options?.errorMessage,
     },
   });
-
-  // Record refund debit in the ledger when confirmed
-  if (newStatus === 'confirmed') {
-    await recordRefundDebit(
-      currentRequest.host_id,
-      currentRequest.booking_id,
-      currentRequest.refund_amount,
-      currentRequest.id,
-    ).catch((err) =>
-      console.error(`[Refund] Failed to record ledger debit:`, err),
-    );
-
-    // Notify tenant and host
-    const notificationData = {
-      booking_id: currentRequest.booking_id,
-      refund_amount: currentRequest.refund_amount,
-      refund_tier: currentRequest.refund_tier,
-      refund_status: 'confirmed',
-    };
-
-    createNotification(currentRequest.tenant_id, 'booking_cancelled', notificationData).catch(() => {});
-    createNotification(currentRequest.host_id, 'booking_cancelled', notificationData).catch(() => {});
-  }
 
   // Escalate to manual review on failure
   if (newStatus === 'manual_review') {
@@ -510,7 +526,34 @@ export async function getRefundPreview(
   checkIn: string,
   cancelledAt: Date = new Date(),
 ): Promise<ServiceResponse<RefundComputation & { snapshotId: string }>> {
-  return computeRefundFromSnapshot(bookingId, checkIn, cancelledAt);
+  if (!bookingId) return { success: false, error: 'bookingId is required' };
+  const snapshotResult = await computeRefundFromSnapshot(bookingId, checkIn, cancelledAt);
+  if (snapshotResult.success || !snapshotResult.error?.includes('No refund policy snapshot')) {
+    return snapshotResult;
+  }
+
+  const { data: booking, error } = await supabase
+    .from('bookings')
+    .select('total_price')
+    .eq('id', bookingId)
+    .single();
+  if (error || !booking) {
+    return { success: false, error: error?.message ?? 'Booking not found' };
+  }
+
+  try {
+    const computation = computeRefund({
+      totalPrice: Number(booking.total_price),
+      checkIn,
+      cancelledAt,
+    });
+    return {
+      success: true,
+      data: { ...computation, snapshotId: 'legacy-live-policy' },
+    };
+  } catch (err) {
+    return { success: false, error: `Refund computation failed: ${String(err)}` };
+  }
 }
 
 // ─── Row mapping ──────────────────────────────────────────────────────────────
@@ -557,8 +600,5 @@ function rowToRefundRequest(row: any): RefundRequest {
  * which is then frozen in the snapshot.
  */
 function getSnapshotPolicyConfig(): RefundPolicyConfig {
-  // Import dynamically to avoid circular dependency
-  // The live config is read once at snapshot creation and stored.
-  const { getRefundPolicyConfig } = require('./refundPolicy.service.js');
   return getRefundPolicyConfig();
 }

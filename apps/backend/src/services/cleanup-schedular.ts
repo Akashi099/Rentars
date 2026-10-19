@@ -1,15 +1,18 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
+import { processNotificationOutbox } from './notification.service.js';
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const NOTIFICATION_OUTBOX_INTERVAL_MS = 30 * 1000;
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
 
 let concurrentReconciliations = 0;
 let reconciliationBackoffMs = INITIAL_BACKOFF_MS;
+let notificationOutboxRunning = false;
 
 async function runSync(): Promise<void> {
   const propertiesResult = await syncAllProperties();
@@ -74,6 +77,10 @@ export function startSyncScheduler(): void {
     runEscrowReconciliation().catch((err) => console.error('[reconcile] Scheduler error:', err));
   }, RECONCILIATION_INTERVAL_MS);
 
+  setInterval(() => {
+    runNotificationOutbox().catch((err) => console.error('[notification-outbox] Scheduler error:', err));
+  }, NOTIFICATION_OUTBOX_INTERVAL_MS);
+
   // Idempotency-key cleanup — runs once per hour, purges records older than 24 h
   setInterval(() => {
     runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
@@ -92,6 +99,19 @@ export function startSyncScheduler(): void {
     `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
     `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s`,
   );
+}
+
+async function runNotificationOutbox(): Promise<void> {
+  if (notificationOutboxRunning) return;
+  notificationOutboxRunning = true;
+  try {
+    const result = await processNotificationOutbox();
+    if (!result.success) {
+      console.error(`[notification-outbox] Dispatch failed: ${result.error}`);
+    }
+  } finally {
+    notificationOutboxRunning = false;
+  }
 }
 
 async function runIdempotencyCleanup(): Promise<void> {

@@ -1,11 +1,11 @@
 import type { Request, Response } from 'express';
-import type { Request, Response } from 'express';
 import { BookingService } from '@/services/booking.service.js';
 import { getPropertyById } from '@/services/property.service.js';
 import { generateIcs } from '@/utils/ics.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import type { BookingModification } from '@/services/booking.service.js';
 import { getRefundPreview, getRefundRequestByBooking } from '@/services/refund.service.js';
+import { hashRequestBody, lookup, store } from '@/services/idempotency.service.js';
 
 const bookingService = new BookingService();
 
@@ -176,10 +176,12 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
     const existing = await lookup(userId, idempotencyKey.trim());
 
     if (!existing.success) {
-      // DB error during lookup — fail safe (let the request proceed without
-      // idempotency protection rather than blocking all bookings)
       console.error('[idempotency] lookup error:', existing.error);
-    } else if (existing.data !== null) {
+      res.status(503).json({ error: 'Booking idempotency check is temporarily unavailable' });
+      return;
+    }
+
+    if (existing.data) {
       const record = existing.data;
 
       if (record.request_hash !== requestHash) {
@@ -210,7 +212,13 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const responseBody = result.data as Record<string, unknown>;
+  if (!result.data) {
+    console.error('[booking] Booking creation succeeded without returning a booking');
+    res.status(500).json({ error: 'Booking creation failed to return a result' });
+    return;
+  }
+
+  const responseBody: Record<string, unknown> = { ...result.data };
   const statusCode = 201;
 
   // ── Persist idempotency record ──────────────────────────────────────────────
@@ -259,7 +267,10 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    ...(result.warning ? { warning: result.warning } : {}),
+  });
 }
 
 export async function confirmBooking(req: Request, res: Response): Promise<void> {

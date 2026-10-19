@@ -7,6 +7,11 @@ import { supabase } from '@/config/supabase.js';
 import type { AdminRequest } from '@/middleware/admin.middleware.js';
 import { z } from 'zod';
 
+function getRouteId(value: string | string[] | undefined): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  return value;
+}
+
 // ─── Featured listings ────────────────────────────────────────────────────────
 
 /** Zod schema for the set-featured request body. */
@@ -43,7 +48,7 @@ const setFeaturedSchema = z.object({
  * Response: the updated property row.
  */
 export async function setFeaturedHandler(req: Request, res: Response): Promise<void> {
-  const propertyId = req.params.id;
+  const propertyId = getRouteId(req.params.id);
   if (!propertyId) {
     res.status(400).json({ error: 'Property ID is required' });
     return;
@@ -90,7 +95,7 @@ export async function setFeaturedHandler(req: Request, res: Response): Promise<v
  * Response: the updated property row.
  */
 export async function clearFeaturedHandler(req: Request, res: Response): Promise<void> {
-  const propertyId = req.params.id;
+  const propertyId = getRouteId(req.params.id);
   if (!propertyId) {
     res.status(400).json({ error: 'Property ID is required' });
     return;
@@ -280,7 +285,11 @@ export async function listUsers(req: AdminRequest, res: Response): Promise<void>
  * User detail with booking history.
  */
 export async function getUserDetail(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
+    return;
+  }
 
   const [userResult, bookingsResult] = await Promise.all([
     supabase
@@ -308,7 +317,11 @@ export async function getUserDetail(req: AdminRequest, res: Response): Promise<v
  * POST /api/v1/admin/users/:id/suspend
  */
 export async function suspendUser(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
+    return;
+  }
 
   const { error } = await supabase
     .from('users')
@@ -335,7 +348,11 @@ export async function suspendUser(req: AdminRequest, res: Response): Promise<voi
  * POST /api/v1/admin/users/:id/activate
  */
 export async function activateUser(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
+    return;
+  }
 
   const { error } = await supabase
     .from('users')
@@ -394,7 +411,11 @@ export async function listAdminProperties(req: AdminRequest, res: Response): Pro
  * POST /api/v1/admin/properties/:id/suspend
  */
 export async function suspendProperty(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
+    return;
+  }
 
   const { error } = await supabase
     .from('properties')
@@ -421,7 +442,11 @@ export async function suspendProperty(req: AdminRequest, res: Response): Promise
  * POST /api/v1/admin/properties/:id/activate
  */
 export async function activateProperty(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
+    return;
+  }
 
   const { error } = await supabase
     .from('properties')
@@ -476,6 +501,45 @@ export async function listAdminBookings(req: AdminRequest, res: Response): Promi
   res.json({ data, meta: { page, limit, total: count ?? 0 } });
 }
 
+/**
+ * GET /api/v1/admin/bookings/:id/escrow-reconciliation
+ *
+ * Read-only reconciliation history for authorized operations staff.
+ */
+export async function getEscrowReconciliationHandler(req: AdminRequest, res: Response): Promise<void> {
+  const parsedId = z.string().uuid().safeParse(req.params.id);
+  if (!parsedId.success) {
+    res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Booking ID must be a UUID' } });
+    return;
+  }
+
+  const { data: booking, error: bookingError } = await supabase
+    .from('bookings')
+    .select('id, status, reconcile_attempts, last_reconcile_at, next_reconcile_at, last_reconcile_error')
+    .eq('id', parsedId.data)
+    .maybeSingle();
+  if (bookingError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: bookingError.message } });
+    return;
+  }
+  if (!booking) {
+    res.status(404).json({ error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found' } });
+    return;
+  }
+
+  const { data: attempts, error: attemptsError } = await supabase
+    .from('escrow_reconciliation_attempts')
+    .select('id, attempt_number, provider_event_id, status, error_category, error_message, next_retry_at, created_at')
+    .eq('booking_id', parsedId.data)
+    .order('attempt_number', { ascending: false });
+  if (attemptsError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: attemptsError.message } });
+    return;
+  }
+
+  res.json({ booking, attempts: attempts ?? [] });
+}
+
 // ─── Dispute management ───────────────────────────────────────────────────────
 
 const resolveDisputeSchema = z.object({
@@ -512,7 +576,11 @@ export async function listDisputes(req: AdminRequest, res: Response): Promise<vo
  * Resolve a dispute with a resolution note.
  */
 export async function resolveDispute(req: AdminRequest, res: Response): Promise<void> {
-  const { id } = req.params;
+  const id = getRouteId(req.params.id);
+  if (!id) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'Dispute ID is required' } });
+    return;
+  }
 
   const parsed = resolveDisputeSchema.safeParse(req.body);
   if (!parsed.success) {

@@ -38,6 +38,7 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [refundPreview, setRefundPreview] = useState<RefundPreview | null>(null);
   const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
+  const [refundPreviewError, setRefundPreviewError] = useState<string | null>(null);
 
   const status      = normaliseStatus(booking.status);
   const transitions = TENANT_TRANSITIONS[status] ?? [];
@@ -49,8 +50,6 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
       setShowCancelConfirm(false);
     });
 
-  if (transitions.length === 0) return null;
-
   const isLoading = pendingAction !== null;
 
   // Fetch refund preview from the booking-time policy snapshot when the
@@ -58,11 +57,13 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
   useEffect(() => {
     if (!showCancelConfirm) {
       setRefundPreview(null);
+      setRefundPreviewError(null);
       return;
     }
 
     let cancelled = false;
     setRefundPreviewLoading(true);
+    setRefundPreviewError(null);
 
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
     fetch(`${API_BASE}/api/v1/bookings/${booking.id}/refund-preview`, {
@@ -72,9 +73,11 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
       .then((data: RefundPreview) => {
         if (!cancelled) setRefundPreview(data);
       })
-      .catch(() => {
-        // Non-fatal: the cancel dialog still works without the preview
-        if (!cancelled) setRefundPreview(null);
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setRefundPreview(null);
+          setRefundPreviewError(error instanceof Error ? error.message : 'Refund calculation is unavailable');
+        }
       })
       .finally(() => {
         if (!cancelled) setRefundPreviewLoading(false);
@@ -82,6 +85,8 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
 
     return () => { cancelled = true; };
   }, [showCancelConfirm, booking.id]);
+
+  if (transitions.length === 0) return null;
 
   const handleDispute = async () => {
     if (!disputeReason.trim()) return;
@@ -230,15 +235,15 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
               )}
             </div>
           )}
-          {!refundPreviewLoading && !refundPreview && (
-            <p className="text-xs text-gray-600 dark:text-gray-400">
-              Cancellation will trigger an escrow refund. This action cannot be undone.
+          {!refundPreviewLoading && refundPreviewError && (
+            <p role="alert" className="text-xs text-red-700 dark:text-red-300">
+              {refundPreviewError}. Refresh the preview before cancelling.
             </p>
           )}
           <div className="flex gap-2">
             <button
               type="button"
-              disabled={isLoading}
+              disabled={isLoading || refundPreviewLoading || !refundPreview || !!refundPreviewError}
               onClick={() => cancel()}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-red-600 text-white
                 text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition

@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
 export interface EscrowStatus {
-  status: 'locked' | 'released' | 'refunded';
+  status: 'locked' | 'released' | 'refunded' | 'pending' | 'manual_review';
   amount: number;
   releaseDate?: string;
 }

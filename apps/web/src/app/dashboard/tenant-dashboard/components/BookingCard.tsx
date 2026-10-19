@@ -9,8 +9,8 @@ interface BookingCardProps {
   checkIn: Date;
   checkOut: Date;
   totalPrice: number;
-  status: 'pending' | 'confirmed' | 'completed' | 'cancelled';
-  escrowStatus: 'locked' | 'released' | 'refunded';
+  status: 'pending' | 'confirmed' | 'completed' | 'cancelled' | 'escrow_reconcile_failed';
+  escrowStatus?: 'locked' | 'released' | 'refunded' | 'pending' | 'manual_review';
   thumbnail?: string;
 }
 
@@ -25,18 +25,33 @@ export default function BookingCard({
   escrowStatus,
   thumbnail,
 }: BookingCardProps) {
+  const normalizedStatus = status.toLowerCase();
+  const normalizedEscrowStatus = escrowStatus ?? 'pending';
   const statusColors = {
     pending: 'bg-yellow-100 text-yellow-700',
     confirmed: 'bg-blue-100 text-blue-700',
     completed: 'bg-green-100 text-green-700',
     cancelled: 'bg-red-100 text-red-700',
+    escrow_reconcile_failed: 'bg-red-100 text-red-700',
   };
 
   const escrowColors = {
     locked: 'bg-yellow-50 text-yellow-700',
     released: 'bg-green-50 text-green-700',
     refunded: 'bg-blue-50 text-blue-700',
+    pending: 'bg-yellow-50 text-yellow-700',
+    manual_review: 'bg-red-50 text-red-700',
   };
+  const statusLabel = normalizedStatus === 'escrow_reconcile_failed'
+    ? 'Escrow review required'
+    : normalizedStatus.charAt(0).toUpperCase() + normalizedStatus.slice(1);
+  const escrowLabel = normalizedStatus === 'escrow_reconcile_failed'
+    ? 'Manual review required'
+    : normalizedEscrowStatus === 'pending'
+      ? 'Verification pending'
+      : normalizedEscrowStatus === 'manual_review'
+        ? 'Manual review required'
+        : normalizedEscrowStatus.charAt(0).toUpperCase() + normalizedEscrowStatus.slice(1);
 
   return (
     <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden hover:shadow-md transition">
@@ -75,13 +90,13 @@ export default function BookingCard({
             <DollarSign size={16} className="text-blue-600" />
             <span className="font-semibold text-gray-900">{totalPrice} USDC</span>
           </div>
-          <span className={`text-xs px-2 py-1 rounded-full font-medium ${statusColors[status]}`}>
-            {status.charAt(0).toUpperCase() + status.slice(1)}
+          <span className={`text-xs px-2 py-1 rounded-full font-medium ${statusColors[normalizedStatus as keyof typeof statusColors]}`}>
+            {statusLabel}
           </span>
         </div>
 
-        <div className={`text-xs px-2 py-1 rounded-full font-medium ${escrowColors[escrowStatus]} text-center`}>
-          Escrow: {escrowStatus.charAt(0).toUpperCase() + escrowStatus.slice(1)}
+        <div className={`text-xs px-2 py-1 rounded-full font-medium ${escrowColors[normalizedEscrowStatus]} text-center`}>
+          Escrow: {escrowLabel}
         </div>
 
         <a

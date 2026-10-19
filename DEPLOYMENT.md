@@ -160,6 +160,20 @@ psql -U postgres -d rentars -f apps/backend/database/migrations/00011_create_not
 psql -U postgres -d rentars -f database/migrations/001_create_sync_tables.sql
 ```
 
+Apply the remaining root migrations in numerical order. The payment, refund,
+ledger, and reconciliation schema changes require migrations 007 and 008 first:
+
+```bash
+psql -U postgres -d rentars -f database/migrations/007_create_earnings_ledger_entries.sql
+psql -U postgres -d rentars -f database/migrations/008_create_refund_snapshots_and_requests.sql
+psql -U postgres -d rentars -f database/migrations/009_payment_escrow_reconciliation.sql
+```
+
+Configure `STELLAR_USDC_ISSUER` in the backend and `NEXT_PUBLIC_USDC_ISSUER` in
+the frontend with the same network-specific classic USDC asset issuer. Payment
+submission is rejected unless the signed Stellar operation uses that issuer and
+the quoted amount.
+
 If the backend is deployed inside Docker, ensure the DB credentials in `SUPABASE_URL` or `DATABASE_URL` are reachable from the container.
 
 ### 4.3 Redis setup
