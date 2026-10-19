@@ -136,6 +136,8 @@ export interface CreateBookingInput {
   /** UTC timestamp when the tenant accepted the terms. */
   terms_accepted_at?: string;
   on_chain_property_id?: bigint;
+  /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
+  quote_token?: string;
 }
 
 export interface RequestModificationInput {
@@ -494,7 +496,7 @@ export class BookingService {
     // 1. Fetch property + owner (include capacity and stay-length limits)
     const { data: property, error: propertyError } = await supabase
       .from('properties')
-      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at')
+      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at, draft_status, moderation_state')
       .eq('id', property_id)
       .single();
 
@@ -512,11 +514,27 @@ export class BookingService {
       check_in_time?: string;
       check_out_time?: string;
       deleted_at?: string | null;
+      draft_status?: string | null;
+      moderation_state?: string | null;
     };
 
     // Reject bookings against soft-deleted (removed) listings
     if (prop.deleted_at) {
       return { success: false, error: 'This property is no longer available for booking' };
+    }
+
+    // Drafts are not bookable. A listing hidden by moderation stops accepting new
+    // bookings, but bookings made before the hide are not changed.
+    if (prop.draft_status === 'draft') {
+      return { success: false, error: 'This property is not available for booking' };
+    }
+    if (prop.moderation_state === 'hidden') {
+      return {
+        success: false,
+        error: 'This property is temporarily unavailable for new bookings',
+        statusCode: 409,
+        code: 'LISTING_HIDDEN',
+      };
     }
 
     // Capacity check
@@ -562,6 +580,35 @@ export class BookingService {
       }
     }
 
+    // 1b. Re-price the stay on the server. The tenant's total must match a fresh
+    //     quote (and a supplied quote token, if any) before dates are reserved or
+    //     funds are authorised. The server total is what gets charged.
+    const priceCheck = await assertQuotedTotal({
+      propertyId: property_id,
+      checkIn: check_in,
+      checkOut: check_out,
+      clientTotal: total_price,
+      quoteToken: input.quote_token,
+    });
+    if (!priceCheck.success || !priceCheck.data) {
+      return {
+        success: false,
+        error: priceCheck.error,
+        statusCode: priceCheck.statusCode,
+        conflict: priceCheck.conflict,
+        code: priceCheck.code,
+        details: priceCheck.details,
+      };
+    }
+    const chargedTotal = priceCheck.data.total;
+
+    // Capture the listing terms the tenant is agreeing to, at the same point the
+    // price is confirmed. This is stored with the booking and never changes after.
+    const termsSnapshot = await captureListingTermsSnapshot(property_id);
+    if (!termsSnapshot.success || !termsSnapshot.data) {
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
+
     // 2. Fetch Stellar addresses
     const [ownerStellarAddress, buyerStellarAddress] = await Promise.all([
       fetchStellarAddress(prop.owner_id),
@@ -592,7 +639,7 @@ export class BookingService {
         p_tenant_id: tenant_id,
         p_check_in: check_in,
         p_check_out: check_out,
-        p_total_price: total_price,
+        p_total_price: chargedTotal,
         p_guest_count: guest_count,
         p_rules_acknowledged_at: rules_acknowledged_at ?? null,
         p_terms_version: terms_version ?? null,
@@ -612,6 +659,21 @@ export class BookingService {
     }
 
     const bookingId = reservedId as string;
+
+    // Store the agreed listing terms on the booking. The snapshot is immutable
+    // (see migration 00065), so this is the only write that sets it.
+    const { error: snapshotError } = await supabase
+      .from('bookings')
+      .update({
+        listing_terms_snapshot: termsSnapshot.data.terms,
+        listing_revision: termsSnapshot.data.revision,
+      })
+      .eq('id', bookingId);
+
+    if (snapshotError) {
+      await supabase.from('bookings').delete().eq('id', bookingId);
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
 
     // 5. Check on-chain availability (advisory; non-blocking on error).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -663,7 +725,7 @@ export class BookingService {
         bookingId,
         buyerAddress: buyerStellarAddress,
         sellerAddress: ownerStellarAddress,
-        amountUsdc: String(total_price),
+        amountUsdc: String(chargedTotal),
         checkIn: check_in,
         checkOut: check_out,
       });
@@ -756,7 +818,7 @@ export class BookingService {
           buyerStellarAddress,
           checkInTs,
           checkOutTs,
-          BigInt(Math.round(total_price * 1e7)),
+          BigInt(Math.round(chargedTotal * 1e7)),
         );
 
         loggingService.logBlockchainOperation('createBookingOnChain', {

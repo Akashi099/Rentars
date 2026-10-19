@@ -282,8 +282,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
         await releaseKey(claimedId);
-        const status = result.conflict ? 409 : 400;
-        res.status(status).json({ error: result.error });
+        const status = result.statusCode ?? (result.conflict ? 409 : 400);
+        res.status(status).json({ error: result.error, code: result.code, details: result.details });
         return;
       }
 
@@ -304,8 +304,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   const result = await bookingService.createBooking(req.body);
 
   if (!result.success) {
-    const status = result.conflict ? 409 : 400;
-    res.status(status).json({ error: result.error });
+    const status = result.statusCode ?? (result.conflict ? 409 : 400);
+    res.status(status).json({ error: result.error, code: result.code, details: result.details });
     return;
   }
 

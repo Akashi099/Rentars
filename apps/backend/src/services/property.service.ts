@@ -79,6 +79,44 @@ export interface Property {
   // Draft status (migration 00060) — 'draft', 'active', 'archived'
   draft_status?: string;
   publish_at?: string | null;
+  // Moderation visibility (migration 00065) — independent of deleted_at
+  moderation_state?: 'visible' | 'hidden';
+  moderation_updated_at?: string | null;
+  // Stay rules that bookings are priced and validated against
+  min_nights?: number;
+  max_nights?: number | null;
+  check_in_time?: string;
+  check_out_time?: string;
+}
+
+/**
+ * Public visibility rule shared by every discovery path (listing, slug, featured,
+ * and search). A row is public only when it is not a host draft and is not hidden
+ * by moderation. Soft-deleted rows are excluded separately by each caller.
+ */
+export function applyPublicVisibility<Q>(query: Q): Q {
+  const filterable = query as unknown as PublicVisibilityFilterable;
+  return filterable
+    .or('draft_status.is.null,draft_status.neq.draft')
+    .eq('moderation_state', 'visible') as unknown as Q;
+}
+
+/** Structural type for the chainable filter methods used by applyPublicVisibility. */
+interface PublicVisibilityFilterable {
+  or(filters: string): PublicVisibilityFilterable;
+  eq(column: string, value: string): PublicVisibilityFilterable;
+}
+
+/**
+ * In-memory counterpart of applyPublicVisibility, for rows already loaded.
+ * Covers both the legacy `status = 'draft'` marker and the draft workflow column.
+ */
+export function isPubliclyReadable(property: Pick<Property, 'status' | 'draft_status' | 'moderation_state'>): boolean {
+  return (
+    property.status !== 'draft' &&
+    property.draft_status !== 'draft' &&
+    property.moderation_state !== 'hidden'
+  );
 }
 
 /**
@@ -152,11 +190,12 @@ function validateAmenities(amenities: string[]): string | null {
  * Retrieve all active (non-soft-deleted) properties.
  */
 export async function getAllProperties(page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Property>>> {
-  const query = supabase
-    .from('properties')
-    .select('*', { count: 'exact' })
-    .is('deleted_at', null)
-    .order('created_at', { ascending: false });
+  const query = applyPublicVisibility(
+    supabase
+      .from('properties')
+      .select('*', { count: 'exact' })
+      .is('deleted_at', null),
+  ).order('created_at', { ascending: false });
   const response = await executePaginatedQuery(query, page, pageSize);
   if (response.error) return { success: false, error: response.error };
   return { success: true, data: response.result };
@@ -189,21 +228,11 @@ export async function getPropertyById(
   }
 
   const cacheKey = `property:${id}`;
+  // Only public rows are ever cached, so a cached hit is always safe to serve
+  // to anyone. Owner-only rows (drafts, hidden listings) fall through to the DB.
   const cached = await cache.get<Property>(cacheKey);
-  if (cached) {
-    // Owners always get fresh data for their own draft/unpublished listings.
-    const isDraftOwnedByRequester =
-      requesterId && cached.status === 'draft' && cached.owner_id === requesterId;
-    if (!isDraftOwnedByRequester) {
-      // If the cached entry is soft-deleted, only surface it to the owner when
-      // includeDeleted is explicitly requested.
-      if (cached.deleted_at) {
-        if (!includeDeleted || cached.owner_id !== requesterId) {
-          return { success: false, error: 'Property not found' };
-        }
-      }
-      return { success: true, data: cached };
-    }
+  if (cached && isPubliclyReadable(cached)) {
+    return { success: true, data: cached };
   }
 
   const { data, error } = await supabase
@@ -217,13 +246,17 @@ export async function getPropertyById(
   }
 
   const property = data as Property;
+  const isOwner = !!requesterId && property.owner_id === requesterId;
 
   // Enforce soft-delete visibility: hide from anyone who isn't the owner
   // requesting their own deleted history.
-  if (property.deleted_at) {
-    if (!includeDeleted || property.owner_id !== requesterId) {
-      return { success: false, error: 'Property not found' };
-    }
+  if (property.deleted_at && (!includeDeleted || !isOwner)) {
+    return { success: false, error: 'Property not found' };
+  }
+
+  // Drafts and moderation-hidden listings are owner-only.
+  if (!isOwner && !isPubliclyReadable(property)) {
+    return { success: false, error: 'Property not found' };
   }
 
   const { data: imageRows, error: imageError } = await supabase
@@ -241,10 +274,9 @@ export async function getPropertyById(
     }));
   }
 
-  // Draft properties change frequently and are owner-only — do not cache them.
-  // Soft-deleted properties should also not be cached on the public key to
-  // prevent stale hidden listings from being served.
-  if (property.status !== 'draft' && !property.deleted_at) {
+  // Drafts change frequently and are owner-only, and hidden or deleted listings
+  // must not be served from the public cache key, so only public rows are cached.
+  if (isPubliclyReadable(property) && !property.deleted_at) {
     await cache.set(cacheKey, property, TTL_ONE);
   }
 
@@ -525,12 +557,13 @@ export async function getPropertyBySlug(
     return { success: false, error: 'Slug is required' };
   }
 
-  const { data, error } = await supabase
-    .from('properties')
-    .select('*')
-    .eq('slug', slug)
-    .is('deleted_at', null)
-    .single();
+  const { data, error } = await applyPublicVisibility(
+    supabase
+      .from('properties')
+      .select('*')
+      .eq('slug', slug)
+      .is('deleted_at', null),
+  ).single();
 
   if (error) {
     return { success: false, error: 'Property not found' };
@@ -539,7 +572,7 @@ export async function getPropertyBySlug(
   const property = data as Property;
 
   // Warm the id-based cache entry so subsequent id lookups are fast
-  if (property.status !== 'draft') {
+  if (isPubliclyReadable(property)) {
     await cache.set(`property:${property.id}`, property, TTL_ONE);
   }
 
@@ -556,13 +589,15 @@ export async function getFeaturedProperties(
 
   const now = new Date().toISOString();
 
-  const { data, error } = await supabase
-    .from('properties')
-    .select('*')
-    .eq('status', 'available')
-    .is('deleted_at', null)
-    .not('featured_until', 'is', null)
-    .gt('featured_until', now)
+  const { data, error } = await applyPublicVisibility(
+    supabase
+      .from('properties')
+      .select('*')
+      .eq('status', 'available')
+      .is('deleted_at', null)
+      .not('featured_until', 'is', null)
+      .gt('featured_until', now),
+  )
     .order('featured_weight', { ascending: false })
     .order('featured_until', { ascending: false })
     .limit(cap);
@@ -668,7 +703,9 @@ export async function searchProperties(
 ): Promise<ServiceResponse<PaginatedResult<Property>>> {
   const page = Math.max(filters.page ?? 1, 1);
   const pageSize = Math.min(filters.pageSize ?? filters.limit ?? 20, 100);
-  let query = supabase.from('properties').select('*', { count: 'exact' }).is('deleted_at', null);
+  let query = applyPublicVisibility(
+    supabase.from('properties').select('*', { count: 'exact' }).is('deleted_at', null),
+  );
 
   if (filters.city) {
     query = query.ilike('city', `%${filters.city}%`);
@@ -825,8 +862,8 @@ export async function advancedSearch(
       ? supabase.from('properties').select('id', { count: 'exact', head: true })
       : supabase.from('properties').select('*');
 
-    // Always exclude soft-deleted listings from public search
-    q = q.is('deleted_at', null);
+    // Always exclude soft-deleted, draft, and moderation-hidden listings from public search
+    q = applyPublicVisibility(q.is('deleted_at', null));
 
     // Full-text search on title/description
     if (filters.query) {
@@ -1247,27 +1284,209 @@ export async function getHostDrafts(
   return { success: true, data: (data ?? []) as Property[] };
 }
 
+/** Fields a host may edit on a draft. Anything else is ignored by updateDraftProperty. */
+export const DRAFT_EDITABLE_FIELDS = [
+  'title',
+  'description',
+  'price_per_night',
+  'address',
+  'city',
+  'country',
+  'bedrooms',
+  'bathrooms',
+  'max_guests',
+  'property_type',
+  'amenities',
+  'pets_allowed',
+  'smoking_allowed',
+  'events_allowed',
+  'quiet_hours_start',
+  'quiet_hours_end',
+  'additional_rules',
+  'min_nights',
+  'max_nights',
+  'check_in_time',
+  'check_out_time',
+] as const;
+
+/** Fields that must be present before a draft can go live. */
+const PUBLISH_REQUIRED_FIELDS = [
+  'title',
+  'price_per_night',
+  'city',
+  'country',
+  'bedrooms',
+  'bathrooms',
+  'max_guests',
+] as const;
+
+/** Presence check that treats 0 (e.g. a studio's bedroom count) as a real value. */
+function hasValue(value: unknown): boolean {
+  return value !== null && value !== undefined && value !== '';
+}
+
 /**
- * Validate that a property has required fields for publication.
+ * Validate the draft fields a host has supplied so far. Section-level checks
+ * let autosave reject bad input immediately without requiring a complete listing.
+ *
+ * @returns An error message for the first invalid field, or null when valid.
  */
-function validateForPublication(property: Property): string | null {
-  const required = ['title', 'price_per_night', 'city', 'country', 'bedrooms', 'bathrooms', 'max_guests'];
-  for (const field of required) {
-    if (!property[field as keyof Property]) {
-      return `Missing required field: ${field}`;
+function validateDraftPatch(patch: Partial<Property>): string | null {
+  if (patch.title !== undefined && (typeof patch.title !== 'string' || patch.title.trim() === '')) {
+    return 'title must be a non-empty string';
+  }
+  if (patch.price_per_night !== undefined && (typeof patch.price_per_night !== 'number' || !(patch.price_per_night > 0))) {
+    return 'price_per_night must be a positive number';
+  }
+  for (const field of ['bedrooms', 'bathrooms'] as const) {
+    const value = patch[field];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 0)) {
+      return `${field} must be a non-negative integer`;
     }
   }
-
-  if (!property.images || property.images.length === 0) {
-    return 'At least one image is required';
+  if (patch.max_guests !== undefined && (typeof patch.max_guests !== 'number' || !Number.isInteger(patch.max_guests) || patch.max_guests < 1)) {
+    return 'max_guests must be a positive integer';
   }
-
+  if (patch.min_nights !== undefined && (typeof patch.min_nights !== 'number' || !Number.isInteger(patch.min_nights) || patch.min_nights < 1)) {
+    return 'min_nights must be a positive integer';
+  }
+  if (patch.max_nights !== undefined && patch.max_nights !== null) {
+    if (typeof patch.max_nights !== 'number' || !Number.isInteger(patch.max_nights) || patch.max_nights < (patch.min_nights ?? 1)) {
+      return 'max_nights must be an integer at least as large as min_nights';
+    }
+  }
+  if (patch.amenities !== undefined) {
+    if (!Array.isArray(patch.amenities)) return 'amenities must be an array';
+    const amenityError = validateAmenities(patch.amenities);
+    if (amenityError) return amenityError;
+  }
   return null;
 }
 
 /**
+ * Return the owner's draft with completion state, for resuming an interrupted listing.
+ * Non-owners and published listings get "not found" so drafts stay private.
+ */
+export async function getDraftProperty(
+  ownerId: string,
+  propertyId: string,
+): Promise<ServiceResponse<Property & { completion: ReturnType<typeof getDraftCompletionStatus> }>> {
+  const { data, error } = await supabase
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .eq('owner_id', ownerId)
+    .eq('draft_status', 'draft')
+    .maybeSingle();
+
+  if (error || !data) {
+    return { success: false, error: 'Draft property not found', statusCode: 404 };
+  }
+
+  const draft = data as Property;
+  return {
+    success: true,
+    data: { ...draft, completion: getDraftCompletionStatus(draft) },
+  };
+}
+
+/**
+ * Autosave a draft. Applies only whitelisted, validated fields.
+ *
+ * Optimistic concurrency: when `expectedUpdatedAt` is supplied the write only
+ * applies if the stored row still carries that timestamp. Otherwise the caller
+ * gets a 409 with the current version so it can merge rather than overwrite.
+ *
+ * @param expectedUpdatedAt - The `updated_at` the client last read, if any.
+ */
+export async function updateDraftProperty(
+  ownerId: string,
+  propertyId: string,
+  patch: Partial<Property>,
+  expectedUpdatedAt?: string,
+): Promise<ServiceResponse<Property>> {
+  const fields: Partial<Property> = {};
+  for (const field of DRAFT_EDITABLE_FIELDS) {
+    if (patch[field] !== undefined) {
+      (fields as Record<string, unknown>)[field] = patch[field];
+    }
+  }
+
+  if (Object.keys(fields).length === 0) {
+    return { success: false, error: 'No editable draft fields provided', statusCode: 400 };
+  }
+
+  const validationError = validateDraftPatch(fields);
+  if (validationError) {
+    return { success: false, error: validationError, statusCode: 400 };
+  }
+
+  if (fields.title !== undefined) fields.title = sanitizeShortText(fields.title, 255);
+  if (fields.description !== undefined && fields.description !== null) {
+    fields.description = sanitizeLongText(fields.description, 10_000);
+  }
+  if (fields.additional_rules !== undefined && fields.additional_rules !== null) {
+    fields.additional_rules = sanitizeLongText(fields.additional_rules, 2_000);
+  }
+
+  let writeQuery = supabase
+    .from('properties')
+    .update(fields)
+    .eq('id', propertyId)
+    .eq('owner_id', ownerId)
+    .eq('draft_status', 'draft');
+
+  if (expectedUpdatedAt) {
+    writeQuery = writeQuery.eq('updated_at', expectedUpdatedAt);
+  }
+
+  const { data, error } = await writeQuery.select().maybeSingle();
+
+  if (error) {
+    return { success: false, error: error.message };
+  }
+
+  if (!data) {
+    // Nothing matched: either the draft is gone, or someone else changed it.
+    const current = await getDraftProperty(ownerId, propertyId);
+    if (!current.success || !current.data) {
+      return { success: false, error: 'Draft property not found', statusCode: 404 };
+    }
+    return {
+      success: false,
+      error: 'Draft was changed since it was last loaded',
+      conflict: true,
+      statusCode: 409,
+      data: current.data,
+    };
+  }
+
+  return { success: true, data: data as Property };
+}
+
+/**
+ * Check whether a draft meets the requirements to go live.
+ *
+ * @param imageCount - Number of uploaded photos (images live in property_images).
+ */
+export function getPublishReadiness(
+  property: Property,
+  imageCount: number,
+): { ready: boolean; missingFields: string[] } {
+  const missingFields: string[] = PUBLISH_REQUIRED_FIELDS.filter(
+    (field) => !hasValue(property[field]),
+  );
+  if (imageCount < 1) missingFields.push('images');
+  return { ready: missingFields.length === 0, missingFields };
+}
+
+/**
  * Publish a draft property to active listing.
- * Validates all required fields are present.
+ *
+ * Idempotent: publishing an already-active listing returns it unchanged, so a
+ * client retry after a timeout cannot create a duplicate or re-run side effects.
+ * The status flip is a compare-and-set on `draft_status = 'draft'`, so two
+ * concurrent publishes also resolve to a single transition.
  */
 export async function publishDraft(
   ownerId: string,
@@ -1278,27 +1497,61 @@ export async function publishDraft(
     .select('*')
     .eq('id', propertyId)
     .eq('owner_id', ownerId)
-    .eq('draft_status', 'draft')
-    .single();
+    .maybeSingle();
 
   if (fetchError || !property) {
-    return { success: false, error: 'Draft property not found' };
+    return { success: false, error: 'Draft property not found', statusCode: 404 };
   }
 
-  const validationError = validateForPublication(property as Property);
-  if (validationError) {
-    return { success: false, error: validationError };
+  const row = property as Property;
+
+  if (row.draft_status === 'active') {
+    return { success: true, data: row };
+  }
+
+  if (row.draft_status !== 'draft') {
+    return { success: false, error: 'Only drafts can be published', statusCode: 409 };
+  }
+
+  const { count: imageCount } = await supabase
+    .from('property_images')
+    .select('id', { count: 'exact', head: true })
+    .eq('property_id', propertyId);
+
+  const readiness = getPublishReadiness(row, imageCount ?? 0);
+  if (!readiness.ready) {
+    return {
+      success: false,
+      error: `Listing is not ready to publish. Missing: ${readiness.missingFields.join(', ')}`,
+      statusCode: 422,
+    };
   }
 
   const { data: updated, error: updateError } = await supabase
     .from('properties')
     .update({ draft_status: 'active', publish_at: new Date().toISOString() })
     .eq('id', propertyId)
+    .eq('owner_id', ownerId)
+    .eq('draft_status', 'draft')
     .select()
-    .single();
+    .maybeSingle();
 
   if (updateError) {
     return { success: false, error: updateError.message };
+  }
+
+  if (!updated) {
+    // A concurrent publish won the race; report the listing as published.
+    const { data: current } = await supabase
+      .from('properties')
+      .select('*')
+      .eq('id', propertyId)
+      .eq('owner_id', ownerId)
+      .maybeSingle();
+    if (current && (current as Property).draft_status === 'active') {
+      return { success: true, data: current as Property };
+    }
+    return { success: false, error: 'Draft property not found', statusCode: 404 };
   }
 
   // Bust caches
@@ -1368,7 +1621,58 @@ const VERSIONED_FIELDS: ReadonlyArray<keyof Property> = [
   'city',
   'country',
   'property_type',
+  'min_nights',
+  'max_nights',
+  'check_in_time',
+  'check_out_time',
 ] as const;
+
+/**
+ * Capture the booking-relevant terms of a listing as they stand now, plus its
+ * revision number. Booking creation stores this so a tenant's booking keeps the
+ * terms they agreed to, however the host edits the listing later.
+ *
+ * @returns `revision` is the latest property_versions number (0 if never versioned).
+ */
+export async function captureListingTermsSnapshot(
+  propertyId: string,
+): Promise<ServiceResponse<{ revision: number; terms: Record<string, unknown> }>> {
+  const { data: property, error } = await supabase
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .maybeSingle();
+
+  if (error || !property) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+
+  const { data: latest } = await supabase
+    .from('property_versions')
+    .select('version_number')
+    .eq('property_id', propertyId)
+    .order('version_number', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const row = property as unknown as Record<string, unknown>;
+  const terms: Record<string, unknown> = {};
+  for (const field of VERSIONED_FIELDS) {
+    terms[field] = row[field] ?? null;
+  }
+
+  return {
+    success: true,
+    data: {
+      revision: (latest as { version_number: number } | null)?.version_number ?? 0,
+      terms: {
+        ...terms,
+        listing_updated_at: row.updated_at ?? null,
+        captured_at: new Date().toISOString(),
+      },
+    },
+  };
+}
 
 export interface PropertyVersion {
   id: string;
@@ -1524,8 +1828,40 @@ export async function rollbackToVersion(
     return { success: false, error: 'Forbidden: only the property owner may roll back a version', statusCode: 403 };
   }
 
-  // Apply the snapshot as an update (this will trigger a new version record).
-  const restorePayload = version.snapshot as Partial<Property>;
+  // A restore is a host edit, so it must not get around moderation or removal.
+  // Moderation-hidden and removed listings are restored only by a moderator.
+  if (currentProperty.deleted_at) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+  if (currentProperty.moderation_state === 'hidden') {
+    return {
+      success: false,
+      error: 'This listing is hidden by moderation and cannot be restored by the host',
+      statusCode: 409,
+      code: 'LISTING_HIDDEN',
+    };
+  }
+
+  // Only tracked, booking-relevant fields are restored. Anything else in the
+  // snapshot (visibility, draft state, ownership) is ignored.
+  const snapshot = version.snapshot as Record<string, unknown>;
+  const restorePayload: Partial<Property> = {};
+  for (const field of VERSIONED_FIELDS) {
+    if (snapshot[field] !== undefined) {
+      (restorePayload as Record<string, unknown>)[field] = snapshot[field];
+    }
+  }
+
+  const alreadyCurrent = VERSIONED_FIELDS.every(
+    (field) =>
+      restorePayload[field] === undefined ||
+      JSON.stringify(restorePayload[field]) === JSON.stringify(currentProperty[field]),
+  );
+  if (alreadyCurrent) {
+    return { success: false, error: 'The listing already matches this version', statusCode: 409 };
+  }
+
+  // Apply the snapshot as an update (this records a new version rather than rewriting history).
   const updateResult = await updateProperty(propertyId, restorePayload, actorId, 'rollback',
     `Rolled back to version ${version.version_number} (id: ${versionId})`);
 

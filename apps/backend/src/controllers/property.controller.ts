@@ -665,7 +665,68 @@ export async function publishDraftHandler(req: AuthRequest, res: Response): Prom
   const result = await publishDraft(userId, req.params.id);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/properties/:id/draft
+ *
+ * Resume an unfinished listing. Owner-only.
+ */
+export async function getDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { getDraftProperty } = await import('../services/property.service.js');
+  const result = await getDraftProperty(userId, req.params.id as string);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * PATCH /api/v1/properties/:id/draft
+ *
+ * Autosave draft fields. Send `expected_updated_at` (the `updated_at` from the
+ * last read) to get a 409 with the current draft instead of overwriting a newer edit.
+ */
+export async function updateDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { expected_updated_at, ...patch } = (req.body ?? {}) as Record<string, unknown> & {
+    expected_updated_at?: unknown;
+  };
+
+  if (expected_updated_at !== undefined && typeof expected_updated_at !== 'string') {
+    res.status(400).json({ error: 'expected_updated_at must be an ISO timestamp string' });
+    return;
+  }
+
+  const { updateDraftProperty } = await import('../services/property.service.js');
+  const result = await updateDraftProperty(
+    userId,
+    req.params.id as string,
+    patch,
+    expected_updated_at as string | undefined,
+  );
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error, ...(result.conflict ? { current: result.data } : {}) });
     return;
   }
 

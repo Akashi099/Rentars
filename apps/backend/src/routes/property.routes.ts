@@ -17,6 +17,8 @@ import {
   trackSuggestionAcceptedHandler,
   createDraftHandler,
   getHostDraftsHandler,
+  getDraftHandler,
+  updateDraftHandler,
   publishDraftHandler,
   getPropertyVersionsHandler,
   rollbackPropertyVersionHandler,
@@ -105,7 +107,13 @@ router.post('/draft', authenticate, createDraftHandler);
 // GET /api/v1/properties/drafts - list host's drafts
 router.get('/drafts', authenticate, getHostDraftsHandler);
 
-// PATCH /api/v1/properties/:id/publish - publish draft to active
+// GET /api/v1/properties/:id/draft - resume an unfinished draft (owner only)
+router.get('/:id/draft', authenticate, getDraftHandler);
+
+// PATCH /api/v1/properties/:id/draft - autosave draft fields (owner only, optimistic concurrency)
+router.patch('/:id/draft', authenticate, updateDraftHandler);
+
+// PATCH /api/v1/properties/:id/publish - publish draft to active (idempotent)
 router.patch('/:id/publish', authenticate, publishDraftHandler);
 
 // ── Property Management ────────────────────────────────────────────────────────
