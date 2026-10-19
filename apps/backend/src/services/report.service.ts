@@ -16,6 +16,10 @@ export const REPORT_REASONS = [
   'inappropriate',
   'misleading',
   'harassment',
+  'discrimination',
+  'unsafe_property',
+  'privacy',
+  'retaliatory',
   'other',
 ] as const;
 export type ReportReason = (typeof REPORT_REASONS)[number];

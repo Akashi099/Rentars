@@ -30,7 +30,72 @@ export type NotificationType =
   | 'new_property'
   | 'system_alert'
   | 'report_created'
-  | 'message_received';
+  | 'message_received'
+  | 'appeal_submitted'
+  | 'report_notification'
+  | 'moderation_decision';
+
+/** Coarse bucket used for filtering the notification list. */
+export type NotificationCategory =
+  | 'booking'
+  | 'payment'
+  | 'review'
+  | 'dispute'
+  | 'message'
+  | 'moderation'
+  | 'social'
+  | 'system';
+
+export const VALID_NOTIFICATION_CATEGORIES: ReadonlyArray<NotificationCategory> = [
+  'booking',
+  'payment',
+  'review',
+  'dispute',
+  'message',
+  'moderation',
+  'social',
+  'system',
+];
+
+/**
+ * Map a notification type to its coarse category bucket.
+ * This mapping is the single source of truth — the DB migration backfill
+ * uses the same CASE logic.
+ */
+export function categoryForType(type: NotificationType): NotificationCategory {
+  switch (type) {
+    case 'booking_created':
+    case 'booking_confirmed':
+    case 'booking_cancelled':
+    case 'booking_completed':
+    case 'booking_expired':
+    case 'booking_reminder':
+    case 'booking_modification_requested':
+    case 'booking_modification_accepted':
+    case 'booking_modification_declined':
+      return 'booking';
+    case 'payment_received':
+      return 'payment';
+    case 'review_requested':
+    case 'review_submitted':
+    case 'host_response':
+      return 'review';
+    case 'dispute_initiated':
+    case 'booking_disputed':
+      return 'dispute';
+    case 'message_received':
+      return 'message';
+    case 'report_created':
+    case 'moderation_decision':
+    case 'appeal_submitted':
+    case 'report_notification':
+      return 'moderation';
+    case 'new_property':
+      return 'social';
+    default:
+      return 'system';
+  }
+}
 
 export interface Notification {
   id: string;
@@ -38,6 +103,10 @@ export interface Notification {
   type: NotificationType;
   data: Record<string, unknown>;
   read: boolean;
+  category?: NotificationCategory;
+  deep_link?: string | null;
+  event_id?: string | null;
+  expires_at?: string | null;
   created_at?: string;
 }
 
@@ -86,6 +155,9 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'booking_created',
   'booking_confirmed',
   'booking_cancelled',
+  'booking_completed',
+  'booking_disputed',
+  'booking_expired',
   'booking_modification_requested',
   'booking_modification_accepted',
   'booking_modification_declined',
@@ -99,37 +171,149 @@ const VALID_NOTIFICATION_TYPES: ReadonlyArray<NotificationType> = [
   'system_alert',
   'report_created',
   'message_received',
+  'appeal_submitted',
+  'report_notification',
+  'moderation_decision',
 ];
+
+/**
+ * Keys that are stripped from notification `data` payloads when returning
+ * list responses.  This prevents sensitive fields (email addresses, internal
+ * error details, wallet addresses, amounts) from leaking through list endpoints.
+ * Individual notification detail views may still expose safe fields.
+ */
+const SENSITIVE_DATA_KEYS = [
+  'userEmail',
+  'userName',
+  'walletAddress',
+  'errorDetails',
+  'internalNote',
+  'supportLink',
+  'attempt',
+  'audience',
+] as const;
+
+/**
+ * Return a sanitised copy of the notification data with sensitive keys removed.
+ * Applied to every notification in list responses.
+ */
+function sanitizeDataForList(data: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (!SENSITIVE_DATA_KEYS.includes(key as (typeof SENSITIVE_DATA_KEYS)[number])) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+/**
+ * Apply list-safe sanitisation to a single notification row.
+ */
+function sanitizeNotificationForList(n: Notification): Notification {
+  return {
+    ...n,
+    data: sanitizeDataForList(n.data ?? {}),
+  };
+}
+
+/**
+ * Invalidate the notification cache for a user after a mutation.
+ * Cache keys follow the pattern `notifications:<userId>`.
+ */
+async function invalidateNotificationCache(userId: string): Promise<void> {
+  try {
+    const { invalidatePattern } = await import('./cache.service.js');
+    await invalidatePattern(`notifications:${userId}`);
+  } catch {
+    // Cache miss is non-fatal
+  }
+}
+
+/** Options for creating a notification. */
+export interface CreateNotificationOptions {
+  /** Client-side route the app navigates to on tap. */
+  deepLink?: string;
+  /** Stable event identifier for dedup — prevents duplicate notifications for the same logical event. */
+  eventId?: string;
+  /** Optional retention cutoff; the notification is auto-deleted after this timestamp. */
+  expiresAt?: string;
+}
 
 export async function createNotification(
   userId: string,
   type: NotificationType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  options?: CreateNotificationOptions,
 ): Promise<ServiceResponse<Notification>> {
   if (!VALID_NOTIFICATION_TYPES.includes(type)) {
     return { success: false, error: `Unknown notification type: ${type}` };
   }
 
+  const category = categoryForType(type);
+
+  // Event ID dedup: if an event_id is provided, check for an existing
+  // notification with the same (user_id, event_id).  If found, return it
+  // idempotently instead of creating a duplicate.
+  if (options?.eventId) {
+    const { data: existing } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('event_id', options.eventId)
+      .maybeSingle();
+
+    if (existing) {
+      return { success: true, data: existing as Notification };
+    }
+  }
+
+  const insertPayload: Record<string, unknown> = {
+    user_id: userId,
+    type,
+    data,
+    category,
+    ...(options?.deepLink && { deep_link: options.deepLink }),
+    ...(options?.eventId && { event_id: options.eventId }),
+    ...(options?.expiresAt && { expires_at: options.expiresAt }),
+  };
+
   const { data: notification, error } = await supabase
     .from('notifications')
-    .insert({ user_id: userId, type, data })
+    .insert(insertPayload)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
+
+  // Invalidate the notification cache so the next list request sees the new row.
+  await invalidateNotificationCache(userId);
+
   return { success: true, data: notification as Notification };
 }
 
-export async function getNotifications(userId: string, page = 1, pageSize = 20): Promise<ServiceResponse<PaginatedResult<Notification>>> {
-  const query = supabase
+export async function getNotifications(
+  userId: string,
+  page = 1,
+  pageSize = 20,
+  category?: NotificationCategory | null,
+): Promise<ServiceResponse<PaginatedResult<Notification>>> {
+  let query = supabase
     .from('notifications')
     .select('*', { count: 'exact' })
     .eq('user_id', userId)
     .order('created_at', { ascending: false });
 
+  if (category && VALID_NOTIFICATION_CATEGORIES.includes(category)) {
+    query = query.eq('category', category);
+  }
+
   const response = await executePaginatedQuery(query, page, Math.min(Math.max(1, pageSize), 100));
   if (response.error) return { success: false, error: response.error };
-  return { success: true, data: response.result };
+
+  // Sanitise sensitive fields out of the list payload.
+  const sanitized = response.result!.data.map(sanitizeNotificationForList);
+  return { success: true, data: { ...response.result!, data: sanitized } };
 }
 
 /**
@@ -138,14 +322,16 @@ export async function getNotifications(userId: string, page = 1, pageSize = 20):
  * Sort key: (created_at DESC, id DESC) — stable even under concurrent inserts.
  * We fetch limit+1 rows so we can detect whether a next page exists.
  *
- * @param userId - The authenticated user's ID
- * @param cursor - Opaque cursor returned from a previous call (omit for first page)
- * @param limit  - Page size, default 20, max 100
+ * @param userId   - The authenticated user's ID
+ * @param cursor   - Opaque cursor returned from a previous call (omit for first page)
+ * @param limit    - Page size, default 20, max 100
+ * @param category - Optional category filter
  */
 export async function getNotificationsCursor(
   userId: string,
   cursor?: string | null,
   limit = 20,
+  category?: NotificationCategory | null,
 ): Promise<ServiceResponse<CursorPaginatedResult<Notification>>> {
   // Reject non-finite or fractional limits so the service never passes an
   // unexpected page size to Supabase. Valid integers are clamped to [1, 100].
@@ -164,6 +350,10 @@ export async function getNotificationsCursor(
     .order('id', { ascending: false })
     .limit(pageSize + 1); // +1 to detect hasMore
 
+  if (category && VALID_NOTIFICATION_CATEGORIES.includes(category)) {
+    query = query.eq('category', category);
+  }
+
   if (decoded) {
     // Keyset filter: rows strictly after the cursor position
     // (created_at < cursor.created_at) OR (created_at = cursor.created_at AND id < cursor.id)
@@ -179,7 +369,10 @@ export async function getNotificationsCursor(
   const rows = (data ?? []) as Notification[];
   const page = buildCursorPage(rows, pageSize);
 
-  return { success: true, data: page };
+  // Sanitise sensitive fields out of the list payload.
+  const sanitizedData = page.data.map(sanitizeNotificationForList);
+
+  return { success: true, data: { ...page, data: sanitizedData } };
 }
 
 export async function markAsRead(
@@ -193,7 +386,51 @@ export async function markAsRead(
     .eq('user_id', userId);
 
   if (error) return { success: false, error: error.message };
+
+  await invalidateNotificationCache(userId);
   return { success: true };
+}
+
+/**
+ * Mark a specific set of notifications as read for the authenticated user.
+ *
+ * Authorization: the `eq('user_id', userId)` filter ensures a user can only
+ * mark their own notifications.  Idempotent — already-read rows are
+ * unaffected by the UPDATE.
+ *
+ * @param userId          - The authenticated user's ID (authorization scope)
+ * @param notificationIds - Array of notification UUIDs to mark as read
+ * @returns               - Count of notifications actually updated
+ */
+export async function bulkMarkAsRead(
+  userId: string,
+  notificationIds: string[],
+): Promise<ServiceResponse<{ updated: number }>> {
+  if (!userId || !userId.trim()) {
+    return { success: false, error: 'user_id is required' };
+  }
+  if (!Array.isArray(notificationIds) || notificationIds.length === 0) {
+    return { success: false, error: 'notificationIds must be a non-empty array' };
+  }
+  // Cap the batch size to prevent abuse.
+  if (notificationIds.length > 500) {
+    return { success: false, error: 'Cannot mark more than 500 notifications at once' };
+  }
+
+  // The eq('user_id', userId) clause is the authorization boundary —
+  // even if an attacker passes another user's notification IDs, the update
+  // will not affect them.
+  const { data, error } = await supabase
+    .from('notifications')
+    .update({ read: true })
+    .eq('user_id', userId)
+    .in('id', notificationIds)
+    .select('id');
+
+  if (error) return { success: false, error: error.message };
+
+  await invalidateNotificationCache(userId);
+  return { success: true, data: { updated: data?.length ?? 0 } };
 }
 
 export async function markAllAsRead(userId: string): Promise<ServiceResponse<void>> {
@@ -208,6 +445,8 @@ export async function markAllAsRead(userId: string): Promise<ServiceResponse<voi
     .eq('read', false);
 
   if (error) return { success: false, error: error.message };
+
+  await invalidateNotificationCache(userId);
   return { success: true };
 }
 
@@ -222,6 +461,8 @@ export async function deleteNotification(
     .eq('user_id', userId);
 
   if (error) return { success: false, error: error.message };
+
+  await invalidateNotificationCache(userId);
   return { success: true };
 }
 
@@ -233,7 +474,51 @@ export async function deleteAllNotifications(userId: string): Promise<ServiceRes
     .select('id');
 
   if (error) return { success: false, error: error.message };
+
+  await invalidateNotificationCache(userId);
   return { success: true, data: data?.length ?? 0 };
+}
+
+/**
+ * Get the count of unread notifications for a user.
+ * Used by the UI to display a badge.
+ */
+export async function getUnreadCount(userId: string): Promise<ServiceResponse<number>> {
+  const { count, error } = await supabase
+    .from('notifications')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('read', false);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: count ?? 0 };
+}
+
+/**
+ * Delete notifications that have passed their retention cutoff.
+ *
+ * This function is designed to be called by a scheduled job / cron.
+ * Only rows with a non-null `expires_at` that is in the past are deleted.
+ *
+ * @returns Count of deleted notifications.
+ */
+export async function cleanupExpiredNotifications(): Promise<ServiceResponse<number>> {
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from('notifications')
+    .delete()
+    .lt('expires_at', now)
+    .select('id');
+
+  if (error) return { success: false, error: error.message };
+
+  const deleted = data?.length ?? 0;
+  if (deleted > 0) {
+    console.info(`[NotificationService] Cleaned up ${deleted} expired notifications`);
+  }
+
+  return { success: true, data: deleted };
 }
 
 export async function getPreferences(
@@ -306,9 +591,10 @@ export async function shouldSendInApp(userId: string, type: NotificationType): P
 export async function createNotificationWithEmail(
   userId: string,
   type: NotificationType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  options?: CreateNotificationOptions,
 ): Promise<ServiceResponse<Notification>> {
-  const result = await createNotification(userId, type, data);
+  const result = await createNotification(userId, type, data, options);
   if (!result.success) return result;
 
   const sendEmail = await shouldSendEmail(userId, type);
@@ -362,9 +648,10 @@ export async function sendBatchedNotifications(
 export async function createNotificationWithAllChannels(
   userId: string,
   type: NotificationType,
-  data: Record<string, unknown>
+  data: Record<string, unknown>,
+  options?: CreateNotificationOptions,
 ): Promise<ServiceResponse<void>> {
-  const inAppResult = await createNotification(userId, type, data);
+  const inAppResult = await createNotification(userId, type, data, options);
   if (!inAppResult.success) {
     return { success: false, error: inAppResult.error };
   }
@@ -452,6 +739,11 @@ export async function notifyHostFollowers(
     hostName:      data.hostName,
   };
 
+  // Deep link to the property listing page.
+  const deepLink = data.propertySlug
+    ? `/properties/${data.propertySlug}`
+    : `/properties/${data.propertyId}`;
+
   let notified = 0;
 
   for (const followerId of followerIds) {
@@ -460,7 +752,12 @@ export async function notifyHostFollowers(
       const send = await shouldSendInApp(followerId, 'new_property');
       if (!send) continue;
 
-      const result = await createNotification(followerId, 'new_property', payload);
+      // Use a per-follower event_id so retries don't create duplicates.
+      const eventId = `new_property:${data.propertyId}:${followerId}`;
+      const result = await createNotification(followerId, 'new_property', payload, {
+        deepLink,
+        eventId,
+      });
       if (result.success) notified++;
     } catch (err) {
       // Log and continue — one follower's failure must not abort the fan-out

@@ -6,6 +6,12 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getCurrentPolicySnapshot } from '@/services/platformPolicy.service.js';
+import {
+  getCurrentModerationPolicyHandler,
+  listPolicyVersionsHandler,
+  getPolicyVersionHandler,
+} from '@/controllers/moderationPolicy.controller.js';
+import { authenticate, requireRole } from '../middleware/auth.middleware.js';
 
 const router = Router();
 
@@ -48,5 +54,21 @@ router.get('/current', (_req: Request, res: Response): void => {
   res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
   res.json(snapshot);
 });
+
+// ─── Moderation policy ───────────────────────────────────────────────────────
+//
+// Returns the versioned content moderation policy — reason codes, enforcement
+// actions, appeal windows, and retention rules.  The /current endpoint is
+// public so the UI can display report reason options without authentication.
+// The /versions endpoints are admin-only for audit trail access.
+
+// GET /api/v1/policy/moderation/current — public
+router.get('/moderation/current', getCurrentModerationPolicyHandler);
+
+// GET /api/v1/policy/moderation/versions — admin only
+router.get('/moderation/versions', authenticate, requireRole('admin'), listPolicyVersionsHandler);
+
+// GET /api/v1/policy/moderation/versions/:version — admin only
+router.get('/moderation/versions/:version', authenticate, requireRole('admin'), getPolicyVersionHandler);
 
 export default router;
