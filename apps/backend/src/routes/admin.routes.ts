@@ -113,4 +113,11 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
+// ── Ledger adjustment (finance) ───────────────────────────────────────────────
+// #770 — Posts an auditable correction entry to the host earnings ledger.
+// Scope: admin:ledger:adjust → admin, finance (HIGH-RISK — dual approval required)
+// Body: { direction: 'credit'|'debit', amount: number, adminNote: string, bookingId?: string }
+import { postLedgerAdjustment } from '@/routes/host.routes.js';
+router.post('/host/:hostId/ledger/adjustment', requireScope('admin:ledger:adjust'), postLedgerAdjustment);
+
 export default router;

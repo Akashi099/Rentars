@@ -10,7 +10,7 @@
  *   admin       — all scopes (full platform access)
  *   moderator   — content moderation, dispute management, search analytics
  *   support     — read-only user/booking/property lookup, rate-limit summary
- *   finance     — refund approvals, reconciliation (dual-approval required)
+ *   finance     — refund approvals, reconciliation, ledger adjustments (dual-approval required)
  *
  * The JWT `role` claim carries one of: "admin" | "moderator" | "support" | "finance".
  * Sub-roles are additive: a user can only have one role.
@@ -47,7 +47,9 @@ export type AdminScope =
   | 'admin:ratelimits:read'
   // Refund / financial
   | 'admin:refunds:approve'    // HIGH-RISK: financial action, dual-approval required
-  | 'admin:reconciliation:read';
+  | 'admin:reconciliation:read'
+  // Ledger adjustments (#770)
+  | 'admin:ledger:adjust';     // HIGH-RISK: posts auditable corrections to earnings ledger
 
 // ── Scopes that require dual approval ────────────────────────────────────────
 
@@ -55,6 +57,7 @@ export const DUAL_APPROVAL_REQUIRED = new Set<AdminScope>([
   'admin:disputes:resolve',
   'admin:refunds:approve',
   'admin:users:suspend',
+  'admin:ledger:adjust',
 ]);
 
 // ── Role → Scope mapping ──────────────────────────────────────────────────────
@@ -79,6 +82,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:ratelimits:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:ledger:adjust',
   ],
   moderator: [
     'admin:dashboard:read',
@@ -107,6 +111,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:refunds:approve',
     'admin:reconciliation:read',
     'admin:audit:read',
+    'admin:ledger:adjust',
   ],
 };
 
