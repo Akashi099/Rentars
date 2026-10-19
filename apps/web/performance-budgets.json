@@ -1,0 +1,194 @@
+{
+    "budgets": [
+        {
+            "route": "/",
+            "description": "Home page",
+            "metrics": {
+                "bundleSize": {
+                    "js": "250kb",
+                    "css": "50kb",
+                    "total": "300kb"
+                },
+                "webVitals": {
+                    "LCP": 2500,
+                    "FID": 100,
+                    "CLS": 0.1,
+                    "INP": 200,
+                    "TTFB": 800
+                },
+                "navigationTime": 1500
+            }
+        },
+        {
+            "route": "/search",
+            "description": "Search page with map and filters",
+            "metrics": {
+                "bundleSize": {
+                    "js": "400kb",
+                    "css": "60kb",
+                    "total": "500kb",
+                    "note": "Includes Leaflet map library (lazy-loaded)"
+                },
+                "webVitals": {
+                    "LCP": 3000,
+                    "FID": 100,
+                    "CLS": 0.1,
+                    "INP": 250,
+                    "TTFB": 1000
+                },
+                "navigationTime": 2000,
+                "searchResponseTime": 800
+            }
+        },
+        {
+            "route": "/property/[id]",
+            "description": "Property detail page",
+            "metrics": {
+                "bundleSize": {
+                    "js": "350kb",
+                    "css": "55kb",
+                    "total": "450kb",
+                    "note": "Includes image gallery and map components"
+                },
+                "webVitals": {
+                    "LCP": 2800,
+                    "FID": 100,
+                    "CLS": 0.1,
+                    "INP": 200,
+                    "TTFB": 900
+                },
+                "navigationTime": 1800
+            }
+        },
+        {
+            "route": "/booking",
+            "description": "Booking flow",
+            "metrics": {
+                "bundleSize": {
+                    "js": "450kb",
+                    "css": "60kb",
+                    "total": "550kb",
+                    "note": "Includes Stellar SDK and wallet connectors (lazy-loaded)"
+                },
+                "webVitals": {
+                    "LCP": 2500,
+                    "FID": 100,
+                    "CLS": 0.05,
+                    "INP": 150,
+                    "TTFB": 800
+                },
+                "navigationTime": 1500
+            }
+        },
+        {
+            "route": "/dashboard",
+            "description": "User dashboard with charts",
+            "metrics": {
+                "bundleSize": {
+                    "js": "400kb",
+                    "css": "65kb",
+                    "total": "500kb",
+                    "note": "Includes recharts library for analytics (lazy-loaded)"
+                },
+                "webVitals": {
+                    "LCP": 2800,
+                    "FID": 100,
+                    "CLS": 0.1,
+                    "INP": 200,
+                    "TTFB": 900
+                },
+                "navigationTime": 2000
+            }
+        }
+    ],
+    "baseline": {
+        "measuredAt": "2026-10-17",
+        "environment": "production",
+        "device": "Moto G4 (4x CPU slowdown)",
+        "connection": "Slow 4G (400ms RTT, 400kbps down, 400kbps up)",
+        "tool": "Lighthouse v11",
+        "note": "Baselines should be updated quarterly or after major dependency changes"
+    },
+    "enforcement": {
+        "ci": {
+            "enabled": true,
+            "failOnExcess": false,
+            "warnThreshold": "10%",
+            "command": "npm run build && npx lighthouse-ci autorun"
+        },
+        "monitoring": {
+            "enabled": true,
+            "tool": "Lighthouse CI + Web Vitals RUM",
+            "alertThreshold": "20% regression",
+            "dashboardUrl": "https://lighthouse-ci.yourcompany.com"
+        }
+    },
+    "exceptions": {
+        "process": "Exceptions require approval from tech lead with documented justification",
+        "template": {
+            "route": "/route-path",
+            "exceededMetric": "bundleSize.js",
+            "requestedBudget": "500kb",
+            "currentBudget": "400kb",
+            "justification": "New feature X requires library Y (100kb gzipped)",
+            "mitigations": "Lazy load library, code split by route",
+            "approvedBy": "Tech Lead Name",
+            "approvedDate": "YYYY-MM-DD",
+            "reviewDate": "YYYY-MM-DD (3 months from approval)"
+        },
+        "approved": []
+    },
+    "optimization": {
+        "lazyLoadComponents": [
+            "Leaflet map (apps/web/src/components/properties/PropertyMap.tsx)",
+            "Stellar SDK (apps/web/src/lib/stellar.ts)",
+            "Freighter wallet adapter (apps/web/src/lib/freighter-utils.ts)",
+            "Recharts (apps/web/src/components/dashboard/*)",
+            "Image gallery lightbox"
+        ],
+        "imageOptimization": {
+            "formats": [
+                "webp",
+                "avif"
+            ],
+            "sizes": {
+                "thumbnail": "320w",
+                "card": "640w",
+                "detail": "1280w",
+                "hero": "1920w"
+            },
+            "quality": 85,
+            "devicePixelRatios": [
+                1,
+                2
+            ]
+        },
+        "codeSplitting": {
+            "strategy": "route-based + dynamic imports",
+            "chunks": [
+                "framework (React, Next.js)",
+                "commons (shared utilities)",
+                "route-specific (per page)"
+            ]
+        }
+    },
+    "monitoring": {
+        "realUserMonitoring": {
+            "enabled": true,
+            "sampleRate": 0.1,
+            "reportTo": "/api/v1/web-vitals"
+        },
+        "syntheticMonitoring": {
+            "frequency": "hourly",
+            "locations": [
+                "us-east",
+                "eu-west",
+                "ap-southeast"
+            ],
+            "devices": [
+                "mobile",
+                "desktop"
+            ]
+        }
+    }
+}
