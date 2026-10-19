@@ -12,6 +12,8 @@ import {
   getBookingCalendar,
   getBookingReceipt,
   getBookingStatusHistory,
+  getRefundPreviewHandler,
+  getRefundStatusHandler,
   listUserBookings,
   raiseDispute,
   requestModification,
@@ -87,9 +89,18 @@ router.post('/:id/complete', authenticate, completeBooking);
 router.post('/:id/dispute', authenticate, disputeBooking);
 
 // POST /api/v1/bookings/:id/cancel
-// Tenant cancels a booking → refund computed per policy → escrow settled → both parties notified
+// Tenant cancels a booking → refund computed from booking-time snapshot → escrow settled → both parties notified
 // Body (optional): { reason?: string }
 router.post('/:id/cancel', authenticate, validateBody(cancelBookingSchema), cancelBooking);
+
+// GET /api/v1/bookings/:id/refund-preview
+// Shows the refund calculation from the booking-time policy snapshot *before*
+// the tenant confirms cancellation.  Does not modify any state. (#769)
+router.get('/:id/refund-preview', authenticate, getRefundPreviewHandler);
+
+// GET /api/v1/bookings/:id/refund
+// Returns the current refund request status (requested/submitted/confirmed/failed/manual_review). (#769)
+router.get('/:id/refund', authenticate, getRefundStatusHandler);
 
 // POST /api/v1/bookings/:id/dispute
 router.post('/:id/dispute', authenticate, validateBody(raiseDisputeSchema), raiseDispute);

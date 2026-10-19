@@ -18,6 +18,14 @@ import { createNotification, getPreferences } from './notification.service.js';
 import { emailService } from './email.service.js';
 import { buildPreferenceUrlForUser } from './preferenceToken.js';
 import { computeRefund } from './refundPolicy.service.js';
+import {
+  createRefundSnapshot,
+  createRefundRequest,
+  computeRefundFromSnapshot,
+  transitionRefundStatus,
+  getRefundPreview,
+  type RefundStatus,
+} from './refund.service.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
 import type { CursorPaginatedResult } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
@@ -545,6 +553,15 @@ export class BookingService {
 
     const booking = bookingData as Booking;
 
+    // #769 — Snapshot the refund policy at booking creation time so later
+    // policy changes don't affect this booking's refund terms.
+    createRefundSnapshot({
+      bookingId: booking.id,
+      totalPrice: total_price,
+    }).catch((err) =>
+      console.warn('[BookingService] Failed to create refund snapshot:', err),
+    );
+
     // Notify tenant (in-app)
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
       () => {},
@@ -687,16 +704,45 @@ export class BookingService {
       };
     }
 
-    // 4. Compute refund per the configured policy
+    // 4. Compute refund from the booking-time policy snapshot (#769).
+    //    Falls back to the live policy if no snapshot exists (legacy bookings).
     let refund;
-    try {
-      refund = computeRefund({
-        totalPrice: booking.total_price ?? 0,
-        checkIn: booking.check_in,
+    let snapshotId: string | undefined;
+
+    const snapshotRefundResult = await computeRefundFromSnapshot(
+      bookingId,
+      booking.check_in ?? '',
+      now,
+    );
+
+    if (snapshotRefundResult.success && snapshotRefundResult.data) {
+      refund = snapshotRefundResult.data;
+      snapshotId = snapshotRefundResult.data.snapshotId;
+    } else {
+      // Fallback: compute from the live policy (for legacy bookings without
+      // a snapshot).
+      try {
+        refund = computeRefund({
+          totalPrice: booking.total_price ?? 0,
+          checkIn: booking.check_in ?? '',
+          cancelledAt: now,
+        });
+      } catch (err) {
+        return { success: false, error: `Cannot compute refund: ${String(err)}` };
+      }
+    }
+
+    // 4a. Create an idempotent refund request tracking the settlement lifecycle.
+    if (hostId && booking.tenant_id) {
+      await createRefundRequest({
+        bookingId,
+        tenantId: booking.tenant_id,
+        hostId,
         cancelledAt: now,
-      });
-    } catch (err) {
-      return { success: false, error: `Cannot compute refund: ${String(err)}` };
+        destinationEscrowId: booking.escrow_id ?? undefined,
+      }).catch((err) =>
+        console.warn('[BookingService] Failed to create refund request:', err),
+      );
     }
 
     // 5. Drive the appropriate escrow action for the refund tier
