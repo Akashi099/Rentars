@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — 2026-10-19
+
+#### #740 — Recovery and verification token hardening
+- Email verification and password reset tokens are claimed with conditional updates, so a concurrent reuse of the same link fails.
+- Password reset looks accounts up by email in the `users` table. The previous `listUsers()` call only saw the first page.
+- Password reset responses take a constant minimum time and send email without awaiting delivery, so known and unknown addresses look the same.
+- A successful reset or logout-all-devices revokes access tokens issued before that moment. The new `sessionRevocationGuard` enforces this and fails closed.
+- Removed the hard-coded `'secret'` fallback for `JWT_SECRET` in the auth middleware.
+
+#### #741 — Abuse controls for authentication endpoints
+- Each auth route has its own IP bucket, plus an account bucket for login, register, reset request and wallet endpoints.
+- Added `TRUST_PROXY` (hop count or trusted address list; `true` is rejected) so rate limits key on the real client behind a load balancer.
+- Redis failure on auth routes returns 503 instead of silently disabling limits.
+- Operator overrides: `AUTH_IP_RATE_POINTS`, `AUTH_IP_RATE_WINDOW_SECONDS`, `AUTH_ACCOUNT_RATE_POINTS`, `AUTH_ACCOUNT_RATE_WINDOW_SECONDS`.
+
+#### #742 — Audit coverage for account and recovery events
+- Added audit records for password reset requests, email verification and wallet linking.
+- Refund approvals are recorded under `admin.refund_approve` (previously logged as `payment.confirmed`).
+- Audit metadata redaction now covers arrays and raw payload or body keys.
+- Migration `00065_audit_logs_append_only.sql` blocks `UPDATE` and `DELETE` on `audit_logs`.
+
+#### #743 — Cookie, CORS and CSRF review
+- Disallowed origins no longer raise a 500. CORS headers are withheld and the browser blocks the read.
+- In production, `CORS_ORIGIN` must be explicit and use `https://`.
+- Documented token transport, CORS, and CSRF behaviour in `docs/SECURITY_AUTH_HARDENING.md`.
+- Repaired broken imports that stopped `auth.routes.ts` from loading: the auth routes now use `authenticate`, the wallet simulate and transaction preflight use `soroban.ts`, and a stray `await` in `probe.service.ts` is removed.
+- Bearer-authenticated mutations skip the double-submit CSRF check. The web client sends Bearer tokens and never sends `X-CSRF-Token`, so every write was being rejected. Cookie-only cross-site posts still get 403.
+
 ### Added — 2026-09-25
 
 #### #576 — Reproducible lockfile and runtime checks

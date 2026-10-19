@@ -1,6 +1,7 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
+import { processDueAccountDeletions } from './privacy.service.js';
 
 const bookingService = new BookingService();
 
@@ -8,6 +9,7 @@ const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const ACCOUNT_DELETION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
@@ -104,6 +106,11 @@ export function startSyncScheduler(): void {
   setInterval(() => {
     runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
   }, BOOKING_EXPIRY_INTERVAL_MS);
+
+  // Account deletion — executes requests whose 7-day cancellation window has closed.
+  setInterval(() => {
+    processDueAccountDeletions().catch((err) => console.error('[privacy] Deletion worker error:', err));
+  }, ACCOUNT_DELETION_INTERVAL_MS);
 
   // Run an initial cleanup shortly after startup so stale keys don't linger
   // across a server restart that happens to be more than 24 h after creation.

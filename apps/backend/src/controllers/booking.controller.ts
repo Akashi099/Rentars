@@ -8,11 +8,21 @@ import { supabase } from '@/config/supabase.js';
 import { env } from '@/config/env.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import type { BookingModification } from '@/services/booking.service.js';
+import type { BookingActor } from '@/services/bookingAuthorization.service.js';
 import { lookup, store, lockKey, completeKey, releaseKey, hashRequestBody } from '@/services/idempotency.service.js';
 import { fetchReceiptData, generateReceiptPdf } from '@/services/receipt.service.js';
 
 function calendarFeedSecret(): string {
   return env.CALENDAR_FEED_SECRET ?? env.JWT_SECRET;
+}
+
+/**
+ * The authenticated caller, from the JWT populated by `authenticate`. Returns
+ * undefined when there is no caller, so handlers can answer 401.
+ */
+function bookingActor(req: Request): BookingActor | undefined {
+  const user = (req as Request & { user?: { id: string; role?: string } }).user;
+  return user?.id ? { id: user.id, role: user.role } : undefined;
 }
 
 function generateFeedToken(userId: string): string {
@@ -159,22 +169,45 @@ export async function declineModification(req: Request, res: Response): Promise<
   res.json(result.data);
 }
 
+/**
+ * GET /api/v1/bookings/:id
+ *
+ * Returns the booking to its tenant, its host, or a role that may read any booking.
+ * Anyone else receives 404.
+ */
 export async function getBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.getBookingById(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getBookingForActor(req.params.id, actor);
 
   if (!result.success) {
-    res.status(404).json({ error: result.error });
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 
   res.json(result.data);
 }
 
+/**
+ * GET /api/v1/bookings/:id/status-history
+ *
+ * Same access rule as getBooking.
+ */
 export async function getBookingStatusHistory(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.getBookingStatusHistory(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getBookingStatusHistoryForActor(req.params.id, actor);
 
   if (!result.success) {
-    res.status(404).json({ error: result.error });
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 
@@ -249,8 +282,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
         await releaseKey(claimedId);
-        const status = result.conflict ? 409 : 400;
-        res.status(status).json({ error: result.error });
+        const status = result.statusCode ?? (result.conflict ? 409 : 400);
+        res.status(status).json({ error: result.error, code: result.code, details: result.details });
         return;
       }
 
@@ -271,8 +304,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   const result = await bookingService.createBooking(req.body);
 
   if (!result.success) {
-    const status = result.conflict ? 409 : 400;
-    res.status(status).json({ error: result.error });
+    const status = result.statusCode ?? (result.conflict ? 409 : 400);
+    res.status(status).json({ error: result.error, code: result.code, details: result.details });
     return;
   }
 
@@ -389,22 +422,44 @@ export async function disputeBooking(req: Request, res: Response): Promise<void>
   res.json(result.data);
 }
 
+/**
+ * PATCH /api/v1/bookings/:id
+ *
+ * Admin only. Denied attempts are audited by the service.
+ */
 export async function updateBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.updateBooking(req.params.id, req.body);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.updateBooking(req.params.id, req.body, actor);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
   res.json(result.data);
 }
 
+/**
+ * DELETE /api/v1/bookings/:id
+ *
+ * Admin only. Denied attempts are audited by the service.
+ */
 export async function deleteBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.deleteBooking(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.deleteBooking(req.params.id, actor);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 

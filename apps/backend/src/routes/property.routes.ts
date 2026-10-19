@@ -17,6 +17,8 @@ import {
   trackSuggestionAcceptedHandler,
   createDraftHandler,
   getHostDraftsHandler,
+  getDraftHandler,
+  updateDraftHandler,
   publishDraftHandler,
   getPropertyVersionsHandler,
   rollbackPropertyVersionHandler,
@@ -41,10 +43,18 @@ import {
 import { authenticate } from '@/middleware/auth.middleware.js';
 import { requireEmailVerified } from '@/middleware/emailVerified.middleware.js';
 import { upload } from '@/middleware/multer.js';
+import { createUserRateLimiter } from '@/middleware/rateLimiter.js';
 import { geoSearchSchema, validateQuery } from '@/validators/property.validator.js';
 import { validatePagination } from '@/validators/pagination.validator.js';
 
 const router = Router();
+
+/** Per-account upload quota. Limits storage churn from one account, independent of IP. */
+const imageUploadLimiter = createUserRateLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 60,
+  keyPrefix: 'rl:property-images:upload',
+});
 
 // GET /api/v1/properties
 router.get('/', validatePagination, getProperties);
@@ -97,7 +107,13 @@ router.post('/draft', authenticate, createDraftHandler);
 // GET /api/v1/properties/drafts - list host's drafts
 router.get('/drafts', authenticate, getHostDraftsHandler);
 
-// PATCH /api/v1/properties/:id/publish - publish draft to active
+// GET /api/v1/properties/:id/draft - resume an unfinished draft (owner only)
+router.get('/:id/draft', authenticate, getDraftHandler);
+
+// PATCH /api/v1/properties/:id/draft - autosave draft fields (owner only, optimistic concurrency)
+router.patch('/:id/draft', authenticate, updateDraftHandler);
+
+// PATCH /api/v1/properties/:id/publish - publish draft to active (idempotent)
 router.patch('/:id/publish', authenticate, publishDraftHandler);
 
 // ── Property Management ────────────────────────────────────────────────────────
@@ -128,7 +144,7 @@ router.post('/:id/versions/:versionId/rollback', authenticate, requireEmailVerif
 router.get('/:id/images', listImages);
 
 // POST /api/v1/properties/:id/images
-router.post('/:id/images', authenticate, upload.single('image'), uploadImage);
+router.post('/:id/images', authenticate, imageUploadLimiter, upload.single('image'), uploadImage);
 
 // DELETE /api/v1/properties/:id/images/:imageId
 router.delete('/:id/images/:imageId', authenticate, deleteImage);
