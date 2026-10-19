@@ -10,6 +10,12 @@
 import nodemailer from 'nodemailer';
 import { env } from '@/config/env.js';
 import { renderEmail, escapeHtml } from './emailLayout.js';
+import {
+  createDeliveryRecord,
+  markSent,
+  markFailed,
+  isEmailSuppressed,
+} from './emailDelivery.service.js';
 
 // ─── Data shapes ──────────────────────────────────────────────────────────────
 
@@ -102,13 +108,85 @@ function createTransport() {
   });
 }
 
-async function send(to: string, subject: string, html: string, text?: string): Promise<void> {
-  const transport = createTransport();
-  if (!transport) {
-    console.log(`[EmailService] SMTP not configured — skipping email to ${to}: ${subject}`);
+/**
+ * Core send function.
+ *
+ * Before handing off to nodemailer:
+ *  1. Check suppression list (security emails bypass this).
+ *  2. Create a delivery log record in 'queued' state.
+ *  3. Send via SMTP and capture the provider message ID.
+ *  4. Update the record to 'sent' on success or 'failed' on error.
+ *
+ * @param templateKey     - Key from the email_templates registry.
+ * @param isSecurityEmail - If true, bypasses suppression check (reset/verify mails).
+ * @param isEssential     - Stored on the log record; used for operator triage.
+ * @param notificationId  - Optional FK to the notifications table for correlation.
+ */
+async function send(
+  to: string,
+  subject: string,
+  html: string,
+  text?: string,
+  templateKey = 'transactional',
+  isSecurityEmail = false,
+  isEssential = false,
+  notificationId?: string,
+): Promise<void> {
+  // ── Suppression check ───────────────────────────────────────────────────────
+  const suppressed = await isEmailSuppressed(to, templateKey, isSecurityEmail);
+  if (suppressed) {
+    // Create a 'suppressed' log record so operators can see the skip
+    await createDeliveryRecord({
+      recipientEmail: to,
+      templateKey,
+      notificationId,
+      isSecurityEmail,
+      isEssential,
+    }).then(async (r) => {
+      if (r.success && r.data) {
+        await markFailed(r.data.id, 'SUPPRESSED', 'Recipient is on the suppression list');
+      }
+    }).catch(() => { /* delivery log failure must never block the send path */ });
+    console.log(`[EmailService] Skipping suppressed recipient for template ${templateKey}`);
     return;
   }
-  await transport.sendMail({ from: env.EMAIL_FROM, to, subject, html, text });
+
+  const transport = createTransport();
+  if (!transport) {
+    console.log(`[EmailService] SMTP not configured — skipping email: ${subject}`);
+    return;
+  }
+
+  // ── Create delivery log record ───────────────────────────────────────────────
+  const logResult = await createDeliveryRecord({
+    recipientEmail: to,
+    templateKey,
+    notificationId,
+    isSecurityEmail,
+    isEssential,
+  }).catch(() => null);
+
+  const logId = logResult?.success ? logResult.data?.id : null;
+
+  // ── Send ─────────────────────────────────────────────────────────────────────
+  try {
+    const info = await transport.sendMail({ from: env.EMAIL_FROM, to, subject, html, text });
+    // nodemailer returns messageId with angle brackets: "<id@host>" — strip them
+    const rawId: string = (info as { messageId?: string }).messageId ?? '';
+    const providerMessageId = rawId.replace(/^<|>$/g, '') || null;
+
+    if (logId) {
+      await markSent(logId, providerMessageId).catch(() => { /* non-critical */ });
+    }
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    if (logId) {
+      // Schedule one retry in 15 minutes
+      const nextRetry = new Date(Date.now() + 15 * 60_000).toISOString();
+      await markFailed(logId, 'SMTP_ERROR', errorMessage, nextRetry).catch(() => { /* non-critical */ });
+    }
+    throw err; // re-throw so callers can handle
+  }
 }
 
 // ─── Shared template fragments ────────────────────────────────────────────────
@@ -386,7 +464,7 @@ export const emailService = {
           This link expires in 24 hours. If you did not create a Rentars account, you can safely ignore this email.
         </p>`,
     });
-    await send(data.to, 'Verify your Rentars email', html, text);
+    await send(data.to, 'Verify your Rentars email', html, text, 'verification', true, true);
   },
 
   async sendBookingCreated(data: BookingEmailData): Promise<void> {
@@ -408,7 +486,7 @@ export const emailService = {
       preferencesUrl: data.preferencesUrl,
     });
 
-    await send(data.to, 'Booking Received — Rentars', html, text);
+    await send(data.to, 'Booking Received — Rentars', html, text, 'booking_created');
   },
 
   async sendBookingConfirmed(data: BookingEmailData): Promise<void> {
@@ -428,7 +506,7 @@ export const emailService = {
       preferencesUrl: data.preferencesUrl,
     });
 
-    await send(data.to, 'Booking Confirmed by Host — Rentars', html, text);
+    await send(data.to, 'Booking Confirmed by Host — Rentars', html, text, 'booking_confirmed');
   },
 
   async sendBookingCancelled(data: BookingEmailData): Promise<void> {
@@ -451,7 +529,7 @@ export const emailService = {
       preferencesUrl: data.preferencesUrl,
     });
 
-    await send(data.to, 'Booking Cancelled — Rentars', html, text);
+    await send(data.to, 'Booking Cancelled — Rentars', html, text, 'booking_cancelled');
   },
 
   /**
@@ -505,7 +583,7 @@ export const emailService = {
       preferencesUrl: data.preferencesUrl,
     });
 
-    await send(data.to, `Booking Confirmed: ${data.propertyTitle} — Rentars`, html, text);
+    await send(data.to, `Booking Confirmed: ${data.propertyTitle} — Rentars`, html, text, 'booking_detailed');
   },
 
   /**
@@ -540,7 +618,7 @@ export const emailService = {
       preferencesUrl: data.preferencesUrl,
     });
 
-    await send(data.hostEmail, `New Booking: ${data.propertyTitle} — Rentars`, html, text);
+    await send(data.hostEmail, `New Booking: ${data.propertyTitle} — Rentars`, html, text, 'host_booking_notification');
   },
 
   async sendPasswordResetEmail(data: PasswordResetEmailData): Promise<void> {
@@ -563,6 +641,6 @@ export const emailService = {
           This link expires in 60 minutes. If you did not request a reset, you can safely ignore this email.
         </p>`,
     });
-    await send(data.to, 'Reset your Rentars password', html, text);
+    await send(data.to, 'Reset your Rentars password', html, text, 'password_reset', true, true);
   },
 };

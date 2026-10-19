@@ -49,6 +49,76 @@ export interface Report {
 
 const UNIQUE_VIOLATION = '23505';
 
+/** Maximum length of an appeal reason, in characters. */
+const MAX_APPEAL_REASON_LENGTH = 2_000;
+
+/**
+ * Confirm a report target exists and is still live. For listings, also return the
+ * owner so callers can enforce self-report rules and route host notices.
+ */
+async function loadReportTarget(
+  targetType: ReportTargetType,
+  targetId: string,
+): Promise<ServiceResponse<{ ownerId: string | null }>> {
+  if (targetType === 'property') {
+    const { data, error } = await supabase
+      .from('properties')
+      .select('owner_id, deleted_at')
+      .eq('id', targetId)
+      .maybeSingle();
+
+    if (error || !data || (data as { deleted_at: string | null }).deleted_at) {
+      return { success: false, error: 'Reported listing not found', statusCode: 404 };
+    }
+    return { success: true, data: { ownerId: (data as { owner_id: string }).owner_id } };
+  }
+
+  const { data, error } = await supabase
+    .from('reviews')
+    .select('id')
+    .eq('id', targetId)
+    .maybeSingle();
+
+  if (error || !data) {
+    return { success: false, error: 'Reported review not found', statusCode: 404 };
+  }
+  return { success: true, data: { ownerId: null } };
+}
+
+/**
+ * Set a listing's moderation visibility. This never touches `deleted_at`, so a
+ * host's own removal is not reversed by a moderation decision.
+ */
+async function setListingModerationState(
+  propertyId: string,
+  state: 'visible' | 'hidden',
+): Promise<ServiceResponse<null>> {
+  const { error } = await supabase
+    .from('properties')
+    .update({ moderation_state: state, moderation_updated_at: new Date().toISOString() })
+    .eq('id', propertyId);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: null };
+}
+
+/**
+ * True when another report still has an active hide on this listing. A listing
+ * stays hidden until every hide decision has been lifted.
+ */
+async function hasOtherActiveHide(propertyId: string, exceptReportId: string): Promise<boolean> {
+  const { data } = await supabase
+    .from('reports')
+    .select('id')
+    .eq('target_type', 'property')
+    .eq('target_id', propertyId)
+    .eq('hide_property', true)
+    .neq('id', exceptReportId)
+    .limit(1);
+
+  return Array.isArray(data) && data.length > 0;
+}
+
 /**
  * Submit an abuse report for a property listing or review.
  * Duplicate reports (same reporter + target) are rejected as a conflict.
@@ -65,6 +135,15 @@ export async function submitReport(
   }
   if (!REPORT_REASONS.includes(reason)) {
     return { success: false, error: `reason must be one of: ${REPORT_REASONS.join(', ')}` };
+  }
+
+  // Validate the target exists and that the reporter is not reporting their own listing.
+  const target = await loadReportTarget(targetType, targetId);
+  if (!target.success) {
+    return { success: false, error: target.error, statusCode: target.statusCode };
+  }
+  if (targetType === 'property' && target.data?.ownerId === reporterId) {
+    return { success: false, error: 'You cannot report your own listing', statusCode: 422 };
   }
 
   const { data, error } = await supabase
@@ -251,12 +330,65 @@ export async function addEvidence(
   return { success: true, data: data as Report };
 }
 
+/** Fetch a report row, or a 404 result when it does not exist. */
+async function loadReport(reportId: string): Promise<ServiceResponse<Report>> {
+  const { data, error } = await supabase.from('reports').select('*').eq('id', reportId).maybeSingle();
+  if (error || !data) return { success: false, error: 'Report not found', statusCode: 404 };
+  return { success: true, data: data as Report };
+}
+
+/** Owner of a listing, or null when the listing does not exist. */
+async function getListingOwnerId(propertyId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('properties')
+    .select('owner_id')
+    .eq('id', propertyId)
+    .maybeSingle();
+  return (data as { owner_id: string } | null)?.owner_id ?? null;
+}
+
 /**
- * Hide a property from search when report is severe.
+ * Clear a report's hide decision. The listing becomes visible again only when no
+ * other report still hides it, so one lifted hide cannot undo another.
+ */
+async function clearHide(report: Report, actorId: string, auditAction: string): Promise<ServiceResponse<Report>> {
+  const { data, error } = await supabase
+    .from('reports')
+    .update({ hide_property: false })
+    .eq('id', report.id)
+    .select()
+    .single();
+
+  if (error) return { success: false, error: error.message };
+
+  if (report.target_type === 'property' && !(await hasOtherActiveHide(report.target_id, report.id))) {
+    const visibility = await setListingModerationState(report.target_id, 'visible');
+    if (!visibility.success) return { success: false, error: visibility.error };
+  }
+
+  const { record } = await import('./auditLog.service.js');
+  await record(actorId, auditAction, 'report', report.id, { listingId: report.target_id });
+
+  return { success: true, data: data as Report };
+}
+
+/**
+ * Hide a listing from discovery pending review. Records the decision on the
+ * report, audits the moderator, and notifies the host without revealing the reporter.
+ * Existing bookings are not changed; the listing only stops accepting new ones.
  */
 export async function hideProperty(
   reportId: string,
+  moderatorId: string,
 ): Promise<ServiceResponse<Report>> {
+  const loaded = await loadReport(reportId);
+  if (!loaded.success || !loaded.data) return loaded;
+  const report = loaded.data;
+
+  if (report.target_type !== 'property') {
+    return { success: false, error: 'Only listings can be hidden', statusCode: 400 };
+  }
+
   const { data, error } = await supabase
     .from('reports')
     .update({ hide_property: true })
@@ -265,44 +397,63 @@ export async function hideProperty(
     .single();
 
   if (error) return { success: false, error: error.message };
-  const report = data as Report;
 
-  // Also hide the property in the properties table
-  if (report.target_type === 'property') {
-    await supabase
-      .from('properties')
-      .update({ deleted_at: new Date().toISOString() })
-      .eq('id', report.target_id);
+  const visibility = await setListingModerationState(report.target_id, 'hidden');
+  if (!visibility.success) return { success: false, error: visibility.error };
+
+  const { record } = await import('./auditLog.service.js');
+  await record(moderatorId, 'listing.hidden', 'report', reportId, { listingId: report.target_id });
+
+  const ownerId = await getListingOwnerId(report.target_id);
+  if (ownerId && report.notify_host !== false) {
+    await notifyHost(
+      reportId,
+      ownerId,
+      'One of your listings has been hidden from search while it is reviewed. You can submit an appeal.',
+    );
   }
 
-  return { success: true, data: report };
+  return { success: true, data: data as Report };
 }
 
 /**
- * Unhide a property after successful appeal.
+ * Lift a moderator's hide on a listing. The listing is restored only once no other
+ * active hide remains on it.
  */
 export async function unhideProperty(
   reportId: string,
+  moderatorId: string,
+): Promise<ServiceResponse<Report>> {
+  const loaded = await loadReport(reportId);
+  if (!loaded.success || !loaded.data) return loaded;
+  return clearHide(loaded.data, moderatorId, 'listing.unhidden');
+}
+
+/**
+ * Escalate a pending report to a senior moderator. Records the decision in the audit log.
+ */
+export async function escalateReport(
+  reportId: string,
+  moderatorId: string,
+  note?: string,
 ): Promise<ServiceResponse<Report>> {
   const { data, error } = await supabase
     .from('reports')
-    .update({ hide_property: false })
+    .update({ status: 'escalated', resolution_note: note || null })
     .eq('id', reportId)
+    .eq('status', 'pending')
     .select()
-    .single();
+    .maybeSingle();
 
   if (error) return { success: false, error: error.message };
-  const report = data as Report;
-
-  // Restore the property
-  if (report.target_type === 'property') {
-    await supabase
-      .from('properties')
-      .update({ deleted_at: null })
-      .eq('id', report.target_id);
+  if (!data) {
+    return { success: false, error: 'Only pending reports can be escalated', statusCode: 409 };
   }
 
-  return { success: true, data: report };
+  const { record } = await import('./auditLog.service.js');
+  await record(moderatorId, 'report.escalated', 'report', reportId, { resolutionNote: note ?? null });
+
+  return { success: true, data: data as Report };
 }
 
 /**
@@ -337,24 +488,58 @@ export async function notifyHost(
 }
 
 /**
- * Submit an appeal for a hidden property.
+ * Submit an appeal for a hidden property. Only the listing's owner may appeal,
+ * only while the listing is hidden by this report, and only one appeal may be
+ * pending at a time.
  */
 export async function submitAppeal(
   reportId: string,
   hostId: string,
   appealReason: string,
 ): Promise<ServiceResponse<Report>> {
+  const reason = appealReason.trim();
+  if (reason.length === 0 || reason.length > MAX_APPEAL_REASON_LENGTH) {
+    return {
+      success: false,
+      error: `appealReason must be between 1 and ${MAX_APPEAL_REASON_LENGTH} characters`,
+      statusCode: 400,
+    };
+  }
+
+  const loaded = await loadReport(reportId);
+  if (!loaded.success || !loaded.data) return loaded;
+  const report = loaded.data;
+
+  if (report.target_type !== 'property' || !report.hide_property) {
+    return { success: false, error: 'This report is not hiding a listing', statusCode: 409 };
+  }
+
+  const ownerId = await getListingOwnerId(report.target_id);
+  if (ownerId !== hostId) {
+    return { success: false, error: 'Only the listing owner can appeal', statusCode: 403 };
+  }
+
+  if (report.appeal_status === 'pending') {
+    return { success: false, error: 'An appeal is already pending', statusCode: 409 };
+  }
+  if (report.appeal_status === 'approved') {
+    return { success: false, error: 'This listing has already been restored', statusCode: 409 };
+  }
+
+  // Compare-and-set: only move from 'none' or 'denied' so concurrent appeals cannot both land.
   const { data, error } = await supabase
     .from('reports')
     .update({
       appeal_status: 'pending',
-      appeal_reason: appealReason,
+      appeal_reason: reason,
     })
     .eq('id', reportId)
+    .in('appeal_status', ['none', 'denied'])
     .select()
-    .single();
+    .maybeSingle();
 
   if (error) return { success: false, error: error.message };
+  if (!data) return { success: false, error: 'An appeal is already pending', statusCode: 409 };
 
   // Notify moderators of appeal
   const { data: admins } = await supabase.from('users').select('id').eq('role', 'admin');
@@ -376,7 +561,8 @@ export async function submitAppeal(
 }
 
 /**
- * Review and approve/deny an appeal.
+ * Approve or deny a pending appeal. Approval restores the listing (subject to other
+ * active hides); denial leaves it hidden. The host is told the outcome.
  */
 export async function reviewAppeal(
   reportId: string,
@@ -385,46 +571,51 @@ export async function reviewAppeal(
 ): Promise<ServiceResponse<Report>> {
   const status = approved ? 'approved' : 'denied';
 
-  const { data: report, error: fetchError } = await supabase
-    .from('reports')
-    .select('*')
-    .eq('id', reportId)
-    .single();
+  const loaded = await loadReport(reportId);
+  if (!loaded.success || !loaded.data) return loaded;
+  const report = loaded.data;
 
-  if (fetchError || !report) {
-    return { success: false, error: 'Report not found' };
+  if (report.appeal_status !== 'pending') {
+    return { success: false, error: 'No pending appeal to review', statusCode: 409 };
   }
 
-  const updateData: Record<string, unknown> = {
-    appeal_status: status,
-  };
-
-  // If approved, unhide the property
-  if (approved && report.hide_property) {
-    updateData.hide_property = false;
-    // Also restore in properties table
-    if (report.target_type === 'property') {
-      await supabase
-        .from('properties')
-        .update({ deleted_at: null })
-        .eq('id', report.target_id);
-    }
-  }
-
+  // Compare-and-set on 'pending' so a decision is recorded exactly once.
   const { data, error } = await supabase
     .from('reports')
-    .update(updateData)
+    .update({ appeal_status: status })
     .eq('id', reportId)
+    .eq('appeal_status', 'pending')
     .select()
-    .single();
+    .maybeSingle();
 
   if (error) return { success: false, error: error.message };
+  if (!data) return { success: false, error: 'No pending appeal to review', statusCode: 409 };
+
+  let result = data as Report;
+  if (approved && report.hide_property) {
+    const lifted = await clearHide(report, moderatorId, 'listing.unhidden');
+    if (!lifted.success) return lifted;
+    result = lifted.data ?? result;
+  }
 
   // Log the decision
   const { record } = await import('./auditLog.service.js');
   await record(moderatorId, `appeal.${status}`, 'report', reportId, {});
 
-  return { success: true, data: data as Report };
+  if (report.target_type === 'property') {
+    const ownerId = await getListingOwnerId(report.target_id);
+    if (ownerId) {
+      await notifyHost(
+        reportId,
+        ownerId,
+        approved
+          ? 'Your appeal was approved and your listing is visible again.'
+          : 'Your appeal was reviewed and the listing remains hidden.',
+      );
+    }
+  }
+
+  return { success: true, data: result };
 }
 
 /**

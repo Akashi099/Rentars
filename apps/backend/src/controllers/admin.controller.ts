@@ -604,8 +604,16 @@ import { listAuditLogs } from '@/services/auditLog.service.js';
 export async function getAuditLogsHandler(req: AdminRequest, res: Response): Promise<void> {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
 
+  const actorId = typeof req.query.actorId === 'string' ? req.query.actorId : undefined;
+  if (actorId !== undefined && !z.string().uuid().safeParse(actorId).success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: { actorId: ['actorId must be a valid UUID'] } },
+    });
+    return;
+  }
+
   const filters = {
-    actorId: typeof req.query.actorId === 'string' ? req.query.actorId : undefined,
+    actorId,
     action: typeof req.query.action === 'string' ? req.query.action : undefined,
     targetType: typeof req.query.targetType === 'string' ? req.query.targetType : undefined,
     targetId: typeof req.query.targetId === 'string' ? req.query.targetId : undefined,
@@ -688,7 +696,7 @@ export async function approveRefundHandler(req: AdminRequest, res: Response): Pr
   // Record refund approval in audit log with both actors
   await auditLogger.log({
     actorId: req.adminId,
-    action: 'payment.confirmed',
+    action: 'admin.refund_approve',
     resourceType: 'payment',
     resourceId: booking_id,
     ip: req.ip,

@@ -33,6 +33,9 @@ export interface Review {
   on_chain_id?: number;
   host_response?: string;
   host_response_at?: string;
+  host_response_version?: number;
+  host_response_edit_deadline?: string;
+  host_response_mod_status?: 'pending' | 'approved' | 'rejected' | 'removed' | null;
   is_flagged?: boolean;
   flag_reason?: string;
   is_approved?: boolean;
@@ -202,14 +205,36 @@ export async function getAverageRating(userId: string): Promise<ServiceResponse<
   return { success: true, data: Math.round(avg * 10) / 10 };
 }
 
+/** How long hosts have to edit their response after first posting (hours). */
+const RESPONSE_EDIT_WINDOW_HOURS = 48;
+
+/** Maximum response length (characters). */
 const MAX_HOST_RESPONSE_LENGTH = 1000;
 
+/**
+ * Add or edit a host response to a review.
+ *
+ * Rules enforced:
+ *  1. Only the property owner (or, for non-property reviews, the target user)
+ *     may respond.
+ *  2. Exactly one visible response is allowed per review.
+ *  3. Edits are permitted within RESPONSE_EDIT_WINDOW_HOURS of the first post.
+ *  4. Every version (create + each edit) is appended to review_response_history
+ *     as an immutable audit trail.
+ *  5. The response enters 'pending' moderation on first create; edits also reset
+ *     moderation to 'pending' so moderators review the updated text.
+ *  6. The reviewer is notified on first create only (not on edits) to avoid spam.
+ */
 export async function addHostResponse(
   reviewId: string,
   hostId: string,
   response: string,
 ): Promise<ServiceResponse<Review>> {
-  if (response.trim().length > MAX_HOST_RESPONSE_LENGTH) {
+  const cleanResponse = sanitizeResponse(response, MAX_HOST_RESPONSE_LENGTH);
+  if (!cleanResponse) {
+    return { success: false, error: 'Response text is required' };
+  }
+  if (cleanResponse.length > MAX_HOST_RESPONSE_LENGTH) {
     return {
       success: false,
       error: `Response must be at most ${MAX_HOST_RESPONSE_LENGTH} characters`,
@@ -218,7 +243,9 @@ export async function addHostResponse(
 
   const { data: review, error: reviewError } = await supabase
     .from('reviews')
-    .select('id, target_id, property_id, host_response')
+    .select(
+      'id, reviewer_id, target_id, property_id, host_response, host_response_version, host_response_edit_deadline, host_response_mod_status',
+    )
     .eq('id', reviewId)
     .single();
 
@@ -228,16 +255,16 @@ export async function addHostResponse(
 
   const r = review as {
     id: string;
+    reviewer_id: string;
     target_id: string;
     property_id: string | null;
     host_response: string | null;
+    host_response_version: number;
+    host_response_edit_deadline: string | null;
+    host_response_mod_status: string | null;
   };
 
-  if (r.host_response) {
-    return { success: false, error: 'This review already has a host response' };
-  }
-
-  // Verify host owns the reviewed property; fall back to target_id check when no property
+  // ── Authorization: verify caller owns the reviewed property ─────────────────
   if (r.property_id) {
     const { data: property } = await supabase
       .from('properties')
@@ -252,43 +279,162 @@ export async function addHostResponse(
     return { success: false, error: 'Only the reviewed host can respond' };
   }
 
-  // Sanitize host response; enforce max 2000 chars
-  const cleanResponse = sanitizeResponse(response, 2_000);
-  if (!cleanResponse) {
-    return { success: false, error: 'Response text is required' };
+  const isFirstResponse = !r.host_response;
+  const now = new Date();
+
+  // ── Edit window enforcement ──────────────────────────────────────────────────
+  if (!isFirstResponse) {
+    if (!r.host_response_edit_deadline) {
+      return { success: false, error: 'This response can no longer be edited' };
+    }
+    if (now > new Date(r.host_response_edit_deadline)) {
+      return {
+        success: false,
+        error: `Responses can only be edited within ${RESPONSE_EDIT_WINDOW_HOURS} hours of posting`,
+      };
+    }
+    // Removed responses cannot be edited
+    if (r.host_response_mod_status === 'removed') {
+      return { success: false, error: 'This response has been removed by a moderator' };
+    }
   }
 
+  const nextVersion = (r.host_response_version ?? 0) + 1;
+  const editDeadline = isFirstResponse
+    ? new Date(now.getTime() + RESPONSE_EDIT_WINDOW_HOURS * 3_600_000).toISOString()
+    : r.host_response_edit_deadline; // preserve original deadline on edits
+
+  // ── Persist the updated response ─────────────────────────────────────────────
   const { data, error } = await supabase
     .from('reviews')
-    .update({ host_response: cleanResponse, host_response_at: new Date().toISOString() })
+    .update({
+      host_response: cleanResponse,
+      host_response_at: isFirstResponse ? now.toISOString() : undefined,
+      host_response_version: nextVersion,
+      host_response_edit_deadline: editDeadline,
+      // Reset moderation to pending on every create/edit
+      host_response_mod_status: 'pending',
+    })
     .eq('id', reviewId)
-    .is('host_response', null)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
-  if (!data) {
-    return { success: false, error: 'This review already has a host response' };
-  }
+  if (!data) return { success: false, error: 'Failed to update review response' };
 
-  // Notify the reviewer that the host has responded
-  try {
-    const updatedReview = data as Review;
-    const { createNotification } = await import('./notification.service.js');
-    const deepLink = updatedReview.property_id
-      ? `/properties/${updatedReview.property_id}#reviews`
-      : `/reviews/${reviewId}`;
-    await createNotification(updatedReview.reviewer_id, 'host_response', {
-      reviewId,
-      hostId,
-      propertyId: updatedReview.property_id ?? null,
-      message: 'The host responded to your review.',
-    }, { deepLink });
-  } catch {
-    // Notification failure must never block the host response submission
+  // ── Append to edit history ────────────────────────────────────────────────────
+  await supabase
+    .from('review_response_history')
+    .insert({
+      review_id: reviewId,
+      author_id: hostId,
+      body: cleanResponse,
+      version: nextVersion,
+      moderation_status: 'pending',
+    })
+    .catch((err) =>
+      console.error('[review.service] Failed to write response history:', err),
+    );
+
+  // ── Notify reviewer on first post only ───────────────────────────────────────
+  if (isFirstResponse) {
+    try {
+      const updatedReview = data as Review;
+      const { createNotification } = await import('./notification.service.js');
+      await createNotification(updatedReview.reviewer_id, 'host_response', {
+        reviewId,
+        hostId,
+        propertyId: updatedReview.property_id ?? null,
+        message: 'The host responded to your review.',
+      });
+    } catch {
+      // Notification failure must never block the host response submission
+    }
   }
 
   return { success: true, data: data as Review };
+}
+
+/**
+ * Moderate a host response (admin / moderator action).
+ *
+ * Sets host_response_mod_status.  If the status is 'removed', clears the
+ * visible host_response so it no longer renders — but the history row is
+ * preserved for audit purposes.
+ */
+export async function moderateHostResponse(
+  reviewId: string,
+  status: 'approved' | 'rejected' | 'removed',
+  moderatorId: string,
+  note?: string,
+): Promise<ServiceResponse<Review>> {
+  const isRemoval = status === 'removed';
+
+  const { data, error } = await supabase
+    .from('reviews')
+    .update({
+      host_response_mod_status: status,
+      // Wipe the visible text on removal; other transitions leave it intact
+      ...(isRemoval ? { host_response: null } : {}),
+    })
+    .eq('id', reviewId)
+    .select()
+    .single();
+
+  if (error) return { success: false, error: error.message };
+
+  // Update the latest history row with the moderation outcome
+  await supabase
+    .from('review_response_history')
+    .update({
+      moderation_status: status,
+      moderation_note: note ?? null,
+      moderated_by: moderatorId,
+      moderated_at: new Date().toISOString(),
+    })
+    .eq('review_id', reviewId)
+    .order('version', { ascending: false })
+    .limit(1)
+    .catch((err) =>
+      console.error('[review.service] Failed to update response history moderation:', err),
+    );
+
+  try {
+    const { record } = await import('./auditLog.service.js');
+    await record(moderatorId, `review.response.${status}`, 'review', reviewId, { note });
+  } catch {
+    // Audit log failure is non-fatal
+  }
+
+  return { success: true, data: data as Review };
+}
+
+/**
+ * Get the full edit history for a host response (admin view).
+ * Returns history rows in ascending version order.
+ */
+export async function getResponseHistory(
+  reviewId: string,
+): Promise<ServiceResponse<Array<{
+  id: string;
+  review_id: string;
+  author_id: string;
+  body: string;
+  version: number;
+  moderation_status: string;
+  moderation_note: string | null;
+  moderated_by: string | null;
+  moderated_at: string | null;
+  created_at: string;
+}>>> {
+  const { data, error } = await supabase
+    .from('review_response_history')
+    .select('*')
+    .eq('review_id', reviewId)
+    .order('version', { ascending: true });
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: data ?? [] };
 }
 
 export async function flagReview(

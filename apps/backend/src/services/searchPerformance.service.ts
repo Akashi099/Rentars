@@ -6,9 +6,12 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { hashSearchQuery } from '../utils/searchMetrics.js';
 
 export interface SearchMetric {
   id?: string;
+  /** Raw search term. Hashed before storage; never persisted as-is. */
+  query?: string;
   query_hash?: string;
   query_duration_ms: number;
   cache_hit: boolean;
@@ -83,11 +86,13 @@ const ERROR_RATE_TARGET = 0.01; // 1% error rate
  */
 export async function recordSearchMetric(metric: SearchMetric): Promise<ServiceResponse<null>> {
   try {
-    // Hash the query to avoid storing sensitive search terms
-    const queryHash = metric.query_duration_ms ? `hash_${Date.now()}` : undefined;
+    // Persist only a hash of the search term, never the term itself. A caller
+    // may pass a precomputed `query_hash`; a raw `query` is hashed here.
+    const queryHash =
+      metric.query_hash ?? (metric.query !== undefined ? hashSearchQuery(metric.query) : 'unknown');
 
     const { error } = await supabase.from('search_analytics').insert({
-      query: queryHash || 'hashed',
+      query: queryHash,
       query_duration_ms: metric.query_duration_ms,
       cache_hit: metric.cache_hit,
       result_count: metric.result_count,

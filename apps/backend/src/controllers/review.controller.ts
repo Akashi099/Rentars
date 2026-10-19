@@ -17,8 +17,8 @@ import {
   approveReview,
   rejectReview,
   getPendingReviews,
-  getModerationQueue,
-  getPendingAppeals,
+  moderateHostResponse,
+  getResponseHistory,
 } from '../services/review.service.js';
 import {
   getReviewRepairQueue,
@@ -92,7 +92,46 @@ export async function respondToReview(req: AuthRequest, res: Response): Promise<
     const isOwnershipError =
       result.error === 'Only the property owner can respond to this review' ||
       result.error === 'Only the reviewed host can respond';
-    res.status(isOwnershipError ? 403 : 400).json({ error: result.error });
+    const isEditWindowError = result.error?.includes('edit') || result.error?.includes('removed');
+    res.status(isOwnershipError ? 403 : isEditWindowError ? 422 : 400).json({ error: result.error });
+    return;
+  }
+  res.json(result.data);
+}
+
+/** GET /api/reviews/:id/response/history — admin: full edit history for a response */
+export async function getReviewResponseHistory(req: AuthRequest, res: Response): Promise<void> {
+  const result = await getResponseHistory(req.params.id);
+  if (!result.success) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+  res.json({ data: result.data });
+}
+
+/** PATCH /api/reviews/:id/response/moderate — admin: approve/reject/remove a host response */
+export async function moderateHostResponseHandler(req: AuthRequest, res: Response): Promise<void> {
+  const moderatorId = req.userId;
+  if (!moderatorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { status, note } = req.body as { status?: string; note?: string };
+  if (!status || !['approved', 'rejected', 'removed'].includes(status)) {
+    res.status(400).json({ error: 'status must be one of: approved, rejected, removed' });
+    return;
+  }
+
+  const result = await moderateHostResponse(
+    req.params.id,
+    status as 'approved' | 'rejected' | 'removed',
+    moderatorId,
+    note,
+  );
+
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
     return;
   }
   res.json(result.data);

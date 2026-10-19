@@ -19,9 +19,8 @@ import {
   listPendingAppeals,
   approveReviewHandler,
   rejectReviewHandler,
-  getRepairQueueHandler,
-  reconcileReviewsHandler,
-  resolveRepairTaskHandler,
+  getReviewResponseHistory,
+  moderateHostResponseHandler,
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import {
@@ -50,9 +49,19 @@ router.get('/user/:id', validatePagination, getUserReviews);
 // GET /api/v1/reviews/user/:id/average
 router.get('/user/:id/average', getUserAverageRating);
 
-// ─── Moderation admin routes (static paths before /:id) ───────────────────────
+// POST /api/reviews/:id/response — host creates or edits their response
+router.post('/:id/response', authenticate, respondToReview);
 
-// GET /api/v1/reviews/moderation/flagged — list flagged reviews (admin)
+// GET /api/reviews/:id/response/history — admin: full edit history
+router.get('/:id/response/history', authenticate, requireRole('admin'), getReviewResponseHistory);
+
+// PATCH /api/reviews/:id/response/moderate — admin/moderator: approve, reject, or remove
+router.patch('/:id/response/moderate', authenticate, requireRole('admin'), moderateHostResponseHandler);
+
+// POST /api/reviews/:id/flag — report a review for moderation
+router.post('/:id/flag', authenticate, validateBody(flagReviewSchema), reportReview);
+
+// GET /api/reviews/moderation/flagged — list flagged reviews (admin)
 router.get('/moderation/flagged', authenticate, requireRole('admin'), listFlaggedReviews);
 
 // GET /api/v1/reviews/moderation/pending — list pending reviews (admin)

@@ -78,6 +78,11 @@ export type AuditAction =
   | 'account.enable_2fa'
   | 'account.wallet_link'
   | 'account.wallet_unlink'
+  // Privacy (data subject rights)
+  | 'privacy.data_export_requested'
+  | 'privacy.account_deletion_requested'
+  | 'privacy.account_deletion_cancelled'
+  | 'privacy.account_deletion_completed'
   // Admin
   | 'admin.user_suspend'
   | 'admin.user_activate'
@@ -118,30 +123,37 @@ export interface AuditLogEntry {
 }
 
 /**
- * Sanitize metadata to prevent logging of sensitive data.
+ * Keys whose values must never be persisted. Matches credentials, key material,
+ * raw provider or message payloads, and free-text bodies.
  */
-function sanitizeMeta(meta?: Record<string, unknown>): Record<string, unknown> | undefined {
+const SENSITIVE_META_KEYS =
+  /token|secret|password|passwd|seed|mnemonic|key|pin|card|ssn|cvv|signature|private|cookie|authorization|payload|raw|body|content/i;
+
+/**
+ * Sanitize metadata to prevent logging of sensitive data.
+ * Exported for tests; production code reaches it through AuditLogger.log.
+ */
+export function sanitizeAuditMeta(meta?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!meta) return undefined;
+  return sanitizeValue(meta) as Record<string, unknown>;
+}
 
-  const sanitized: Record<string, unknown> = {};
-  const sensitiveKeys = /token|secret|password|seed|key|pin|card|ssn|cvv|signature|private/i;
-
-  for (const [key, value] of Object.entries(meta)) {
-    if (sensitiveKeys.test(key)) {
-      // Log that this field was present but redacted
-      sanitized[key] = '[REDACTED]';
-    } else if (typeof value === 'string' && value.length > 255) {
-      // Truncate long strings
-      sanitized[key] = value.slice(0, 255) + '...[TRUNCATED]';
-    } else if (typeof value === 'object' && value !== null) {
-      // Recursively sanitize nested objects
-      sanitized[key] = sanitizeMeta(value as Record<string, unknown>);
-    } else {
-      sanitized[key] = value;
-    }
+function sanitizeValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length > 255 ? `${value.slice(0, 255)}...[TRUNCATED]` : value;
   }
-
-  return sanitized;
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeValue(item));
+  }
+  if (typeof value === 'object' && value !== null) {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) {
+      // Log that the field was present, but do not store its value
+      sanitized[key] = SENSITIVE_META_KEYS.test(key) ? '[REDACTED]' : sanitizeValue(nested);
+    }
+    return sanitized;
+  }
+  return value;
 }
 
 class AuditLogger {
@@ -163,7 +175,7 @@ class AuditLogger {
       ip: entry.ip ?? null,
       success: entry.success ?? true,
       error: entry.error ?? null,
-      meta: sanitizeMeta(entry.meta),
+      meta: sanitizeAuditMeta(entry.meta),
     };
 
     // Always emit to stdout as structured JSON for log aggregation

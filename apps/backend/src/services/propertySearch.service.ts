@@ -1,6 +1,37 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import { isFeaturedNow, FEATURED_CAP, type Property, type AdvancedSearchFilters } from './property.service.js';
+import { recordSearchMetric } from './searchPerformance.service.js';
+import { isSlowQuery } from '../utils/searchMetrics.js';
+
+type SearchEndpoint = 'text' | 'nearby';
+
+/**
+ * Record latency, result count and failures for one search call (issue #750).
+ * The raw query is passed through so recordSearchMetric can hash it; it is
+ * never stored or logged as-is. Recording is fire-and-forget so metrics can
+ * never delay or fail a search.
+ */
+function reportSearch<T>(
+  endpoint: SearchEndpoint,
+  query: string | undefined,
+  startedAt: number,
+  result: ServiceResponse<T[]>,
+): void {
+  const durationMs = performance.now() - startedAt;
+  if (isSlowQuery(durationMs)) {
+    console.warn(`[search] slow ${endpoint} query took ${Math.round(durationMs)}ms`);
+  }
+
+  void recordSearchMetric({
+    query,
+    query_duration_ms: durationMs,
+    cache_hit: false,
+    result_count: result.success ? (result.data?.length ?? 0) : 0,
+    error: result.success ? undefined : result.error,
+    endpoint,
+  });
+}
 
 // ─── Nearby search ────────────────────────────────────────────────────────────
 
@@ -30,6 +61,15 @@ export interface NearbySearchResult {
  * efficient bounding-box pre-filter followed by precise distance calculation.
  */
 export async function searchPropertiesNearby(
+  params: NearbySearchParams,
+): Promise<ServiceResponse<NearbySearchResult[]>> {
+  const startedAt = performance.now();
+  const result = await runNearbySearch(params);
+  reportSearch('nearby', undefined, startedAt, result);
+  return result;
+}
+
+async function runNearbySearch(
   params: NearbySearchParams,
 ): Promise<ServiceResponse<NearbySearchResult[]>> {
   const { lat, lng, radiusKm } = params;
@@ -109,7 +149,10 @@ export function promoteFeatureToTop(
   }
 
   // Sort by weight descending and keep only the top `effectiveCap` entries.
-  featuredCandidates.sort((a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0));
+  // Equal weights fall back to id so the featured order never depends on input order.
+  featuredCandidates.sort(
+    (a, b) => (b.featured_weight ?? 0) - (a.featured_weight ?? 0) || a.id.localeCompare(b.id),
+  );
   const promoted = featuredCandidates.slice(0, effectiveCap);
 
   // Properties that were featured but did not fit the cap are demoted to
@@ -125,6 +168,15 @@ export function promoteFeatureToTop(
 // ─── Text-based property search ───────────────────────────────────────────────
 
 export async function searchPropertiesByQuery(
+  query: string,
+): Promise<ServiceResponse<(Property & { is_featured: boolean })[]>> {
+  const startedAt = performance.now();
+  const result = await runTextSearch(query);
+  reportSearch('text', query, startedAt, result);
+  return result;
+}
+
+async function runTextSearch(
   query: string,
 ): Promise<ServiceResponse<(Property & { is_featured: boolean })[]>> {
   const q = query.trim();
