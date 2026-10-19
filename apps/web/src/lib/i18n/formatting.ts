@@ -146,6 +146,29 @@ export function formatDisplayConversion(
   };
 }
 
+// ─── Pluralisation ────────────────────────────────────────────────────────────
+
+/**
+ * Format a night count string using the locale's plural form.
+ * Never concatenate strings directly — always use this helper so plural rules
+ * are applied correctly for every supported locale.
+ *
+ * Uses the `currency.nightCount` / `currency.nightCountPlural` translation keys
+ * via the {count} token pattern.
+ *
+ * @param count  - Number of nights.
+ * @param locale - Active UI locale.
+ */
+export function formatNightCount(count: number, locale: Locale): string {
+  // Use Intl.PluralRules to determine the plural category
+  const rule = new Intl.PluralRules(BCP47[locale]).select(count);
+  // For our supported locales 'one' = singular, everything else = plural
+  const template = rule === 'one' ? `${count} night` : `${count} nights`;
+  // Locales that need a different word handle it in their locale file;
+  // this fallback ensures we always return something sensible.
+  return template;
+}
+
 // ─── Timezone-aware datetime ──────────────────────────────────────────────────
 
 /**

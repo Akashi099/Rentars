@@ -119,6 +119,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:refunds:approve',
     'admin:reconciliation:read',
     'admin:audit:read',
+    'admin:support:read',
   ],
 };
 
