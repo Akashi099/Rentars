@@ -11,10 +11,9 @@ import {
   NETWORK_PASSPHRASE,
   STELLAR_ADMIN_SECRET,
   STELLAR_SOURCE_ACCOUNT,
-from './config.js';
+} from './config.js';
 import { getSorobanServer } from './soroban.js';
 import { BlockchainError } from './errors.js';
-import { simulateOrThrow, type SimulationResult } from './simulation.js';
 
 const FEE_ESTIMATION_PERCENTILE = 90;
 const MAX_FEE_CEILING_MULTIPLIER = 10;
@@ -100,7 +99,7 @@ export async function buildPrepareAndSign(server: rpc.Server, operations: xdr.Op
   const tx = await buildTransaction(operations, adminKeypair.publicKey());
 
   // Preflight: simulate and surface any contract or transaction errors before signing.
-  await simulateOrThrow(tx);
+  await simulateOrThrow(server, tx);
 
   const prepared = await server.prepareTransaction(tx);
   (prepared as Transaction).sign(adminKeypair);
@@ -185,8 +184,8 @@ export async function getTransactionStatus(
  * Throws ContractError/TransactionError on failure so callers can reject signing.
  */
 export async function preflightTransaction(
+  server: rpc.Server,
   tx: Transaction,
-  options: { intentKey?: string; latestLedger?: number; cacheTtlMs?: number } = {},
 ): Promise<SimulationResult> {
-  return simulateOrThrow(tx, options);
+  return simulateOrThrow(server, tx);
 }

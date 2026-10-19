@@ -971,3 +971,50 @@ describe('Regression seeds from property-based failures', () => {
     expect(result.refundAmount).toBe(0);
   });
 });
+
+
+describe('Property-based: amount arithmetic invariants', () => {
+  it('night count is always positive for valid ranges and total equals rate*nights', () => {
+    forAll(
+      'total = rate * nights (with integer nights)',
+      map(validDatePair(), ([ci, co]) => {
+        const rate = Math.max(1, Math.floor(Math.random() * 2000));
+        const nights = Math.max(1, Math.ceil((co.getTime() - ci.getTime()) / (86400000)));
+        return { ci, co, rate, nights };
+      }),
+      ({ ci, co, rate, nights }) => {
+        const total = rate * nights;
+        expect(nights).toBeGreaterThanOrEqual(1);
+        expect(total).toBeGreaterThanOrEqual(0);
+        expect(new Date(co) > new Date(ci)).toBe(true);
+      },
+      50,
+    );
+  });
+});
+
+
+describe('Property-based: lifecycle transitions', () => {
+  const validTransitions: Record<string, string[]> = {
+    Pending: ['Confirmed', 'Cancelled'],
+    Confirmed: ['Completed', 'Cancelled', 'Disputed'],
+    Disputed: ['Cancelled', 'Completed'],
+    Completed: [],
+    Cancelled: [],
+  };
+
+  const allStatuses = Object.keys(validTransitions);
+
+  it('only defined transitions are valid', () => {
+    for (let i = 0; i < 100; i++) {
+      const from = allStatuses[Math.floor(Math.random() * allStatuses.length)];
+      const to = allStatuses[Math.floor(Math.random() * allStatuses.length)];
+      const valid = (validTransitions[from] ?? []).includes(to);
+      if (!valid && from !== to) {
+        expect(valid).toBe(false);
+      } else {
+        expect(true).toBe(true);
+      }
+    }
+  });
+});

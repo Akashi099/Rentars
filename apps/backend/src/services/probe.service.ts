@@ -69,9 +69,15 @@ async function executeTarget(
 
     clearTimeout(timeoutId);
 
-    const responseBody = res.headers.get('content-type')?.includes('application/json')
-      ? await res.json().catch(() => await res.text())
-      : await res.text();
+    const rawBody = await res.text();
+    let responseBody: unknown = rawBody;
+    if (res.headers.get('content-type')?.includes('application/json')) {
+      try {
+        responseBody = JSON.parse(rawBody);
+      } catch {
+        responseBody = rawBody;
+      }
+    }
 
     response = {
       status: res.status,

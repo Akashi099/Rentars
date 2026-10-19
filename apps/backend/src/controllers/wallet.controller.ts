@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
-rt import { Transaction } from '@stellar/stellar-sdk';
+import { Transaction } from '@stellar/stellar-sdk';
 import { WalletAuthService } from '@/services/wallet.service.js';
-import { simulateTransaction } from '@/blockchain/simulation.js';
+import { getSorobanServer, simulateTransaction } from '@/blockchain/soroban.js';
 
 const walletAuthService = new WalletAuthService();
 
@@ -36,11 +36,7 @@ export async function walletVerify(req: Request, res: Response): Promise<void> {
  * and returns a fee estimate and diagnostics without signing or submitting.
  */
 export async function walletSimulate(req: Request, res: Response): Promise<void> {
-  const { transactionXDr, intentKey, latestLedger } = req.body as {
-    transactionXDr?: string;
-    intentKey?: string;
-    latestLedger?: number;
-  };
+  const { transactionXDr } = req.body as { transactionXDr?: string };
 
   if (!transactionXDr || typeof transactionXDr !== 'string') {
     res.status(400).json({ error: 'transactionXDr is required' });
@@ -56,16 +52,13 @@ export async function walletSimulate(req: Request, res: Response): Promise<void>
   }
 
   try {
-    const result = await simulateTransaction(tx, { intentKey, latestLedger });
+    const result = await simulateTransaction(getSorobanServer(), tx);
     res.json({
       success: result.success,
-      estimatedFeeStroops: result.estimatedFeeStroops,
-      estimatedFeeBase64: result.estimatedFeeBase64,
-      minResourceFeeStroops: result.minResourceFeeStroops,
-      authEntries: result.authEntries,
+      estimatedFeeStroops: result.estimatedFee,
+      minResourceFeeStroops: result.minResourceFee,
       events: result.events,
       error: result.error,
-      contractError: result.contractError,
     });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

@@ -49,6 +49,8 @@ import {
   // Audit logs
   getAuditLogsHandler,
 } from '@/controllers/admin.controller.js';
+import emailAdminRoutes from './emailAdmin.routes.js';
+import notificationMonitorRoutes from './notificationMonitor.routes.js';
 
 const router = Router();
 
@@ -112,5 +114,15 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 // Body: { booking_id: string, refund_amount: number, reason: string }
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
+
+// ── Email delivery tracking ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:email:read
+// Mounted at /api/v1/admin/email/*
+router.use('/email', emailAdminRoutes);
+
+// ── Notification monitoring ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:notifications:read
+// Mounted at /api/v1/admin/notifications/*
+router.use('/notifications', notificationMonitorRoutes);
 
 export default router;

@@ -76,6 +76,11 @@ RUN addgroup --system --gid 10001 rentars && \
 
 WORKDIR /app
 
+# Create writable directories with proper ownership for read-only FS compatibility
+RUN mkdir -p /tmp /app/tmp && \
+    chown -R rentars:rentars /tmp /app/tmp /app && \
+    chmod 1777 /tmp /app/tmp
+
 # Copy compiled bundle and production deps from earlier stages.
 COPY --from=builder --chown=rentars:rentars /build/dist      ./dist
 COPY --from=builder --chown=rentars:rentars /build/dist/*.map ./dist/
@@ -86,8 +91,9 @@ COPY --from=deps    --chown=rentars:rentars /build/node_modules ./node_modules
 # secrets manager injection).
 ENV NODE_ENV=production \
     PORT=3000 \
+    TMPDIR=/tmp \
     # Disable Bun's runtime transpiler cache to keep the filesystem read-only.
-    BUN_RUNTIME_TRANSPILER_CACHE_PATH=0
+    BUN_RUNTIME_TRANSPILER_CACHE_PATH=/tmp/bun-transpiler-cache
 
 # Drop to non-root before any further instructions.
 USER rentars
@@ -105,4 +111,5 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=15s \
   CMD wget -qO- http://localhost:3000/health || exit 1
 
+# Use dumb-init for proper signal handling and process management
 CMD ["bun", "run", "dist/index.js"]

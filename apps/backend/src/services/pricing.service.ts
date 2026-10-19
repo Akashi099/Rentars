@@ -1,7 +1,10 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { signQuoteToken, verifyQuoteToken } from '@/utils/quoteToken.js';
 
 const PLATFORM_FEE_PCT = 0.05;
+/** How long a quote (and its token) stays valid before the client must re-quote. */
+export const QUOTE_TTL_MS = 15 * 60 * 1000;
 const MIN_PRICE_MULTIPLIER = 0.1;
 const MAX_PRICE_MULTIPLIER = 10;
 const MIN_NIGHTLY_PRICE = 1;
@@ -48,6 +51,10 @@ export interface PriceQuote {
   currency?: string;
   version?: string;
   expires_at?: string;
+  /** True when every requested night is bookable. */
+  available: boolean;
+  /** Signed binding of this total to its inputs; null when signing is not configured. */
+  quote_token: string | null;
   unavailable_intervals?: Array<{ start: string; end: string; reason: string }>;
 }
 
@@ -402,7 +409,7 @@ export async function getPropertyQuote(
   // Fetch property details
   const { data: property, error: propError } = await supabase
     .from('properties')
-    .select('base_price_per_night, updated_at')
+    .select('base_price_per_night, updated_at, status, draft_status, deleted_at, moderation_state')
     .eq('id', propertyId)
     .single();
 
@@ -410,8 +417,26 @@ export async function getPropertyQuote(
     return { success: false, error: 'Property not found' };
   }
 
-  const baseRate = (property as { base_price_per_night: number }).base_price_per_night;
-  const propertyUpdatedAt = (property as { updated_at: string }).updated_at;
+  // Quotes are public, so drafts, removed, and moderation-hidden listings are not quotable.
+  const listing = property as {
+    base_price_per_night: number;
+    updated_at: string;
+    status: string | null;
+    draft_status: string | null;
+    deleted_at: string | null;
+    moderation_state: string | null;
+  };
+  if (
+    listing.deleted_at ||
+    listing.status === 'draft' ||
+    listing.draft_status === 'draft' ||
+    listing.moderation_state === 'hidden'
+  ) {
+    return { success: false, error: 'Property not found' };
+  }
+
+  const baseRate = listing.base_price_per_night;
+  const propertyUpdatedAt = listing.updated_at;
 
   // Check for booked dates
   const { data: bookings } = await supabase
@@ -468,7 +493,17 @@ export async function getPropertyQuote(
 
   // Create quote version hash from property state
   const quoteVersion = Buffer.from(`${propertyId}:${propertyUpdatedAt}`).toString('base64');
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min TTL
+  const expiresAt = new Date(Date.now() + QUOTE_TTL_MS).toISOString();
+
+  // Bind the total to its exact inputs so booking can verify it has not drifted.
+  const quoteToken = signQuoteToken({
+    pid: propertyId,
+    ci: checkInDate.toISOString(),
+    co: checkOutDate.toISOString(),
+    tot: total,
+    ver: propertyUpdatedAt,
+    exp: expiresAt,
+  });
 
   return {
     success: true,
@@ -485,7 +520,112 @@ export async function getPropertyQuote(
       currency: 'USD',
       version: quoteVersion,
       expires_at: expiresAt,
+      available: unavailableIntervals.length === 0,
+      quote_token: quoteToken,
       unavailable_intervals: unavailableIntervals.length > 0 ? unavailableIntervals : undefined,
     },
   };
+}
+
+export interface QuotedTotalInput {
+  propertyId: string;
+  checkIn: string;
+  checkOut: string;
+  /** Total the tenant submitted, in dollars. */
+  clientTotal: number;
+  /** Quote token from a previous getPropertyQuote call, if the client kept one. */
+  quoteToken?: string;
+  /** Clock override for tests. Defaults to now. */
+  now?: number;
+}
+
+/**
+ * Confirm a tenant's submitted total against a fresh server-side quote before any
+ * dates are reserved or money is authorised.
+ *
+ * The server total is authoritative. The client total must match it to the cent,
+ * and a supplied quote token must still be valid, unexpired, and for the same
+ * stay and listing version. Any mismatch fails rather than charging a different amount.
+ *
+ * @returns The authoritative total in dollars on success.
+ */
+export async function assertQuotedTotal(
+  input: QuotedTotalInput,
+): Promise<ServiceResponse<{ total: number; quote: PriceQuote }>> {
+  const { propertyId, checkIn, checkOut, clientTotal, quoteToken } = input;
+  const now = input.now ?? Date.now();
+
+  const quoted = await getPropertyQuote(propertyId, checkIn, checkOut);
+  if (!quoted.success || !quoted.data) {
+    const notFound = quoted.error === 'Property not found';
+    return {
+      success: false,
+      error: quoted.error ?? 'Could not price this stay',
+      statusCode: notFound ? 404 : 400,
+    };
+  }
+
+  const quote = quoted.data;
+
+  if (!quote.available) {
+    return {
+      success: false,
+      error: 'Property is not available for the requested dates',
+      conflict: true,
+      code: 'DATES_UNAVAILABLE',
+      details: { unavailable_intervals: quote.unavailable_intervals ?? [] },
+    };
+  }
+
+  if (quoteToken) {
+    const claims = verifyQuoteToken(quoteToken);
+    if (!claims) {
+      return { success: false, error: 'Invalid quote token', statusCode: 400, code: 'QUOTE_INVALID' };
+    }
+
+    const normalisedIn = new Date(checkIn).toISOString();
+    const normalisedOut = new Date(checkOut).toISOString();
+    if (claims.pid !== propertyId || claims.ci !== normalisedIn || claims.co !== normalisedOut) {
+      return {
+        success: false,
+        error: 'Quote does not match the requested stay',
+        statusCode: 400,
+        code: 'QUOTE_MISMATCH',
+      };
+    }
+
+    if (Date.parse(claims.exp) <= now) {
+      return {
+        success: false,
+        error: 'Quote has expired; request a new quote',
+        conflict: true,
+        code: 'QUOTE_EXPIRED',
+        details: { quote },
+      };
+    }
+
+    // The listing changed after this quote was issued.
+    const issuedVersion = Buffer.from(`${propertyId}:${claims.ver}`).toString('base64');
+    if (issuedVersion !== quote.version) {
+      return {
+        success: false,
+        error: 'The listing changed after this quote was issued; request a new quote',
+        conflict: true,
+        code: 'PRICE_CHANGED',
+        details: { quote },
+      };
+    }
+  }
+
+  if (Math.round(clientTotal * 100) !== Math.round(quote.total * 100)) {
+    return {
+      success: false,
+      error: `The price for this stay is now $${quote.total.toFixed(2)}; it does not match the submitted total`,
+      conflict: true,
+      code: 'PRICE_CHANGED',
+      details: { quote },
+    };
+  }
+
+  return { success: true, data: { total: quote.total, quote } };
 }
