@@ -208,8 +208,35 @@ This is disclosed to users:
 
 ---
 
+## 16. Category Ownership
+
+Every sensitive category has a named owning team accountable for purpose,
+access review, retention enforcement, and deletion behaviour.
+
+| Category | Sections | Owner | Review cadence |
+|---|---|---|---|
+| Identity & Authentication | 1 | Platform Engineering | Quarterly |
+| Profile & KYC | 2 | Platform Engineering | Quarterly |
+| Listings & Locations | 3 | Backend / Search | Quarterly |
+| Bookings & Payments | 4–5 | Finance Engineering | Quarterly |
+| Messaging & Evidence | 6–7 | Trust & Safety | Quarterly |
+| Notifications | 8 | Platform Engineering | Quarterly |
+| Wallet & Blockchain | 9 | Protocol Engineering | Quarterly (ledger data is immutable — see §15) |
+| Analytics & Search | 10 | Data / Search | Quarterly |
+| Audit Logs | 11 | Security | Annually (7-year retention, append-only) |
+| Logs & Infrastructure | 12 | SRE | Quarterly |
+
+### Policy alignment
+
+This inventory is the internal source of truth for the user-facing
+[Privacy Policy](../apps/web/src/app/privacy/page.tsx). On each review the owner of
+every category above must confirm the corresponding Privacy Policy section still
+matches actual collection, retention, and deletion behaviour; discrepancies are
+filed as issues against Platform Engineering before the next release.
+
 ## Change Log
 
 | Date | Version | Change |
 |---|---|---|
 | 2026-09-24 | 1.0 | Initial inventory — all tables from migrations 00001–00057 |
+| 2026-10-17 | 1.1 | Added category ownership and Privacy Policy alignment check (#837) |
