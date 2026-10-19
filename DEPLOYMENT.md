@@ -393,7 +393,9 @@ ROLLED_BACK
 
 ## 7.6 Rollback Health Gates
 
-Automated health gates determine if a rollout should pause or roll back:
+Automated health gates determine if a rollout should pause or roll back.
+
+The thresholds below are also kept in machine-readable form in [`docs/releases/health-gates.json`](docs/releases/health-gates.json). `scripts/release-health-gate.ts` evaluates a metrics snapshot against that file and exits `0` (proceed), `10` (pause), or `20` (rollback). If this section and the JSON file disagree, the JSON file is authoritative. Ownership of pause and rollback decisions, and the irreversible operations that limit rollback, are in [`docs/releases/rollback.md`](docs/releases/rollback.md).
 
 ### 7.6.1 Error Rate Gate
 

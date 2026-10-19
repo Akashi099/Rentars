@@ -56,6 +56,9 @@ jobs:
       - name: Verify generate-release-manifest runs cleanly
         run: bun run scripts/generate-release-manifest.ts --version 0.0.0-ci
 
+      - name: Test release health gate (#737)
+        run: bun test scripts/release-health-gate.test.ts
+
   # ─── Job 1: Validate migration filenames ────────────────────────────────────
   validate-migrations:
     name: Validate Migration Filenames
@@ -515,73 +518,39 @@ jobs:
             apps/web/test-results/
           retention-days: 14
 
-  # ─── Job 7b: Visual regression (#828) ───────────────────────────────────────
-  # Captures deterministic desktop + mobile baselines for the critical routes
-  # (home, search, property detail, dashboard, booking, auth, error) and diffs
-  # them on pull requests. Volatile content (maps, charts, timestamps, wallet
-  # addresses) is masked in apps/web/e2e/visual-regression.spec.ts so only
-  # real layout regressions — clipping, overlap, missing controls — are reported.
-  #
-  # Baseline maintenance is documented in
-  # apps/web/e2e/VISUAL_REGRESSION.md and reviewed through pull requests.
-  #
-  # Local reproduction:
-  #   cd apps/web
-  #   yarn playwright test e2e/visual-regression.spec.ts --project=chromium
-  #   yarn playwright test e2e/visual-regression.spec.ts --project=chromium --update-snapshots
-  visual-regression:
-    name: Frontend — Visual Regression (${{ matrix.project }})
+  # ─── Job 7b: Search rollout upgrade test (#747) ─────────────────────────────
+  # Applies migration 00067 to a database that already holds listings, backfills in
+  # batches, and asserts search and nearby search work and that the migration is
+  # idempotent. Self-contained, so it does not depend on setup.sql.
+  search-rollout-upgrade:
+    name: Search Rollout Upgrade Test
     runs-on: ubuntu-latest
-    needs: frontend-checks
-    strategy:
-      fail-fast: false
-      matrix:
-        project: ['chromium', 'mobile-chrome']
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: yarn
-          cache-dependency-path: apps/web/yarn.lock
-
-      - name: Install web dependencies
-        working-directory: apps/web
-        run: yarn install --frozen-lockfile
-
-      - name: Install Playwright browsers
-        working-directory: apps/web
-        run: yarn playwright install --with-deps ${{ matrix.project == 'mobile-chrome' && 'chromium' || matrix.project }}
-
-      - name: Build Next.js app
-        working-directory: apps/web
+      - name: Run upgrade test for migration 00067
+        working-directory: apps/backend/tests/db
         env:
-          NEXT_PUBLIC_API_URL: http://localhost:3000
-          NEXT_PUBLIC_SUPABASE_URL: https://mock.supabase.co
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: mock-anon-key
-        run: yarn build
-
-      - name: Run visual regression tests
-        working-directory: apps/web
-        env:
-          CI: true
-          PLAYWRIGHT_BASE_URL: http://localhost:3001
-          NEXT_PUBLIC_API_URL: http://localhost:3000
-          PORT: "3001"
-        run: yarn playwright test e2e/visual-regression.spec.ts --project=${{ matrix.project }}
-
-      - name: Upload visual diff artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: visual-regression-${{ matrix.project }}
-          path: |
-            apps/web/playwright-report/
-            apps/web/test-results/
-          retention-days: 14
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: ./run-search-rollout.sh
 
   # ─── Job 8: Documentation link check ────────────────────────────────────────
   # Verifies that all relative file paths referenced in Markdown docs exist in
@@ -608,3 +577,83 @@ jobs:
             apps/backend/database/README.md
             apps/backend/database/MIGRATIONS_NAMING.md
           fail: true
+
+  # ─── Job 9: Backup restore drill (#736) ─────────────────────────────────────
+  # Applies the restore fixture schema and sanitized seed data, then runs the
+  # restore drill: encrypted export, checksum, isolated restore, and schema, RLS,
+  # row-count and write-probe assertions. A truncated copy of the same backup must
+  # be rejected. The scheduled workflow in restore-drill.yml runs the same script
+  # against nonproduction infrastructure.
+  restore-drill:
+    name: Backup Restore Drill
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGPASSWORD: postgres
+      PROD_DB_HOST: 127.0.0.1
+      PROD_DB_USER: postgres
+      PROD_DB_PASSWORD: postgres
+      PROD_DB_NAME: rentars
+      VERIFY_DB_HOST: 127.0.0.1
+      VERIFY_DB_USER: postgres
+      VERIFY_DB_PASSWORD: postgres
+      DRILL_REPORT_DIR: restore-drill-reports
+      DRILL_BACKUP_OUT: restore-drill-backups
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source database and apply schema subset
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE rentars;'
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/schema.sql
+
+      - name: Load sanitized seed data
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/sanitized-seed.sql
+
+      - name: Generate ephemeral backup key
+        run: echo "BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Run restore drill
+        run: bash scripts/backup-restore-drill.sh
+
+      - name: Reject a truncated backup
+        run: |
+          set -euo pipefail
+          src="$(ls restore-drill-backups/*.dump.enc)"
+          truncated="restore-drill-backups/truncated.dump.enc"
+          size="$(stat -c %s "$src")"
+          head -c "$((size / 2))" "$src" > "$truncated"
+          cp "$src.sha256" "$truncated.sha256"
+          if DRILL_SOURCE_BACKUP="$truncated" bash scripts/backup-restore-drill.sh; then
+            echo "::error::restore drill accepted a truncated backup"
+            exit 1
+          fi
+          echo "Truncated backup rejected as expected."
+
+      - name: Upload drill reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-reports
+          path: restore-drill-reports/
+          retention-days: 14

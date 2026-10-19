@@ -52,15 +52,17 @@ export default function DashboardSummaryCards({ summary }: Props) {
       {cards.map((card) => (
         <div
           key={card.label}
-          className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-5 flex items-start gap-4"
+          className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-4 sm:p-5 flex items-start gap-3 sm:gap-4"
         >
-          <div className={`p-2 rounded-lg ${card.color}`} aria-hidden="true">
+          <div className={`p-2 rounded-lg flex-shrink-0 ${card.color}`} aria-hidden="true">
             {card.icon}
           </div>
-          <div>
+          <div className="min-w-0 flex-1">
             <p className="text-sm text-gray-500 dark:text-gray-400">{card.label}</p>
-            <p className="text-2xl font-bold text-gray-900 dark:text-white mt-0.5">{card.value}</p>
-            <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{card.description}</p>
+            <p className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white mt-0.5 break-words">
+              {card.value}
+            </p>
+            <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 break-words">{card.description}</p>
           </div>
         </div>
       ))}

@@ -15,6 +15,11 @@ export function generateCsrfToken(): string {
   return randomBytes(CSRF_TOKEN_LENGTH).toString('hex');
 }
 
+function isBearerRequest(req: Request): boolean {
+  const authorization = req.headers.authorization;
+  return typeof authorization === 'string' && /^Bearer\s+\S/i.test(authorization);
+}
+
 export function csrfMiddleware(req: CsrfRequest, res: Response, next: NextFunction): void {
   const method = req.method.toUpperCase();
 
@@ -29,6 +34,13 @@ export function csrfMiddleware(req: CsrfRequest, res: Response, next: NextFuncti
       signed: false,
     });
     req.csrfToken = token;
+    return next();
+  }
+
+  // Bearer requests carry no ambient credentials. A cross-site page cannot set the
+  // Authorization header without a CORS preflight, and preflight only passes for origins in
+  // CORS_ORIGIN. The double-submit check protects cookie-authenticated requests, so skip it here.
+  if (isBearerRequest(req)) {
     return next();
   }
 

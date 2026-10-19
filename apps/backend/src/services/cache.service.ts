@@ -1,4 +1,18 @@
 import { connectRedis, redisClient } from '@/config/redis.js';
+import {
+  REDIS_KEY_PREFIX,
+  boundedTtl,
+  assertValueSize,
+} from '@/config/redisKeys.js';
+import { incCounter, cacheOperationsTotal } from '@/middleware/metrics.middleware.js';
+
+/**
+ * All cache keys are namespaced under `<env>:<service>:cache:` so keys cannot
+ * collide across environments/services sharing a Redis instance.
+ */
+function namespaced(key: string): string {
+  return `${REDIS_KEY_PREFIX}:cache:${key}`;
+}
 
 async function ensureConnected(): Promise<void> {
   try {
@@ -20,13 +34,18 @@ async function ensureConnected(): Promise<void> {
 export async function get<T>(key: string): Promise<T | null> {
   try {
     await ensureConnected();
-    const value = await redisClient.get(key);
+    const value = await redisClient.get(namespaced(key));
     // Use strict null check: Redis returns null for missing keys.
     // A stored value of 0, false, or "" serialises to a non-null string and must
     // not be discarded by JavaScript's falsy coercion.
-    if (value === null || value === undefined) return null;
+    if (value === null || value === undefined) {
+      incCounter(cacheOperationsTotal, { result: 'miss', domain: 'cache' });
+      return null;
+    }
+    incCounter(cacheOperationsTotal, { result: 'hit', domain: 'cache' });
     return JSON.parse(value) as T;
   } catch {
+    incCounter(cacheOperationsTotal, { result: 'error', domain: 'cache' });
     return null;
   }
 }
@@ -50,7 +69,9 @@ export async function set(key: string, value: unknown, ttlSeconds: number): Prom
   }
   try {
     await ensureConnected();
-    await redisClient.set(key, JSON.stringify(value), { EX: ttlSeconds });
+    const payload = JSON.stringify(value);
+    assertValueSize(payload);
+    await redisClient.set(namespaced(key), payload, { EX: boundedTtl(ttlSeconds) });
   } catch {
     // Cache miss is non-fatal
   }
@@ -64,7 +85,7 @@ export async function set(key: string, value: unknown, ttlSeconds: number): Prom
 export async function del(key: string): Promise<void> {
   try {
     await ensureConnected();
-    await redisClient.del(key);
+    await redisClient.del(namespaced(key));
   } catch {
     // Ignore
   }
@@ -81,7 +102,7 @@ export async function del(key: string): Promise<void> {
 export async function invalidatePattern(pattern: string): Promise<void> {
   try {
     await ensureConnected();
-    const rawKeys = await redisClient.keys(pattern);
+    const rawKeys = await redisClient.keys(namespaced(pattern));
     // Normalise to an empty array in case the client returns null/undefined
     // on a temporary response anomaly, preventing a runtime exception.
     const keys: string[] = Array.isArray(rawKeys) ? rawKeys : [];

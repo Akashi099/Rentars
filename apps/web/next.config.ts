@@ -3,6 +3,19 @@ import path from 'path';
 
 const nextConfig: NextConfig = {
   output: 'standalone',
+  
+  // Performance: compress static assets
+  compress: true,
+  
+  // Performance: enable React strict mode for better development checks
+  reactStrictMode: true,
+  
+  // Performance: optimize fonts
+  optimizeFonts: true,
+  
+  // Performance: enable SWC minification
+  swcMinify: true,
+  
   images: {
     // `remotePatterns` supersedes the deprecated `domains` list and supports
     // wildcards, so we cover Supabase storage buckets and any future CDN host.
@@ -27,7 +40,12 @@ const nextConfig: NextConfig = {
         pathname: '/storage/v1/object/**',
       },
     ],
+    // Image optimization settings
+    formats: ['image/avif', 'image/webp'],
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
   },
+  
   webpack(config) {
     config.resolve.alias = {
       ...config.resolve.alias,
@@ -39,6 +57,11 @@ const nextConfig: NextConfig = {
       '@/lib': path.resolve(__dirname, 'src/lib'),
     };
     return config;
+  },
+  
+  // Experimental features for better performance
+  experimental: {
+    optimizePackageImports: ['lucide-react', 'recharts', 'leaflet', 'react-leaflet'],
   },
 };
 
