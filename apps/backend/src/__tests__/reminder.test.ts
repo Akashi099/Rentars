@@ -600,3 +600,156 @@ describe('runReminderScheduler() — quiet-hours deferral', () => {
     expect(mockCreateNotificationWithEmail).toHaveBeenCalled();
   });
 });
+
+// ─── Payment deadline and dispute reminders ───────────────────────────────────
+//
+// processPaymentDeadlineReminders uses: .select().eq('status','Pending').gte().lte()
+// processDisputeReminders        uses: .select().eq('status','Disputed').lte()
+//
+// Both end with a terminal .lte() (mockLte is awaited directly).
+// checkIn / checkOut queries end with .lte().not() — they do NOT await mockLte directly.
+//
+// Call order of mockLte within runReminderScheduler():
+//   #1  checkIn   .gte().lte()          → chained with .not(); not terminal
+//   #2  checkOut  .gte().lte()          → chained with .not(); not terminal
+//   #3  paymentDeadline .eq().gte().lte() → terminal await
+//   #4  dispute   .eq().lte()           → terminal await
+
+// Helper: Object.assign thenable so .not() can still be called after .lte()
+const makeNonTerminalLte = () =>
+  Object.assign(Promise.resolve({ data: [], error: null }), { not: mockNot });
+
+function setupForPaymentDeadline(
+  paymentRow: ReturnType<typeof makeBookingRow>,
+) {
+  // check-in and check-out return empty results
+  mockNot.mockResolvedValueOnce({ data: [], error: null });
+  mockNot.mockResolvedValueOnce({ data: [], error: null });
+
+  // mockLte call #1 (check-in): must have .not so the chain continues
+  mockLte.mockReturnValueOnce(makeNonTerminalLte());
+  // mockLte call #2 (check-out): same
+  mockLte.mockReturnValueOnce(makeNonTerminalLte());
+  // mockLte call #3 (payment deadline): terminal — return the test booking
+  mockLte.mockResolvedValueOnce({ data: [paymentRow], error: null });
+  // mockLte call #4 (dispute): terminal — return empty
+  mockLte.mockResolvedValueOnce({ data: [], error: null });
+}
+
+function setupForDispute(disputeRow: ReturnType<typeof makeBookingRow>) {
+  // check-in and check-out return empty results
+  mockNot.mockResolvedValueOnce({ data: [], error: null });
+  mockNot.mockResolvedValueOnce({ data: [], error: null });
+
+  // mockLte call #1 (check-in): non-terminal
+  mockLte.mockReturnValueOnce(makeNonTerminalLte());
+  // mockLte call #2 (check-out): non-terminal
+  mockLte.mockReturnValueOnce(makeNonTerminalLte());
+  // mockLte call #3 (payment deadline): terminal — empty
+  mockLte.mockResolvedValueOnce({ data: [], error: null });
+  // mockLte call #4 (dispute): terminal — return the test booking
+  mockLte.mockResolvedValueOnce({ data: [disputeRow], error: null });
+}
+
+describe('runReminderScheduler() — payment deadline reminders', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreateNotificationWithEmail.mockResolvedValue({ success: true });
+    mockGetPreferences.mockResolvedValue({
+      success: true,
+      data: { email_notifications: true, push_notifications: true, notification_types: {} },
+    });
+    mockSingle.mockResolvedValue({ data: { email: 'u@example.com' }, error: null });
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+  });
+
+  it('sends a payment_deadline_tenant reminder for a Pending booking approaching its deadline', async () => {
+    const row = {
+      ...makeBookingRow('booking-payment-dl'),
+      created_at: new Date(Date.now() - 47 * 3_600_000).toISOString(), // ~1 h from 48-h deadline
+    };
+
+    setupForPaymentDeadline(row);
+
+    // isReminderSent → not yet sent
+    mockInsert.mockResolvedValue({ error: null });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    expect(result.data!.sent).toBeGreaterThan(0);
+    expect(mockCreateNotificationWithEmail).toHaveBeenCalledWith(
+      row.tenant_id,
+      'booking_reminder',
+      expect.objectContaining({ event: 'payment_deadline' }),
+    );
+  });
+
+  it('does not send a duplicate payment deadline reminder on re-run', async () => {
+    const row = {
+      ...makeBookingRow('booking-payment-dl-dup'),
+      created_at: new Date(Date.now() - 47 * 3_600_000).toISOString(),
+    };
+
+    setupForPaymentDeadline(row);
+
+    // Already sent — unique_violation on insert
+    mockInsert.mockResolvedValue({ error: { code: '23505', message: 'unique' } });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    expect(result.data!.sent).toBe(0);
+    expect(result.data!.skipped).toBeGreaterThan(0);
+    expect(mockCreateNotificationWithEmail).not.toHaveBeenCalled();
+  });
+});
+
+describe('runReminderScheduler() — dispute reminders', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreateNotificationWithEmail.mockResolvedValue({ success: true });
+    mockGetPreferences.mockResolvedValue({
+      success: true,
+      data: { email_notifications: true, push_notifications: true, notification_types: {} },
+    });
+    mockSingle.mockResolvedValue({ data: { email: 'u@example.com' }, error: null });
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+  });
+
+  it('sends dispute reminders to both tenant and host for a long-open Disputed booking', async () => {
+    const row = makeBookingRow('booking-dispute');
+
+    setupForDispute(row);
+
+    mockInsert.mockResolvedValue({ error: null });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    expect(result.data!.sent).toBeGreaterThan(0);
+
+    const notifTypes = mockCreateNotificationWithEmail.mock.calls.map((c) => c[1]);
+    expect(notifTypes.every((t) => t === 'booking_reminder')).toBe(true);
+
+    const eventValues = mockCreateNotificationWithEmail.mock.calls.map(
+      (c) => (c[2] as Record<string, unknown>).event,
+    );
+    expect(eventValues.every((e) => e === 'dispute_unresolved')).toBe(true);
+  });
+
+  it('skips dispute reminders already sent (at-most-once delivery)', async () => {
+    const row = makeBookingRow('booking-dispute-dup');
+
+    setupForDispute(row);
+
+    mockInsert.mockResolvedValue({ error: { code: '23505', message: 'unique' } });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    expect(result.data!.sent).toBe(0);
+    expect(result.data!.skipped).toBeGreaterThan(0);
+    expect(mockCreateNotificationWithEmail).not.toHaveBeenCalled();
+  });
+});
