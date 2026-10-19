@@ -49,6 +49,8 @@ import {
   // Audit logs
   getAuditLogsHandler,
 } from '@/controllers/admin.controller.js';
+import emailAdminRoutes from './emailAdmin.routes.js';
+import notificationMonitorRoutes from './notificationMonitor.routes.js';
 
 const router = Router();
 
@@ -113,29 +115,14 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
-// ── Support cases (staff view) ────────────────────────────────────────────────
-// Scope: admin:support:read    → admin, moderator, support, finance
-// Scope: admin:support:manage  → admin, moderator, support
-// Scope: admin:support:audit:read → admin, moderator, support
-import {
-  listStaffCasesHandler,
-  getStaffCaseHandler,
-  updateCaseStatusHandler,
-  assignCaseHandler,
-  addStaffNoteHandler,
-  getStaffCaseNotesHandler,
-  getCaseAuditHandler,
-} from '@/controllers/supportCase.controller.js';
+// ── Email delivery tracking ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:email:read
+// Mounted at /api/v1/admin/email/*
+router.use('/email', emailAdminRoutes);
 
-// List and read
-router.get('/support/cases',              requireScope('admin:support:read'),       listStaffCasesHandler);
-router.get('/support/cases/:id',          requireScope('admin:support:read'),       getStaffCaseHandler);
-router.get('/support/cases/:id/notes',    requireScope('admin:support:read'),       getStaffCaseNotesHandler);
-// Manage
-router.patch('/support/cases/:id/status', requireScope('admin:support:manage'),     updateCaseStatusHandler);
-router.post('/support/cases/:id/assign',  requireScope('admin:support:manage'),     assignCaseHandler);
-router.post('/support/cases/:id/notes',   requireScope('admin:support:manage'),     addStaffNoteHandler);
-// Audit trail
-router.get('/support/cases/:id/audit',   requireScope('admin:support:audit:read'), getCaseAuditHandler);
+// ── Notification monitoring ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:notifications:read
+// Mounted at /api/v1/admin/notifications/*
+router.use('/notifications', notificationMonitorRoutes);
 
 export default router;

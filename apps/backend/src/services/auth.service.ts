@@ -14,12 +14,27 @@ import { emailService } from './email.service.js';
 import { issueRefreshToken } from './refreshToken.service.js';
 import { securityLogger } from './logging.service.js';
 import { auditLogger } from './auditLogger.service.js';
+import { markUserSessionsRevoked } from './sessionRevocation.service.js';
 import type { ServiceResponse } from './index.js';
 
 const VERIFICATION_TOKEN_EXPIRES_MINUTES = 24 * 60; // 24 hours
 
 function hashToken(raw: string): string {
   return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+/**
+ * Minimum wall-clock time for the public password-reset request endpoint.
+ * Known and unknown addresses both take at least this long, so response
+ * timing does not reveal which addresses have accounts.
+ */
+export const PASSWORD_RESET_MIN_RESPONSE_MS = 500;
+
+async function padToMinimumDuration(startedAt: number, minMs: number): Promise<void> {
+  const remaining = minMs - (Date.now() - startedAt);
+  if (remaining > 0) {
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -88,13 +103,19 @@ export async function registerUser(
   const tokenHash = hashToken(rawToken);
   const expiresAt = new Date(Date.now() + VERIFICATION_TOKEN_EXPIRES_MINUTES * 60 * 1000);
 
-  await supabase.from('users').upsert({
+  const { error: upsertError } = await supabase.from('users').upsert({
     id: data.user.id,
     email: data.user.email,
     email_verified: false,
     email_verification_token: tokenHash,
     email_verification_expires_at: expiresAt.toISOString(),
   });
+
+  // Without this row the verification link cannot work, so fail the registration
+  // rather than report success for an account whose verification state is unknown.
+  if (upsertError) {
+    throw new AuthError(AuthErrorCode.USER_NOT_FOUND, 'Registration failed: could not persist account state');
+  }
 
   await emailService.sendVerificationEmail({ to: data.user.email!, token: rawToken });
 
@@ -380,17 +401,33 @@ export async function verifyEmail(rawToken: string): Promise<ServiceResponse<voi
     throw new AuthError(AuthErrorCode.TOKEN_EXPIRED, 'Verification token has expired');
   }
 
-  // Mark email as verified and clear token
-  await supabase
+  // Claim the token atomically. The conditional update only matches while the
+  // token is still stored and the address is unverified, so two concurrent
+  // requests carrying the same link cannot both succeed.
+  const { data: claimed, error: claimError } = await supabase
     .from('users')
     .update({
       email_verified: true,
       email_verification_token: null,
       email_verification_expires_at: null,
     })
-    .eq('id', user.id);
+    .eq('id', user.id)
+    .eq('email_verification_token', tokenHash)
+    .eq('email_verified', false)
+    .select('id');
+
+  if (claimError || !claimed || claimed.length === 0) {
+    throw new AuthError(AuthErrorCode.INVALID_TOKEN, 'Verification token has already been used');
+  }
 
   await securityLogger.logAuthEvent('email_verified', user.id);
+  await auditLogger.log({
+    actorId: user.id,
+    action: 'auth.email_verify',
+    resourceType: 'auth',
+    resourceId: user.id,
+    success: true,
+  });
 
   return { success: true };
 }
@@ -413,30 +450,59 @@ export async function requestPasswordReset(
   }
 
   const normalizedEmail = email.toLowerCase().trim();
+  const startedAt = Date.now();
 
-  const { data: userData } = await supabase.auth.admin.listUsers();
-  const user = (userData?.users ?? []).find((u) => u.email === normalizedEmail);
+  try {
+    // Indexed lookup. Listing auth users is not used here: it returns a single
+    // page, so accounts beyond that page could never receive a reset link.
+    const { data: userRow } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', normalizedEmail)
+      .maybeSingle();
 
-  if (user) {
-    // Invalidate prior reset tokens for this user (replay prevention)
-    await supabase
-      .from('password_reset_tokens')
-      .update({ consumed_at: new Date().toISOString() })
-      .eq('user_id', user.id)
-      .is('consumed_at', null);
+    if (userRow) {
+      const userId = (userRow as { id: string }).id;
 
-    const rawToken = crypto.randomBytes(32).toString('hex');
-    const tokenHash = hashToken(rawToken);
-    const expiresAt = new Date(Date.now() + RESET_TOKEN_EXPIRES_MINUTES * 60 * 1000);
+      // Invalidate prior reset tokens for this user (replay prevention)
+      await supabase
+        .from('password_reset_tokens')
+        .update({ consumed_at: new Date().toISOString() })
+        .eq('user_id', userId)
+        .is('consumed_at', null);
 
-    await supabase.from('password_reset_tokens').insert({
-      user_id: user.id,
-      token_hash: tokenHash,
-      expires_at: expiresAt.toISOString(),
-    });
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashToken(rawToken);
+      const expiresAt = new Date(Date.now() + RESET_TOKEN_EXPIRES_MINUTES * 60 * 1000);
 
-    await emailService.sendPasswordResetEmail({ to: normalizedEmail, token: rawToken });
+      await supabase.from('password_reset_tokens').insert({
+        user_id: userId,
+        token_hash: tokenHash,
+        expires_at: expiresAt.toISOString(),
+      });
+
+      // Send without awaiting: delivery latency must not differ between known
+      // and unknown addresses. Failures are logged, never surfaced to the caller.
+      emailService
+        .sendPasswordResetEmail({ to: normalizedEmail, token: rawToken })
+        .catch((err: unknown) => {
+          console.error('[auth] Password reset email delivery failed:', err);
+        });
+
+      await auditLogger.log({
+        actorId: userId,
+        action: 'auth.password_reset_request',
+        resourceType: 'auth',
+        resourceId: userId,
+        success: true,
+      });
+    }
+  } catch (err) {
+    // Swallow and log: a storage failure must not change the public response.
+    console.error('[auth] Password reset request failed:', err);
   }
+
+  await padToMinimumDuration(startedAt, PASSWORD_RESET_MIN_RESPONSE_MS);
 
   // Always return success with same message to prevent email enumeration
   return { success: true };
@@ -483,25 +549,45 @@ export async function confirmPasswordReset(
     throw new AuthError(AuthErrorCode.TOKEN_EXPIRED, 'Reset token has expired');
   }
 
+  // Claim the token before touching the password. The conditional update only
+  // matches an unconsumed, unexpired row, so concurrent confirmations with the
+  // same link cannot both reset the password.
+  const nowIso = new Date().toISOString();
+  const { data: claimed, error: claimError } = await supabase
+    .from('password_reset_tokens')
+    .update({ consumed_at: nowIso })
+    .eq('id', row.id)
+    .is('consumed_at', null)
+    .gt('expires_at', nowIso)
+    .select('id');
+
+  if (claimError || !claimed || claimed.length === 0) {
+    throw new AuthError(AuthErrorCode.INVALID_TOKEN, 'Reset token has already been used');
+  }
+
   const { error: updateError } = await supabase.auth.admin.updateUserById(row.user_id, {
     password: newPassword,
   });
 
   if (updateError) {
+    // Release the claim so the user can retry with the same link.
+    await supabase
+      .from('password_reset_tokens')
+      .update({ consumed_at: null })
+      .eq('id', row.id);
     throw new AuthError(AuthErrorCode.INVALID_CREDENTIALS, updateError.message);
   }
 
-  // Mark token as consumed
-  await supabase
-    .from('password_reset_tokens')
-    .update({ consumed_at: new Date().toISOString() })
-    .eq('id', row.id);
+  const revokedAt = new Date();
 
-  // Invalidate all sessions for this user
+  // Record the revocation for stateless JWTs. Persisted in the database for
+  // audit and in Redis for the per-request guard.
   await supabase
     .from('users')
-    .update({ sessions_invalidated_at: new Date().toISOString() })
+    .update({ sessions_invalidated_at: revokedAt.toISOString() })
     .eq('id', row.user_id);
+
+  await markUserSessionsRevoked(row.user_id, revokedAt);
 
   // Invalidate all refresh tokens for this user across all devices
   const { revokeAllUserRefreshTokens } = await import('./refreshToken.service.js');

@@ -15,10 +15,10 @@ see ROADMAP.md.
 **Owner:** *unassigned*
 
 ### Remaining work
-- [ ] Create `apps/web/src/components/booking/DisputeButton.tsx`
-- [ ] Create `apps/web/src/components/booking/DisputeModal.tsx`
-- [ ] Wire dispute-raise API call from modal (`POST /api/v1/bookings/:id/dispute`)
-- [ ] Show `DisputeButton` on active bookings (align with existing booking status logic)
+- [x] Create `apps/web/src/components/booking/DisputeButton.tsx`
+- [x] Create `apps/web/src/components/booking/DisputeModal.tsx`
+- [x] Wire dispute-raise API call from modal (`POST /api/v1/bookings/:id/dispute`)
+- [x] Show `DisputeButton` on active bookings (align with existing booking status logic)
 
 ### Already done
 - [x] Backend: `dispute` and `dispute/resolve` service methods in `booking.service.ts`

@@ -9,7 +9,7 @@ File uploads are a significant attack surface: malware distribution, storage exh
 ```
 1. Browser selects file (client-side MIME type check — advisory only)
    ↓
-2. Express multer validates file size (10 MB limit)
+2. Express multer validates file size (`MAX_IMAGE_SIZE_BYTES`, default 5 MB) and file count (1)
    ↓
 3. Magic-byte detection (real file type, not just extension)
    ↓
@@ -60,7 +60,13 @@ Explicitly rejected:
 
 After decoding the image, Sharp validates:
 - **Minimum**: 200×200 pixels (prevent thumbnails masquerading as full images)
-- **Maximum**: 4096×4096 pixels (prevent memory exhaustion attacks)
+- **Maximum input**: 8192 px on either edge, and at most 40 megapixels decoded
+  (`IMAGE_LIMITS` in `apps/backend/src/services/imageValidation.ts`). The pixel cap
+  is passed to sharp as `limitInputPixels`, so decompression bombs are refused
+  before pixels are allocated. Large phone photos are accepted and downscaled
+  rather than rejected.
+- **Bounded output**: the main image is at most 1920×1080 and the thumbnail at most
+  800×600, both WebP (`optimizeImage` in `apps/backend/src/config/supabase-storage.ts`).
 
 Invalid dimensions are rejected with specific error messages.
 
@@ -92,6 +98,13 @@ const dangerousPatterns = [
 ```
 
 For now, SVGs are rejected at the format whitelist stage.
+
+### Client-supplied type is advisory
+
+The multipart `Content-Type` and file extension are never trusted. The format is
+decided only by `detectImageFormat` on the leading bytes. Processing never falls
+back to the original buffer: if the image cannot be decoded or re-encoded, the
+upload is refused. Storage paths use a random suffix and a UUID-validated property id.
 
 ## Image Re-encoding
 
