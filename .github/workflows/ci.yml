@@ -158,6 +158,46 @@ jobs:
           REDIS_URL: ""
         run: bun test tests/integration/booking-e2e.test.ts
 
+  # ─── Job 3b: OpenAPI contract tests (#826) ──────────────────────────────────
+  # Compares live route samples (success + error fixtures) against the published
+  # OpenAPI document at apps/backend/openapi.json. Any response shape or status
+  # code that is not documented in the spec fails this job, blocking the merge.
+  #
+  # Local reproduction:
+  #   cd apps/backend && bun run test:contract
+  contract-tests:
+    name: Backend — OpenAPI Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install backend dependencies
+        working-directory: apps/backend
+        run: bun install --frozen-lockfile
+
+      - name: Run OpenAPI contract tests
+        working-directory: apps/backend
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: https://mock.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: mock-service-role-key
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          PREF_TOKEN_SECRET: test_pref_token_secret_min_32_chars
+          FRONTEND_URL: https://rentars.app
+          CORS_ORIGIN: http://localhost:3001
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          TRUSTLESS_WORK_API_URL: https://sandbox.trustlesswork.com
+          TRUSTLESS_WORK_API_KEY: test-api-key
+          REDIS_URL: ""
+        run: bun run test:contract
+
   # ─── Job 4: RLS integration tests ───────────────────────────────────────────
   # Applies all migrations to a temporary PostgreSQL database and then runs RLS
   # policy tests. Migration failures and RLS failures both block this job.
