@@ -52,7 +52,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20.18.0'
           cache: yarn
           cache-dependency-path: apps/web/yarn.lock
 
@@ -83,7 +83,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.1.38'
 
       - name: Install backend dependencies (frozen)
         working-directory: apps/backend
@@ -106,8 +106,8 @@ jobs:
 
       - name: Audit contracts workspace
         working-directory: apps/contracts
-        # Reads .cargo/audit.toml for any approved exceptions
-        run: cargo audit
+        # Per-finding suppression configured in .cargo/audit.toml
+        run: cargo audit --config .cargo/audit.toml
 
   # ─── Container image scan ────────────────────────────────────────────────────
   container-scan:
