@@ -2,6 +2,7 @@
 
 import type { ListingFormData } from '../types';
 import { formStyles } from '../styles';
+import { buildDescribedBy } from '@/components/ui/form-field';
 
 interface PricingStepProps {
   formData: Partial<ListingFormData>;
@@ -18,8 +19,10 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
 
         <div className="grid grid-cols-3 gap-4 mt-2">
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="maxGuests">
+            <label htmlFor="maxGuests" className={formStyles.label}>
               Max Guests
+              <span aria-hidden="true" className="ml-1 text-red-500 font-normal">*</span>
+              <span className="sr-only">(required)</span>
             </label>
             <input
               id="maxGuests"
@@ -30,13 +33,21 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
                 setFormData({ ...formData, maxGuests: parseInt(e.target.value, 10) || 1 })
               }
               placeholder="1"
-              className={formStyles.input}
+              required
+              aria-required
+              aria-invalid={!!errors.maxGuests || undefined}
+              aria-describedby={buildDescribedBy('maxGuests', !!errors.maxGuests, false)}
+              className={errors.maxGuests ? formStyles.inputError : formStyles.input}
             />
-            {errors.maxGuests && <p className={formStyles.error}>{errors.maxGuests}</p>}
+            {errors.maxGuests && (
+              <p id="maxGuests-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.maxGuests}
+              </p>
+            )}
           </div>
 
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="bedrooms">
+            <label htmlFor="bedrooms" className={formStyles.label}>
               Bedrooms
             </label>
             <input
@@ -54,17 +65,21 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
                 if (!Number.isNaN(parsed)) {
                   setFormData({ ...formData, bedrooms: parsed });
                 }
-                // non-numeric / malformed: leave state unchanged so the schema
-                // can surface an appropriate validation message
               }}
               placeholder="0"
-              className={formStyles.input}
+              aria-invalid={!!errors.bedrooms || undefined}
+              aria-describedby={buildDescribedBy('bedrooms', !!errors.bedrooms, false)}
+              className={errors.bedrooms ? formStyles.inputError : formStyles.input}
             />
-            {errors.bedrooms && <p className={formStyles.error}>{errors.bedrooms}</p>}
+            {errors.bedrooms && (
+              <p id="bedrooms-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.bedrooms}
+              </p>
+            )}
           </div>
 
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="bathrooms">
+            <label htmlFor="bathrooms" className={formStyles.label}>
               Bathrooms
             </label>
             <input
@@ -82,24 +97,30 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
                 if (!Number.isNaN(parsed)) {
                   setFormData({ ...formData, bathrooms: parsed });
                 }
-                // non-numeric / malformed: leave state unchanged so the schema
-                // can surface an appropriate validation message
               }}
               placeholder="0"
-              className={formStyles.input}
+              aria-invalid={!!errors.bathrooms || undefined}
+              aria-describedby={buildDescribedBy('bathrooms', !!errors.bathrooms, false)}
+              className={errors.bathrooms ? formStyles.inputError : formStyles.input}
             />
-            {errors.bathrooms && <p className={formStyles.error}>{errors.bathrooms}</p>}
+            {errors.bathrooms && (
+              <p id="bathrooms-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.bathrooms}
+              </p>
+            )}
           </div>
         </div>
       </fieldset>
 
       {/* ── Pricing ────────────────────────────────────────────────────── */}
       <div className={formStyles.formGroup}>
-        <label className={formStyles.label} htmlFor="pricePerNight">
+        <label htmlFor="pricePerNight" className={formStyles.label}>
           Price per Night (USDC)
+          <span aria-hidden="true" className="ml-1 text-red-500 font-normal">*</span>
+          <span className="sr-only">(required)</span>
         </label>
         <div className="flex items-center gap-2">
-          <span className="text-xl font-semibold">$</span>
+          <span aria-hidden="true" className="text-xl font-semibold">$</span>
           <input
             id="pricePerNight"
             type="number"
@@ -107,18 +128,26 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
             onChange={(e) => setFormData({ ...formData, pricePerNight: Number(e.target.value) })}
             placeholder="0"
             min="10"
-            className={formStyles.input}
+            required
+            aria-required
+            aria-invalid={!!errors.pricePerNight || undefined}
+            aria-describedby={buildDescribedBy('pricePerNight', !!errors.pricePerNight, false)}
+            className={errors.pricePerNight ? formStyles.inputError : formStyles.input}
           />
         </div>
-        {errors.pricePerNight && <p className={formStyles.error}>{errors.pricePerNight}</p>}
+        {errors.pricePerNight && (
+          <p id="pricePerNight-error" role="alert" aria-live="polite" className={formStyles.error}>
+            {errors.pricePerNight}
+          </p>
+        )}
       </div>
 
       <div className={formStyles.formGroup}>
-        <label className={formStyles.label} htmlFor="cleaningFee">
+        <label htmlFor="cleaningFee" className={formStyles.label}>
           Cleaning Fee (USDC)
         </label>
         <div className="flex items-center gap-2">
-          <span className="text-xl font-semibold">$</span>
+          <span aria-hidden="true" className="text-xl font-semibold">$</span>
           <input
             id="cleaningFee"
             type="number"
@@ -126,18 +155,24 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
             onChange={(e) => setFormData({ ...formData, cleaningFee: Number(e.target.value) })}
             placeholder="0"
             min="0"
-            className={formStyles.input}
+            aria-invalid={!!errors.cleaningFee || undefined}
+            aria-describedby={buildDescribedBy('cleaningFee', !!errors.cleaningFee, false)}
+            className={errors.cleaningFee ? formStyles.inputError : formStyles.input}
           />
         </div>
-        {errors.cleaningFee && <p className={formStyles.error}>{errors.cleaningFee}</p>}
+        {errors.cleaningFee && (
+          <p id="cleaningFee-error" role="alert" aria-live="polite" className={formStyles.error}>
+            {errors.cleaningFee}
+          </p>
+        )}
       </div>
 
       <div className={formStyles.formGroup}>
-        <label className={formStyles.label} htmlFor="serviceFee">
+        <label htmlFor="serviceFee" className={formStyles.label}>
           Service Fee (USDC)
         </label>
         <div className="flex items-center gap-2">
-          <span className="text-xl font-semibold">$</span>
+          <span aria-hidden="true" className="text-xl font-semibold">$</span>
           <input
             id="serviceFee"
             type="number"
@@ -145,10 +180,16 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
             onChange={(e) => setFormData({ ...formData, serviceFee: Number(e.target.value) })}
             placeholder="0"
             min="0"
-            className={formStyles.input}
+            aria-invalid={!!errors.serviceFee || undefined}
+            aria-describedby={buildDescribedBy('serviceFee', !!errors.serviceFee, false)}
+            className={errors.serviceFee ? formStyles.inputError : formStyles.input}
           />
         </div>
-        {errors.serviceFee && <p className={formStyles.error}>{errors.serviceFee}</p>}
+        {errors.serviceFee && (
+          <p id="serviceFee-error" role="alert" aria-live="polite" className={formStyles.error}>
+            {errors.serviceFee}
+          </p>
+        )}
       </div>
 
       {/* ── Stay Length ────────────────────────────────────────────────── */}
@@ -156,7 +197,7 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
         <legend className="text-sm font-semibold text-gray-700 px-1">Stay Length</legend>
         <div className="grid grid-cols-2 gap-4 mt-2">
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="minNights">
+            <label htmlFor="minNights" className={formStyles.label}>
               Minimum Nights
             </label>
             <input
@@ -167,13 +208,19 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
               onChange={(e) =>
                 setFormData({ ...formData, minNights: Math.max(1, parseInt(e.target.value, 10) || 1) })
               }
-              className={formStyles.input}
+              aria-invalid={!!errors.minNights || undefined}
+              aria-describedby={buildDescribedBy('minNights', !!errors.minNights, false)}
+              className={errors.minNights ? formStyles.inputError : formStyles.input}
             />
-            {errors.minNights && <p className={formStyles.error}>{errors.minNights}</p>}
+            {errors.minNights && (
+              <p id="minNights-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.minNights}
+              </p>
+            )}
           </div>
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="maxNights">
-              Maximum Nights (leave blank for no limit)
+            <label htmlFor="maxNights" className={formStyles.label}>
+              Maximum Nights
             </label>
             <input
               id="maxNights"
@@ -185,9 +232,18 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
                 setFormData({ ...formData, maxNights: val });
               }}
               placeholder="No limit"
-              className={formStyles.input}
+              aria-invalid={!!errors.maxNights || undefined}
+              aria-describedby={buildDescribedBy('maxNights', !!errors.maxNights, true)}
+              className={errors.maxNights ? formStyles.inputError : formStyles.input}
             />
-            {errors.maxNights && <p className={formStyles.error}>{errors.maxNights}</p>}
+            <p id="maxNights-hint" className="text-xs text-gray-500 mt-1">
+              Leave blank for no maximum
+            </p>
+            {errors.maxNights && (
+              <p id="maxNights-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.maxNights}
+              </p>
+            )}
           </div>
         </div>
       </fieldset>
@@ -197,7 +253,7 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
         <legend className="text-sm font-semibold text-gray-700 px-1">Check-in / Check-out Times</legend>
         <div className="grid grid-cols-2 gap-4 mt-2">
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="checkInTime">
+            <label htmlFor="checkInTime" className={formStyles.label}>
               Check-in Time
             </label>
             <input
@@ -205,12 +261,18 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
               type="time"
               value={formData.checkInTime ?? '15:00'}
               onChange={(e) => setFormData({ ...formData, checkInTime: e.target.value })}
-              className={formStyles.input}
+              aria-invalid={!!errors.checkInTime || undefined}
+              aria-describedby={buildDescribedBy('checkInTime', !!errors.checkInTime, false)}
+              className={errors.checkInTime ? formStyles.inputError : formStyles.input}
             />
-            {errors.checkInTime && <p className={formStyles.error}>{errors.checkInTime}</p>}
+            {errors.checkInTime && (
+              <p id="checkInTime-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.checkInTime}
+              </p>
+            )}
           </div>
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="checkOutTime">
+            <label htmlFor="checkOutTime" className={formStyles.label}>
               Check-out Time
             </label>
             <input
@@ -218,49 +280,56 @@ export default function PricingStep({ formData, setFormData, errors }: PricingSt
               type="time"
               value={formData.checkOutTime ?? '11:00'}
               onChange={(e) => setFormData({ ...formData, checkOutTime: e.target.value })}
-              className={formStyles.input}
+              aria-invalid={!!errors.checkOutTime || undefined}
+              aria-describedby={buildDescribedBy('checkOutTime', !!errors.checkOutTime, false)}
+              className={errors.checkOutTime ? formStyles.inputError : formStyles.input}
             />
-            {errors.checkOutTime && <p className={formStyles.error}>{errors.checkOutTime}</p>}
+            {errors.checkOutTime && (
+              <p id="checkOutTime-error" role="alert" aria-live="polite" className={formStyles.error}>
+                {errors.checkOutTime}
+              </p>
+            )}
           </div>
         </div>
       </fieldset>
 
-      <div className="p-4 bg-gray-50 rounded-lg">
+      {/* ── Summary ────────────────────────────────────────────────────── */}
+      <div className="p-4 bg-gray-50 rounded-lg" aria-label="Pricing summary">
         <p className="text-sm font-semibold mb-2">Summary</p>
-        <div className="space-y-1 text-sm">
+        <dl className="space-y-1 text-sm">
           <div className="flex justify-between">
-            <span>Max Guests:</span>
-            <span>{formData.maxGuests ?? '—'}</span>
+            <dt>Max Guests:</dt>
+            <dd>{formData.maxGuests ?? '—'}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Per Night:</span>
-            <span>${formData.pricePerNight || 0}</span>
+            <dt>Per Night:</dt>
+            <dd>${formData.pricePerNight || 0}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Cleaning Fee:</span>
-            <span>${formData.cleaningFee || 0}</span>
+            <dt>Cleaning Fee:</dt>
+            <dd>${formData.cleaningFee || 0}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Service Fee:</span>
-            <span>${formData.serviceFee || 0}</span>
+            <dt>Service Fee:</dt>
+            <dd>${formData.serviceFee || 0}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Min Stay:</span>
-            <span>{formData.minNights ?? 1} night{(formData.minNights ?? 1) !== 1 ? 's' : ''}</span>
+            <dt>Min Stay:</dt>
+            <dd>{formData.minNights ?? 1} night{(formData.minNights ?? 1) !== 1 ? 's' : ''}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Max Stay:</span>
-            <span>{formData.maxNights ? `${formData.maxNights} nights` : 'No limit'}</span>
+            <dt>Max Stay:</dt>
+            <dd>{formData.maxNights ? `${formData.maxNights} nights` : 'No limit'}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Check-in:</span>
-            <span>{formData.checkInTime ?? '15:00'}</span>
+            <dt>Check-in:</dt>
+            <dd>{formData.checkInTime ?? '15:00'}</dd>
           </div>
           <div className="flex justify-between">
-            <span>Check-out:</span>
-            <span>{formData.checkOutTime ?? '11:00'}</span>
+            <dt>Check-out:</dt>
+            <dd>{formData.checkOutTime ?? '11:00'}</dd>
           </div>
-        </div>
+        </dl>
       </div>
     </div>
   );
