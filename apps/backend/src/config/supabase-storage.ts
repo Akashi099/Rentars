@@ -1,4 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { supabase } from './supabase.js';
+import {
+  ImageValidationError,
+  IMAGE_LIMITS,
+  assertDimensionsAllowed,
+  detectImageFormat,
+} from '../services/imageValidation.js';
 
 export const STORAGE_BUCKET = 'property-images';
 
@@ -14,7 +21,8 @@ let sharpLib: Sharp | null = null;
 async function getSharp(): Promise<Sharp | null> {
   if (sharpLib !== null) return sharpLib;
   try {
-    sharpLib = (await import('sharp')) as unknown as Sharp;
+    // The CJS module exposes the callable as `default`; the namespace object is not callable.
+    sharpLib = (await import('sharp')).default as unknown as Sharp;
     return sharpLib;
   } catch {
     return null;
@@ -28,27 +36,51 @@ export interface OptimizeOptions {
 }
 
 /**
- * Compresses, auto-rotates, strips metadata, and converts an image buffer to WebP.
- * Strips all EXIF/GPS data by default during re-encoding.
- * Falls back to original buffer when sharp is unavailable.
+ * Decodes, validates and re-encodes an image to WebP.
+ *
+ * - The format is decided from the bytes, never from `_mimetype` or the filename.
+ * - Dimensions and decoded pixel count are checked before any pixels are processed.
+ * - Re-encoding strips EXIF/GPS/XMP metadata and any non-pixel payload.
+ *
+ * Never falls back to the original buffer: storing unprocessed bytes would bypass
+ * every check above.
  */
 export async function optimizeImage(
   buffer: Buffer,
-  mimetype: string,
+  _mimetype: string,
   options: OptimizeOptions = {}
 ): Promise<{ buffer: Buffer; mimetype: string }> {
   const { maxWidth = 1920, maxHeight = 1080, quality = 80 } = options;
 
-  const sharp = await getSharp();
-  if (!sharp) {
-    return { buffer, mimetype };
+  if (!detectImageFormat(buffer)) {
+    throw new ImageValidationError('File is not a supported image (JPEG, PNG or WebP)');
   }
 
-  const optimized = await (sharp as any)(buffer)
-    .rotate()
-    .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
-    .webp({ quality })
-    .toBuffer();
+  const sharp = await getSharp();
+  if (!sharp) {
+    throw new Error('Image processing is unavailable');
+  }
+
+  const sharpOptions = { limitInputPixels: IMAGE_LIMITS.maxPixels };
+
+  let metadata: { width?: number; height?: number };
+  try {
+    metadata = await (sharp as any)(buffer, sharpOptions).metadata();
+  } catch {
+    throw new ImageValidationError('Image could not be decoded');
+  }
+  assertDimensionsAllowed(metadata.width, metadata.height);
+
+  let optimized: Buffer;
+  try {
+    optimized = await (sharp as any)(buffer, sharpOptions)
+      .rotate()
+      .resize(maxWidth, maxHeight, { fit: 'inside', withoutEnlargement: true })
+      .webp({ quality })
+      .toBuffer();
+  } catch {
+    throw new ImageValidationError('Image could not be decoded');
+  }
 
   return { buffer: optimized, mimetype: 'image/webp' };
 }
@@ -69,16 +101,17 @@ export async function uploadImage(
   file: MulterFile,
 ): Promise<{ url: string; thumbnailUrl: string }> {
   const timestamp = Date.now();
+  // A random suffix keeps two uploads in the same millisecond from colliding.
+  const uniqueId = randomUUID();
   const safeBaseName = file.originalname.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_') || 'image';
 
-  // Process main image (max 1920px, EXIF stripped, WebP)
+  // Both variants are re-encoded from the validated bytes. Output is always WebP.
   const { buffer: mainBuffer, mimetype: mainMime } = await optimizeImage(
     file.buffer,
     file.mimetype,
     { maxWidth: 1920, maxHeight: 1080, quality: 80 }
   );
 
-  // Process thumbnail variant (max 800px, EXIF stripped, WebP)
   const { buffer: thumbBuffer, mimetype: thumbMime } = await optimizeImage(
     file.buffer,
     file.mimetype,
@@ -88,10 +121,9 @@ export async function uploadImage(
   const mainExt = mainMime === 'image/webp' ? 'webp' : 'jpg';
   const thumbExt = thumbMime === 'image/webp' ? 'webp' : 'jpg';
 
-  const mainFileName = `${propertyId}/${timestamp}-${safeBaseName}.${mainExt}`;
-  const thumbFileName = `${propertyId}/thumb_${timestamp}-${safeBaseName}.${thumbExt}`;
+  const mainFileName = `${propertyId}/${timestamp}-${uniqueId}-${safeBaseName}.${mainExt}`;
+  const thumbFileName = `${propertyId}/thumb_${timestamp}-${uniqueId}-${safeBaseName}.${thumbExt}`;
 
-  // Upload main image
   const { error: mainError } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(mainFileName, mainBuffer, {
@@ -102,7 +134,6 @@ export async function uploadImage(
     throw new Error(`Failed to upload image: ${mainError.message}`);
   }
 
-  // Upload thumbnail variant
   const { error: thumbError } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(thumbFileName, thumbBuffer, {
@@ -110,6 +141,8 @@ export async function uploadImage(
     });
 
   if (thumbError) {
+    // Do not leave the main image orphaned in storage with no database row.
+    await supabase.storage.from(STORAGE_BUCKET).remove([mainFileName]);
     throw new Error(`Failed to upload thumbnail: ${thumbError.message}`);
   }
 

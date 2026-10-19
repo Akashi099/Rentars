@@ -1,6 +1,15 @@
 import { supabase } from '../config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import type { Property } from './property.service.js';
+import {
+  buildSavedSearchLink,
+  isAlertDue,
+  isWithinQuietHours,
+  normalizeSavedSearchFilters,
+  type DigestFrequency,
+} from '../utils/savedSearchAlerts.js';
+
+type DeliveryStatus = 'pending' | 'sent' | 'failed';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -14,7 +23,14 @@ export interface SavedSearch {
   created_at?: string;
   updated_at?: string;
   version?: number;
+  /** Normalisation rules that produced `filters`. */
+  filter_version?: number;
+  /** Link that reopens the search page with these filters applied. */
+  share_url?: string;
 }
+
+/** Fields a user may change on an existing saved search. */
+const UPDATABLE_FIELDS = ['name', 'filters', 'is_paused', 'digest_frequency'] as const;
 
 /** Subset of AdvancedSearchFilters relevant for matching a new property. */
 export interface SavedSearchFilters {
@@ -43,14 +59,20 @@ export async function createSavedSearch(
     return { success: false, error: 'Search name is required' };
   }
 
+  const normalized = normalizeSavedSearchFilters(filters);
   const { data, error } = await supabase
     .from('saved_searches')
-    .insert({ user_id: userId, name: name.trim(), filters })
+    .insert({
+      user_id: userId,
+      name: name.trim(),
+      filters: normalized.filters,
+      filter_version: normalized.version,
+    })
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: data as SavedSearch };
+  return { success: true, data: withShareUrl(data as SavedSearch) };
 }
 
 export async function listSavedSearches(
@@ -63,24 +85,57 @@ export async function listSavedSearches(
     .order('created_at', { ascending: false });
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as SavedSearch[] };
+  return { success: true, data: (data ?? []).map((row) => withShareUrl(row as SavedSearch)) };
 }
 
+/**
+ * Update one of the user's saved searches. Only the fields in UPDATABLE_FIELDS
+ * are written, so a request cannot reassign ownership or change bookkeeping
+ * columns. Filters are normalised and versioned the same way as on create.
+ */
 export async function updateSavedSearch(
   userId: string,
   searchId: string,
   updates: Partial<SavedSearch>,
 ): Promise<ServiceResponse<SavedSearch>> {
+  const writable: Record<string, unknown> = {};
+  for (const key of UPDATABLE_FIELDS) {
+    if (updates[key] !== undefined) writable[key] = updates[key];
+  }
+
+  if (writable.name !== undefined) {
+    const name = String(writable.name).trim();
+    if (name.length === 0) return { success: false, error: 'Search name is required' };
+    writable.name = name;
+  }
+
+  if (writable.filters !== undefined) {
+    const normalized = normalizeSavedSearchFilters(writable.filters as Record<string, unknown>);
+    writable.filters = normalized.filters;
+    writable.filter_version = normalized.version;
+  }
+
+  if (Object.keys(writable).length === 0) {
+    return { success: false, error: 'At least one updatable field is required' };
+  }
+
   const { data, error } = await supabase
     .from('saved_searches')
-    .update(updates)
+    .update(writable)
     .eq('id', searchId)
     .eq('user_id', userId)
     .select()
     .single();
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: data as SavedSearch };
+  return { success: true, data: withShareUrl(data as SavedSearch) };
+}
+
+/** Attach a share link built from the saved, normalised filters. */
+function withShareUrl(search: SavedSearch): SavedSearch {
+  const baseUrl = process.env.FRONTEND_URL ?? 'http://localhost:3001';
+  const filters = (search.filters ?? {}) as Record<string, unknown>;
+  return { ...search, share_url: buildSavedSearchLink(baseUrl, filters) };
 }
 
 export async function pauseSavedSearch(
@@ -240,12 +295,19 @@ export async function matchesSavedSearch(
  * notifications to their owners. Fire-and-forget: notification failures
  * never throw.
  *
- * Respects pause status and digest frequency preferences.
+ * Delivery rules (issue #751):
+ * - Paused and deleted searches never match, because they are filtered out here.
+ * - Each (search, listing) pair is recorded once in `saved_search_alert_deliveries`,
+ *   so a listing is never alerted twice for the same search.
+ * - A search with a daily or weekly frequency is alerted only when its window
+ *   has elapsed since its last sent alert. Quiet hours hold alerts the same way.
+ *   Held deliveries stay `pending` and go out on a later matching run.
  *
  * @returns The number of users notified.
  */
 export async function notifyMatchingSavedSearches(
   property: Pick<Property, 'id' | 'title' | 'city' | 'country' | 'price_per_night' | 'bedrooms' | 'bathrooms' | 'max_guests' | 'amenities' | 'property_type'>,
+  now: Date = new Date(),
 ): Promise<ServiceResponse<number>> {
   // Fetch all saved searches that are not paused
   const { data: searches, error } = await supabase
@@ -265,7 +327,7 @@ export async function notifyMatchingSavedSearches(
 
   if (matching.length === 0) return { success: true, data: 0 };
 
-  // Group by user to handle digest frequency per user
+  // Group by user; quiet hours are a per-user preference.
   const searchesByUser = new Map<string, SavedSearch[]>();
   for (const search of matching) {
     if (!searchesByUser.has(search.user_id)) {
@@ -279,15 +341,46 @@ export async function notifyMatchingSavedSearches(
 
   for (const [userId, userSearches] of searchesByUser.entries()) {
     try {
-      const lastSearch = userSearches[0];
+      const quiet = await getQuietHours(userId);
+      if (isWithinQuietHours(now, quiet.start, quiet.end)) {
+        for (const search of userSearches) {
+          await ensureDelivery(userId, search.id, property.id);
+        }
+        continue;
+      }
+
+      // Only searches that have not already handled this listing and whose
+      // frequency window is open are delivered now.
+      const dueSearches: SavedSearch[] = [];
+      for (const search of userSearches) {
+        const status = await ensureDelivery(userId, search.id, property.id);
+        if (status !== 'pending') continue;
+
+        const frequency = (search.digest_frequency || 'immediate') as DigestFrequency;
+        const lastSentAt = frequency === 'immediate' ? null : await getLastSentAlertAt(search.id);
+        if (isAlertDue(frequency, lastSentAt, now)) {
+          dueSearches.push(search);
+        }
+      }
+
+      if (dueSearches.length === 0) continue;
+
+      const lastSearch = dueSearches[0];
       const result = await createNotification(userId, 'new_property_search', {
         propertyId: property.id,
         propertyTitle: property.title,
         savedSearchName: lastSearch.name,
         message: `A new listing "${property.title}" matches your saved search "${lastSearch.name}".`,
-        matchCount: userSearches.length,
+        matchCount: dueSearches.length,
         digestFrequency: lastSearch.digest_frequency || 'immediate',
       });
+
+      await markDeliveries(
+        dueSearches.map((s) => s.id),
+        property.id,
+        result.success ? 'sent' : 'failed',
+        now,
+      );
       if (result.success) notified++;
     } catch {
       // Notification failure must never block property creation
@@ -295,4 +388,70 @@ export async function notifyMatchingSavedSearches(
   }
 
   return { success: true, data: notified };
+}
+
+async function getQuietHours(userId: string): Promise<{ start: string | null; end: string | null }> {
+  const { data } = await supabase
+    .from('notification_preferences')
+    .select('quiet_hours_start, quiet_hours_end')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  return {
+    start: (data?.quiet_hours_start as string | null | undefined) ?? null,
+    end: (data?.quiet_hours_end as string | null | undefined) ?? null,
+  };
+}
+
+/**
+ * Ensure a delivery row exists for (search, listing) and return its status.
+ * An existing 'pending' row is returned as-is so a held alert can still go out;
+ * 'sent' or 'failed' means this search has already handled the listing.
+ */
+async function ensureDelivery(
+  userId: string,
+  searchId: string,
+  propertyId: string,
+): Promise<DeliveryStatus> {
+  await supabase
+    .from('saved_search_alert_deliveries')
+    .upsert(
+      { saved_search_id: searchId, property_id: propertyId, user_id: userId, status: 'pending' },
+      { onConflict: 'saved_search_id,property_id', ignoreDuplicates: true },
+    );
+
+  const { data } = await supabase
+    .from('saved_search_alert_deliveries')
+    .select('status')
+    .eq('saved_search_id', searchId)
+    .eq('property_id', propertyId)
+    .maybeSingle();
+
+  return (data?.status as DeliveryStatus | undefined) ?? 'pending';
+}
+
+async function getLastSentAlertAt(searchId: string): Promise<Date | null> {
+  const { data } = await supabase
+    .from('saved_search_alert_deliveries')
+    .select('sent_at')
+    .eq('saved_search_id', searchId)
+    .eq('status', 'sent')
+    .order('sent_at', { ascending: false })
+    .limit(1);
+
+  const sentAt = (data?.[0] as { sent_at?: string } | undefined)?.sent_at;
+  return sentAt ? new Date(sentAt) : null;
+}
+
+async function markDeliveries(
+  searchIds: string[],
+  propertyId: string,
+  status: 'sent' | 'failed',
+  now: Date,
+): Promise<void> {
+  await supabase
+    .from('saved_search_alert_deliveries')
+    .update({ status, sent_at: status === 'sent' ? now.toISOString() : null })
+    .in('saved_search_id', searchIds)
+    .eq('property_id', propertyId);
 }

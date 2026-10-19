@@ -58,8 +58,8 @@ jobs:
       - name: Verify generate-release-manifest runs cleanly
         run: bun run scripts/generate-release-manifest.ts --version 0.0.0-ci
 
-      - name: Check ABI and migration changes are documented
-        run: bash scripts/check-abi-migration-changelog.sh
+      - name: Test release health gate (#737)
+        run: bun test scripts/release-health-gate.test.ts
 
   # ─── Job 1: Validate migration filenames ────────────────────────────────────
   validate-migrations:
@@ -159,6 +159,46 @@ jobs:
           TRUSTLESS_WORK_API_KEY: test-api-key
           REDIS_URL: ""
         run: bun test tests/integration/booking-e2e.test.ts
+
+  # ─── Job 3b: OpenAPI contract tests (#826) ──────────────────────────────────
+  # Compares live route samples (success + error fixtures) against the published
+  # OpenAPI document at apps/backend/openapi.json. Any response shape or status
+  # code that is not documented in the spec fails this job, blocking the merge.
+  #
+  # Local reproduction:
+  #   cd apps/backend && bun run test:contract
+  contract-tests:
+    name: Backend — OpenAPI Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install backend dependencies
+        working-directory: apps/backend
+        run: bun install --frozen-lockfile
+
+      - name: Run OpenAPI contract tests
+        working-directory: apps/backend
+        env:
+          NODE_ENV: test
+          SUPABASE_URL: https://mock.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: mock-service-role-key
+          JWT_SECRET: test_jwt_secret_min_32_chars_long
+          PREF_TOKEN_SECRET: test_pref_token_secret_min_32_chars
+          FRONTEND_URL: https://rentars.app
+          CORS_ORIGIN: http://localhost:3001
+          STELLAR_NETWORK: testnet
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          TRUSTLESS_WORK_API_URL: https://sandbox.trustlesswork.com
+          TRUSTLESS_WORK_API_KEY: test-api-key
+          REDIS_URL: ""
+        run: bun run test:contract
 
   # ─── Job 4: RLS integration tests ───────────────────────────────────────────
   # Applies all migrations to a temporary PostgreSQL database and then runs RLS
@@ -481,6 +521,40 @@ jobs:
             apps/web/test-results/
           retention-days: 14
 
+  # ─── Job 7b: Search rollout upgrade test (#747) ─────────────────────────────
+  # Applies migration 00067 to a database that already holds listings, backfills in
+  # batches, and asserts search and nearby search work and that the migration is
+  # idempotent. Self-contained, so it does not depend on setup.sql.
+  search-rollout-upgrade:
+    name: Search Rollout Upgrade Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run upgrade test for migration 00067
+        working-directory: apps/backend/tests/db
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: ./run-search-rollout.sh
+
   # ─── Job 8: Documentation link check ────────────────────────────────────────
   # Verifies that all relative file paths referenced in Markdown docs exist in
   # the repository. Broken links (e.g. after a file rename) fail this job.
@@ -506,3 +580,83 @@ jobs:
             apps/backend/database/README.md
             apps/backend/database/MIGRATIONS_NAMING.md
           fail: true
+
+  # ─── Job 9: Backup restore drill (#736) ─────────────────────────────────────
+  # Applies the restore fixture schema and sanitized seed data, then runs the
+  # restore drill: encrypted export, checksum, isolated restore, and schema, RLS,
+  # row-count and write-probe assertions. A truncated copy of the same backup must
+  # be rejected. The scheduled workflow in restore-drill.yml runs the same script
+  # against nonproduction infrastructure.
+  restore-drill:
+    name: Backup Restore Drill
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGPASSWORD: postgres
+      PROD_DB_HOST: 127.0.0.1
+      PROD_DB_USER: postgres
+      PROD_DB_PASSWORD: postgres
+      PROD_DB_NAME: rentars
+      VERIFY_DB_HOST: 127.0.0.1
+      VERIFY_DB_USER: postgres
+      VERIFY_DB_PASSWORD: postgres
+      DRILL_REPORT_DIR: restore-drill-reports
+      DRILL_BACKUP_OUT: restore-drill-backups
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source database and apply schema subset
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE rentars;'
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/schema.sql
+
+      - name: Load sanitized seed data
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/sanitized-seed.sql
+
+      - name: Generate ephemeral backup key
+        run: echo "BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Run restore drill
+        run: bash scripts/backup-restore-drill.sh
+
+      - name: Reject a truncated backup
+        run: |
+          set -euo pipefail
+          src="$(ls restore-drill-backups/*.dump.enc)"
+          truncated="restore-drill-backups/truncated.dump.enc"
+          size="$(stat -c %s "$src")"
+          head -c "$((size / 2))" "$src" > "$truncated"
+          cp "$src.sha256" "$truncated.sha256"
+          if DRILL_SOURCE_BACKUP="$truncated" bash scripts/backup-restore-drill.sh; then
+            echo "::error::restore drill accepted a truncated backup"
+            exit 1
+          fi
+          echo "Truncated backup rejected as expected."
+
+      - name: Upload drill reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-reports
+          path: restore-drill-reports/
+          retention-days: 14

@@ -77,6 +77,11 @@ const envSchema = z.object({
   HCAPTCHA_SECRET_KEY: z.string().optional(),
   HCAPTCHA_ENABLED: z.string().optional(),
 
+  // ── Email webhook ─────────────────────────────────────────────────────────
+  // HMAC-SHA256 secret used to verify inbound delivery-status webhooks from
+  // the SMTP/ESP provider.  When unset all webhook requests are rejected.
+  EMAIL_WEBHOOK_SECRET: z.string().optional(),
+
   // ── Booking rate limits ────────────────────────────────────────────────────
   // Per-user rate limit window for booking creation, in milliseconds.
   // Default: 60 000 ms (1 minute).
@@ -327,6 +332,29 @@ const envSchema = z.object({
       if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS must be a positive integer');
       return n;
     }),
+}).superRefine((value, ctx) => {
+  // Production must name its browser origins explicitly. The development default
+  // (localhost) must never become the production allowlist by omission.
+  if (value.NODE_ENV !== 'production') return;
+
+  if (!process.env.CORS_ORIGIN?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CORS_ORIGIN'],
+      message: 'CORS_ORIGIN must be set explicitly in production',
+    });
+    return;
+  }
+
+  for (const origin of value.CORS_ORIGIN) {
+    if (!origin.startsWith('https://')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CORS_ORIGIN'],
+        message: `Production CORS origin must use https:// (got '${origin}')`,
+      });
+    }
+  }
 });
 
 // ── Type export ───────────────────────────────────────────────────────────────

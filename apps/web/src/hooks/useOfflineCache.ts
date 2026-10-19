@@ -1,25 +1,34 @@
 import { useEffect, useState, useCallback } from 'react';
+import {
+  createCacheMetadata,
+  validateCacheScope,
+  getCacheAge,
+  isCacheStale,
+  type OfflineCacheMetadata,
+} from '@/lib/offlineSafety';
 
 interface CacheEntry<T> {
   data: T;
-  timestamp: number;
-  scope: 'public' | 'user' | 'session';
+  metadata: OfflineCacheMetadata;
 }
 
 interface UseOfflineCacheOptions {
   ttl?: number;
   scope?: 'public' | 'user' | 'session';
   maxRetries?: number;
+  userId?: string;
 }
 
 interface UseOfflineCacheResult<T> {
   data: T | null;
   isStale: boolean;
   isOnline: boolean;
+  cacheAge: number | null;
   error: Error | null;
   isRetrying: boolean;
   retry: () => Promise<void>;
   refetch: () => Promise<void>;
+  clearCache: () => void;
 }
 
 export function useOfflineCache<T>(
@@ -28,16 +37,30 @@ export function useOfflineCache<T>(
   options?: UseOfflineCacheOptions
 ): UseOfflineCacheResult<T> {
   const [data, setData] = useState<T | null>(null);
+  const [metadata, setMetadata] = useState<OfflineCacheMetadata | null>(null);
   const [isStale, setIsStale] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [isRetrying, setIsRetrying] = useState(false);
 
-  const ttl = options?.ttl ?? 5 * 60 * 1000;
+  const ttl = options?.ttl ?? 5 * 60 * 1000; // Default 5 minutes
   const scope = options?.scope ?? 'session';
   const maxRetries = options?.maxRetries ?? 3;
+  const userId = options?.userId;
 
   const cacheKey = `cache:${key}`;
+
+  // Clear cache helper
+  const clearCache = useCallback(() => {
+    try {
+      localStorage.removeItem(cacheKey);
+      setData(null);
+      setMetadata(null);
+      setIsStale(false);
+    } catch (err) {
+      console.warn('Failed to clear cache', err);
+    }
+  }, [cacheKey]);
 
   // Initialize from cache on mount
   useEffect(() => {
@@ -45,17 +68,27 @@ export function useOfflineCache<T>(
       const cached = localStorage.getItem(cacheKey);
       if (cached) {
         const entry: CacheEntry<T> = JSON.parse(cached);
-        const age = Date.now() - entry.timestamp;
+        
+        // Validate cache scope matches current user
+        if (!validateCacheScope(entry.metadata, userId)) {
+          clearCache();
+          return;
+        }
+
+        const age = getCacheAge(entry.metadata);
+        const stale = isCacheStale(entry.metadata, ttl);
 
         setData(entry.data);
-        setIsStale(age > ttl);
+        setMetadata(entry.metadata);
+        setIsStale(stale);
       }
     } catch (err) {
       console.warn('Failed to read cache', err);
+      clearCache();
     }
-  }, [cacheKey, ttl]);
+  }, [cacheKey, ttl, userId, clearCache]);
 
-  // Monitor online/offline
+  // Monitor online/offline and clear cache on user change
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -70,6 +103,13 @@ export function useOfflineCache<T>(
     };
   }, []);
 
+  // Clear cache when user changes
+  useEffect(() => {
+    if (metadata && !validateCacheScope(metadata, userId)) {
+      clearCache();
+    }
+  }, [metadata, userId, clearCache]);
+
   const fetchData = useCallback(
     async (retryCount = 0): Promise<void> => {
       if (!isOnline && data) return;
@@ -78,14 +118,15 @@ export function useOfflineCache<T>(
         setError(null);
         const result = await fetcher();
 
+        const newMetadata = createCacheMetadata(scope, userId);
         const entry: CacheEntry<T> = {
           data: result,
-          timestamp: Date.now(),
-          scope,
+          metadata: newMetadata,
         };
 
         localStorage.setItem(cacheKey, JSON.stringify(entry));
         setData(result);
+        setMetadata(newMetadata);
         setIsStale(false);
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
@@ -99,7 +140,7 @@ export function useOfflineCache<T>(
         setError(error);
       }
     },
-    [isOnline, data, fetcher, scope, cacheKey, maxRetries]
+    [isOnline, data, fetcher, scope, userId, cacheKey, maxRetries]
   );
 
   const retry = useCallback(async () => {
@@ -113,13 +154,17 @@ export function useOfflineCache<T>(
 
   const refetch = useCallback(() => fetchData(0), [fetchData]);
 
+  const cacheAge = metadata ? getCacheAge(metadata) : null;
+
   return {
     data,
     isStale,
     isOnline,
+    cacheAge,
     error,
     isRetrying,
     retry,
     refetch,
+    clearCache,
   };
 }

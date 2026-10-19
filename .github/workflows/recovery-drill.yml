@@ -1,0 +1,103 @@
+name: Recovery Drill
+
+# Implements the nonproduction recovery drill described in
+# docs/RECOVERY_RUNBOOK.md §6. Runs against staging only.
+#
+# Schedule: first Sunday of every month at 03:00 UTC, plus manual dispatch.
+# Manual dispatch lets an on-call engineer re-run a single phase after a
+# recovery-relevant change (backup config, contract IDs, RPC list, SMTP).
+
+on:
+  schedule:
+    # First Sunday of every month at 03:00 UTC
+    - cron: '0 3 1-7 * 0'
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Phase to run (or "all")'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - db-restore
+          - cache-rebuild
+          - sync-resume
+          - core-reads
+          - booking-lookup
+          - reconciliation
+      sample-size:
+        description: 'Booking-lookup sample size (§6.6)'
+        required: false
+        default: '20'
+
+jobs:
+  recovery-drill:
+    name: Recovery drill (staging)
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client redis-tools jq
+
+      - name: Run recovery drill
+        env:
+          ENVIRONMENT: staging
+          PHASE: ${{ github.event.inputs.phase || 'all' }}
+          SAMPLE_SIZE: ${{ github.event.inputs.sample-size || '20' }}
+          STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+          ADMIN_JWT: ${{ secrets.RECOVERY_DRILL_ADMIN_JWT }}
+          PROD_DB_HOST: ${{ secrets.STAGING_DB_HOST }}
+          PROD_DB_USER: ${{ secrets.STAGING_DB_USER }}
+          PROD_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+          VERIFY_DB_HOST: ${{ secrets.VERIFY_DB_HOST }}
+          VERIFY_DB_USER: ${{ secrets.VERIFY_DB_USER }}
+          VERIFY_DB_PASSWORD: ${{ secrets.VERIFY_DB_PASSWORD }}
+          REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
+          BOOKING_CONTRACT_ID: ${{ secrets.BOOKING_CONTRACT_ID }}
+          TRUSTLESS_WORK_API_KEY: ${{ secrets.TRUSTLESS_WORK_API_KEY }}
+        run: bash scripts/recovery-drill.sh --phase "$PHASE" --sample-size "$SAMPLE_SIZE"
+
+      - name: Upload drill artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-drill-${{ github.run_id }}
+          path: |
+            recovery_drill_*.log
+            recovery_drill_*.json
+          retention-days: 90
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            // List the working directory for the JSON report (no external deps).
+            const files = fs.readdirSync(process.cwd())
+              .filter(f => f.startsWith('recovery_drill_') && f.endsWith('.json'));
+            let body = 'The recovery drill failed. See the workflow run for full logs and the uploaded artifact for the JSON report.\n\n';
+            if (files.length) {
+              const report = JSON.parse(fs.readFileSync(files[0], 'utf8'));
+              body += '```\n' + JSON.stringify(report, null, 2) + '\n```\n\n';
+            }
+            body += 'Follow-up risks must be filed in docs/RECOVERY_RUNBOOK.md §7.2 with an owner and a due date before this issue is closed.';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Recovery drill FAILED — ' + new Date().toISOString().slice(0,10),
+              body,
+              labels: ['recovery', 'ops', 'drill-failed']
+            });

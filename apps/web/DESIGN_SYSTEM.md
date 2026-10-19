@@ -248,6 +248,160 @@ All components follow WAI-ARIA guidelines:
 - Focus management
 - Color contrast compliance
 
+## Component States & Interaction Contracts
+
+### Button States
+
+**Normal**: Default resting state with hover effects
+```tsx
+<Button>Click me</Button>
+```
+
+**Loading**: Disabled with loading indicator
+```tsx
+<Button disabled>
+  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+  Processing...
+</Button>
+```
+
+**Disabled**: Non-interactive state
+```tsx
+<Button disabled>Disabled</Button>
+```
+
+**Error**: Indicates failed action
+```tsx
+<Button variant="destructive">Delete Failed</Button>
+```
+
+**Keyboard**: All buttons are focusable via Tab and activated via Enter/Space
+
+### Input States
+
+**Normal**: Default input state
+```tsx
+<Input placeholder="Enter text..." />
+```
+
+**Disabled**: Non-editable state
+```tsx
+<Input disabled value="Read only" />
+```
+
+**Error**: Invalid input with error message
+```tsx
+<div>
+  <Input aria-invalid="true" aria-describedby="error" />
+  <p id="error" className="text-red-600 text-sm">This field is required</p>
+</div>
+```
+
+**Loading**: Input with loading indicator
+```tsx
+<div className="relative">
+  <Input />
+  <Loader2 className="absolute right-3 top-3 h-4 w-4 animate-spin" />
+</div>
+```
+
+**Keyboard**: Inputs are focusable and support standard text editing keys
+
+### Modal States
+
+**Open**: Modal is visible with backdrop
+```tsx
+<Modal open={true} onOpenChange={setOpen} title="Modal Title">
+  <ModalContent>Content</ModalContent>
+</Modal>
+```
+
+**Closed**: Modal is hidden
+```tsx
+<Modal open={false} onOpenChange={setOpen} title="Modal Title">
+  <ModalContent>Content</ModalContent>
+</Modal>
+```
+
+**Loading**: Modal with loading state
+```tsx
+<Modal open={true} onOpenChange={setOpen} title="Processing">
+  <ModalContent>
+    <Loader2 className="animate-spin" />
+    <p>Please wait...</p>
+  </ModalContent>
+</Modal>
+```
+
+**Keyboard**: 
+- Focus trapped within modal
+- Escape closes modal
+- Tab cycles through focusable elements
+- Focus returns to trigger on close
+
+### Alert/Error Display States
+
+**Success**: Positive feedback
+```tsx
+<SuccessDisplay title="Success" message="Operation completed" />
+```
+
+**Error**: Error feedback
+```tsx
+<ErrorDisplay title="Error" message="Something went wrong" onDismiss={() => {}} />
+```
+
+**Warning**: Cautionary message
+```tsx
+<WarningDisplay title="Warning" message="Be careful with this action" />
+```
+
+**Info**: Informational message
+```tsx
+<InfoDisplay title="Info" message="Here's some information" />
+```
+
+### Table States
+
+**Normal**: Table with data
+```tsx
+<ResponsiveTable columns={columns} data={data} />
+```
+
+**Empty**: No data state
+```tsx
+<ResponsiveTable columns={columns} data={[]} emptyMessage="No data available" />
+```
+
+**Loading**: Skeleton loading state
+```tsx
+<ResponsiveTable columns={columns} data={loadingData} />
+```
+
+**Mobile**: Card layout on small screens (automatic via useMediaQuery)
+
+**Keyboard**: 
+- Table headers are focusable
+- Sort controls accessible via keyboard
+- Row actions accessible via Tab
+
+### Responsive Behavior
+
+**Breakpoints**:
+- `sm`: 640px
+- `md`: 768px
+- `lg`: 1024px
+- `xl`: 1280px
+- `2xl`: 1536px
+
+**Mobile-first approach**: 
+- Components stack vertically on mobile
+- Tables convert to cards below 768px
+- Navigation collapses to hamburger menu
+- Forms use full-width inputs
+
+**Touch targets**: Minimum 44x44px for interactive elements on mobile
+
 ## Dark Mode
 
 Enable dark mode by adding the `dark` class to the root element:
@@ -260,6 +414,42 @@ Enable dark mode by adding the `dark` class to the root element:
 ```
 
 Or use a theme provider for dynamic switching.
+
+## Testing Guidelines
+
+### Unit Tests
+- Test all component states (normal, loading, error, disabled)
+- Verify keyboard navigation
+- Check ARIA attributes
+- Validate prop handling
+
+### Integration Tests
+- Test form submission flows
+- Verify modal open/close behavior
+- Test responsive breakpoint changes
+
+### Accessibility Tests
+- Run axe-core on all components
+- Manual keyboard navigation testing
+- Screen reader testing for critical flows
+- Color contrast validation
+
+### Storybook
+All components should have stories demonstrating:
+- Default state
+- All variant combinations
+- Loading state
+- Error state
+- Disabled state
+- Mobile responsive view
+
+## Performance Considerations
+
+- Use `React.memo` for expensive re-renders
+- Lazy load heavy components
+- Optimize images with Next.js Image component
+- Use CSS transitions over JavaScript animations
+- Minimize bundle size with tree-shaking
 
 ## Contributing
 

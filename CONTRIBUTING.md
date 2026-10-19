@@ -178,14 +178,19 @@ trailing commas. Run `yarn lint` in CI to catch regressions.
 
 ### Pre-commit hook
 
-**Husky** runs `lint-staged` automatically on every `git commit`. You do not need to run
-lint/format manually before committing — the hook does it for you. If the hook fails, fix
-the reported issues and re-stage the files.
-
-To skip the hook in an emergency (not recommended):
+A `.husky/pre-commit` hook exists, but `husky` and `lint-staged` are **not currently
+installed** as root dependencies, so the hook is inert on a clean checkout. Always run
+lint and format yourself before pushing:
 
 ```bash
-git commit --no-verify -m "emergency: ..."
+yarn lint
+yarn format
+```
+
+If you re-enable the hook, install the missing tooling first:
+
+```bash
+yarn add -D husky lint-staged
 ```
 
 ---
@@ -248,13 +253,24 @@ yarn workspace web e2e:journey
 
 | Job | What it does |
 |---|---|
+| `runtime-check` | Verifies Node/Bun/Yarn versions via `scripts/check-engines.sh` |
+| `release-validation` | Validates `CHANGELOG.md` via `yarn release:validate` |
 | `validate-migrations` | Checks migration filenames for duplicate/out-of-order prefixes |
 | `unit-tests` | Backend unit tests via Bun (no external services) |
 | `backend-e2e` | Full booking lifecycle with mocked Supabase + TrustlessWork |
 | `rls-tests` | Row-level security policies against a local Supabase Postgres |
+| `contracts` | Builds and tests the Soroban contracts |
+| `frontend-checks` | Frontend lint and unit tests |
 | `frontend-e2e` | Playwright search → booking journey on Chromium |
+| `docs-link-check` | Fails on broken internal documentation links |
 
 All jobs run on every push or PR to `main`, `master`, or `develop`.
+
+### Lockfile note
+
+Use **Yarn 1** so `yarn.lock` is the canonical lockfile. If a clean checkout only has
+`package-lock.json`, run `yarn install` once to regenerate `yarn.lock`, then commit it.
+Do not commit `npm install` output.
 
 ---
 
@@ -289,7 +305,14 @@ chore: bump biome to 1.9.4
 Releases are managed **manually** — there is no automated Changesets or npm-publish workflow.
 
 1. Bump the version in the relevant `package.json` (root or workspace).
-2. Add an entry to `CHANGELOG.md` following the existing format.
+2. Add an entry to `CHANGELOG.md` following the existing format, then validate:
+
+   ```bash
+   yarn release:validate      # scripts/validate-changelog.ts
+   yarn release:manifest      # scripts/generate-release-manifest.ts
+   ```
+
+   Both run in the `release-validation` CI job.
 3. Open a PR titled `chore: release vX.Y.Z`.
 4. After merge, create a GitHub Release and tag (`vX.Y.Z`).
 

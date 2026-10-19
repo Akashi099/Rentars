@@ -7,52 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — 2026-10-18
+### Security — 2026-10-19
 
-#### #735 — Reproducible development and CI installs
-- Added `apps/contracts/rust-toolchain.toml` pinning Rust 1.82.0 with
-  `wasm32-unknown-unknown` target and `clippy`/`rustfmt` components; rustup
-  and the contracts CI job now both use the exact declared version.
-- Updated `.nvmrc` from a loose `20` to the exact pinned version `20.18.0`
-  matching `.tool-versions`.
-- Pinned all CI jobs to `node-version: '20.18.0'` and `bun-version: '1.1.38'`
-  (previously `node-version: '20'` and `bun-version: latest`).
-- Updated contracts CI job from `dtolnay/rust-toolchain@stable` to
-  `dtolnay/rust-toolchain@master` with explicit `toolchain: '1.82.0'` so the
-  runner uses the version declared in `rust-toolchain.toml`.
+#### #740 — Recovery and verification token hardening
+- Email verification and password reset tokens are claimed with conditional updates, so a concurrent reuse of the same link fails.
+- Password reset looks accounts up by email in the `users` table. The previous `listUsers()` call only saw the first page.
+- Password reset responses take a constant minimum time and send email without awaiting delivery, so known and unknown addresses look the same.
+- A successful reset or logout-all-devices revokes access tokens issued before that moment. The new `sessionRevocationGuard` enforces this and fails closed.
+- Removed the hard-coded `'secret'` fallback for `JWT_SECRET` in the auth middleware.
 
-#### #734 — Release versioning across applications and contracts
-- Added `scripts/check-abi-migration-changelog.sh` — fails a PR when contract
-  ABI files (`apps/contracts/*.json`) or migration SQL files
-  (`apps/backend/database/migrations/*.sql`) change without a corresponding
-  `CHANGELOG.md` update; enforces explicit release notes for schema or ABI
-  changes.
-- Added `Check ABI and migration changes are documented` step to the
-  `release-validation` CI job; the job now runs with `fetch-depth: 0` so the
-  diff against the base branch is always available.
-- Added `docs/releases/compatibility.md` — documents what to write in
-  the changelog for additive vs. breaking ABI/schema changes, explains
-  the release manifest fields, and specifies the rollout order requirement
-  for breaking changes.
+#### #741 — Abuse controls for authentication endpoints
+- Each auth route has its own IP bucket, plus an account bucket for login, register, reset request and wallet endpoints.
+- Added `TRUST_PROXY` (hop count or trusted address list; `true` is rejected) so rate limits key on the real client behind a load balancer.
+- Redis failure on auth routes returns 503 instead of silently disabling limits.
+- Operator overrides: `AUTH_IP_RATE_POINTS`, `AUTH_IP_RATE_WINDOW_SECONDS`, `AUTH_ACCOUNT_RATE_POINTS`, `AUTH_ACCOUNT_RATE_WINDOW_SECONDS`.
 
-#### #733 — Deployment preview smoke tests with environment identity
-- Added `deployment_id` and `environment` inputs to
-  `.github/workflows/smoke-tests.yml`; failures now carry
-  `[env=<name> deploy=<id>]` annotations so the broken deployment is
-  identifiable without inspecting CI logs.
-- Added `Publish smoke test summary` step that writes environment, deployment
-  ID, API/frontend URLs, status, and run link to the GitHub Actions job summary.
-- Updated artifact name to include environment and deployment ID for
-  unambiguous identification across concurrent deployments.
-- Updated `apps/web/e2e/smoke.spec.ts` to prefix every assertion failure
-  message with `[env=... deploy=...]` context from `SMOKE_DEPLOYMENT_ID`
-  and `SMOKE_ENVIRONMENT` environment variables.
+#### #742 — Audit coverage for account and recovery events
+- Added audit records for password reset requests, email verification and wallet linking.
+- Refund approvals are recorded under `admin.refund_approve` (previously logged as `payment.confirmed`).
+- Audit metadata redaction now covers arrays and raw payload or body keys.
+- Migration `00065_audit_logs_append_only.sql` blocks `UPDATE` and `DELETE` on `audit_logs`.
 
-#### #732 — Dependency and secret scanning gates
-- Added `apps/contracts/.cargo/audit.toml` — per-finding suppression config
-  for `cargo audit`; each suppressed advisory requires a reason, expiry date,
-  and GitHub issue link; the CI job now passes `--config .cargo/audit.toml`
-  explicitly.
+#### #743 — Cookie, CORS and CSRF review
+- Disallowed origins no longer raise a 500. CORS headers are withheld and the browser blocks the read.
+- In production, `CORS_ORIGIN` must be explicit and use `https://`.
+- Documented token transport, CORS, and CSRF behaviour in `docs/SECURITY_AUTH_HARDENING.md`.
+- Repaired broken imports that stopped `auth.routes.ts` from loading: the auth routes now use `authenticate`, the wallet simulate and transaction preflight use `soroban.ts`, and a stray `await` in `probe.service.ts` is removed.
+- Bearer-authenticated mutations skip the double-submit CSRF check. The web client sends Bearer tokens and never sends `X-CSRF-Token`, so every write was being rejected. Cookie-only cross-site posts still get 403.
 
 ### Added — 2026-09-25
 

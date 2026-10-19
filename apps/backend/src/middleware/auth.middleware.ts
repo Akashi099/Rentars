@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '@/config/env.js';
+import { getJwtSecret } from '@/config/jwtSecret.js';
 import { setRequestContextUserId } from '@/services/logging.service.js';
 
 export interface AuthRequest extends Request {
@@ -14,8 +15,14 @@ export function authenticate(req: AuthRequest, res: Response, next: NextFunction
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
+  // No fallback secret: a missing JWT_SECRET must reject tokens, never accept them.
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    res.status(401).json({ error: 'Invalid token' });
+    return;
+  }
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as {
+    const decoded = jwt.verify(token, secret) as {
       userId: string;
       role?: string;
     };

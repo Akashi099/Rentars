@@ -91,7 +91,25 @@ Each target assumes the associated infrastructure tier listed in Section 4.
 4. Record separately: latency with and without the Stellar RPC call to isolate
    third-party contribution.
 
-### 3.4 Frequency
+### 3.4 Redis and queue behaviour
+
+1. **Redis cache:**
+   - Run the search benchmark twice: once with `REDIS_ENABLED=false` (Section 3.2 step 2)
+     and once with the cache enabled; record the p99 delta and hit rate from
+     `cache_hits_total / (cache_hits_total + cache_misses_total)`.
+   - Measure Redis CPU and memory during the 200 VU steady phase; note the point at
+     which memory exceeds 75 % of configured max (Section 6 threshold).
+2. **Queue behaviour (booking pipeline):**
+   - If the async booking queue (BullMQ + Redis, Tier 3 remediation) is enabled, run the
+     Section 3.3 scenario and record queue depth, worker lag, and job failure rate at
+     each VU level.
+   - If the queue is not yet deployed, record the synchronous-path numbers as the
+     baseline and note "queue: not deployed" in the worksheet so future runs are
+     comparable.
+3. **Costs:** for each run, note infrastructure tier, instance sizes, and estimated
+   monthly cost so scaling recommendations include a cost projection, not just latency.
+
+### 3.5 Frequency
 
 | Event | Action |
 |---|---|

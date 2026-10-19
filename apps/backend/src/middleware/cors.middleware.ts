@@ -34,7 +34,9 @@ const corsOptions: CorsOptions = {
         origin: requestOrigin,
         allowedOrigins: [...allowedOrigins],
       });
-      callback(new Error(`Origin '${requestOrigin}' is not permitted by CORS policy`));
+      // Withhold the Access-Control-Allow-Origin header instead of raising an error.
+      // The browser then blocks the cross-origin read, and the request does not 500.
+      callback(null, false);
     }
   },
 

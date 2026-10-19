@@ -4,6 +4,8 @@
 
 Social login (OAuth via Google, GitHub, etc.) is currently **deferred** to allow the platform to focus on core wallet-based authentication and Stellar blockchain integration.
 
+Tracked in issue #738. The login and register screens render no social provider controls, and the backend exposes no OAuth routes. The deferral is enforced by `apps/web/src/components/auth/tests/SocialLoginDeferred.test.tsx`, which fails if either form shows a button or link naming a provider, or any "coming soon" copy. Re-enabling social login means removing that guard for the provider being added, in the same change that implements the flow end to end (see [Requirements before re-enabling](#requirements-before-re-enabling)).
+
 ## Decision Rationale
 
 - **Complexity:** Social login requires OAuth provider configuration, state management, nonce/CSRF token handling, and account linking logic
@@ -268,3 +270,13 @@ When this feature is re-prioritized:
 - [DEPLOYMENT.md](../DEPLOYMENT.md) — Environment variable management
 - [OAuth 2.0 RFC 6749](https://tools.ietf.org/html/rfc6749) — Authorization code flow
 - [PKCE RFC 7636](https://tools.ietf.org/html/rfc7636) — Proof Key for Code Exchange
+
+## Requirements before re-enabling
+
+A provider control may appear on the login or register screen only when all of these are in place for that provider:
+
+1. **Provider configuration** lives on the server. Client IDs are public, but client secrets are never sent to the browser, bundled into the web app, or written to logs.
+2. **State and nonce validation** on the callback. A missing, expired, or mismatched `state` is rejected before any token exchange.
+3. **Account linking** that handles a duplicate email safely. A provider identity is linked to an existing account only when the account owner proves control of it, and never silently merged by email alone.
+4. **Cancellation tests**: a user who cancels at the provider, or returns with an error, lands back on the form with no account created and no half-linked identity.
+5. **The guard test is updated** in the same change, so the provider's control is covered by the regression suite rather than bypassing it.

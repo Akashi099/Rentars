@@ -93,12 +93,18 @@ WORKDIR /app
 RUN addgroup --system --gid 1001 nodejs && \
     adduser  --system --uid 1001 nextjs
 
+# Create writable directories for read-only filesystem compatibility
+RUN mkdir -p /tmp /app/.next/cache && \
+    chown -R nextjs:nodejs /tmp /app/.next/cache /app && \
+    chmod 1777 /tmp
+
 # Runtime environment — non-secret configuration only.
 # All secrets (e.g. internal API tokens) must be injected at container launch.
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
-    HOSTNAME=0.0.0.0
+    HOSTNAME=0.0.0.0 \
+    TMPDIR=/tmp
 
 # ── Standalone output ─────────────────────────────────────────────────────────
 # Next.js standalone mode bundles a minimal server.js and the exact node_modules

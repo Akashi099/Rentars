@@ -32,13 +32,15 @@ beforeAll(() => {
   process.env.TRUSTLESS_WORK_API_KEY = 'test-api-key';
 });
 
-// ── Deterministic test data ───────────────────────────────────────────────────
+// ── Test data (isolated per test run context) ─────────────────────────────────
 
-const OWNER_ID    = 'e2e-owner-user-id';
-const TENANT_ID   = 'e2e-tenant-user-id';
-const PROPERTY_ID = 'e2e-property-uuid';
-const BOOKING_ID  = 'e2e-booking-uuid';
-const ESCROW_ID   = 'e2e-escrow-id';
+const TEST_RUN_ID = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+const OWNER_ID    = 'e2e-owner-' + TEST_RUN_ID;
+const TENANT_ID   = 'e2e-tenant-' + TEST_RUN_ID;
+const PROPERTY_ID = 'e2e-property-' + TEST_RUN_ID;
+const BOOKING_ID  = 'e2e-booking-' + TEST_RUN_ID;
+const ESCROW_ID   = 'e2e-escrow-' + TEST_RUN_ID;
 
 const OWNER_STELLAR  = 'GBRPYHIL2CI3WHZDTOOQFC6EB4CGQOFSNHERX3LRJCX5FWCL46664F3';
 const TENANT_STELLAR = 'GBBD47UZQ2EOPZMQAAMAEWBVHQWWPGVIOTQOI5DQWUB3DJWQX5DVXCA';

@@ -60,7 +60,7 @@ It does not imply mainnet deployment, which requires the additional steps in [`D
 | Structured logging + Prometheus metrics | ✅ Implemented |
 | Admin panel (property moderation, user management) | ✅ Implemented |
 
-### Frontend (Next.js 15)
+### Frontend (Next.js 16)
 
 | Feature | Status |
 |---|---|
@@ -101,7 +101,7 @@ It does not imply mainnet deployment, which requires the additional steps in [`D
 ```
 rentars/
 ├── apps/
-│   ├── web/                        # Next.js 15 frontend (TypeScript + Tailwind CSS)
+│   ├── web/                        # Next.js 16 frontend (TypeScript + Tailwind CSS)
 │   │   ├── src/
 │   │   │   ├── app/                # Next.js App Router pages
 │   │   │   ├── components/         # UI components (booking, search, dashboard, …)
@@ -139,7 +139,7 @@ rentars/
 ├── DEPLOYMENT.md                   # Testnet and mainnet deployment guide
 ├── biome.json                      # Linting & formatting config
 ├── turbo.json                      # Turborepo build pipeline
-└── package.json                    # Monorepo root (npm workspaces)
+└── package.json                    # Monorepo root (Yarn workspaces)
 ```
 
 ---
@@ -148,7 +148,7 @@ rentars/
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 15, React 19, Tailwind CSS v4, TypeScript |
+| Frontend | Next.js 16, React 19, Tailwind CSS v4, TypeScript |
 | Backend | Node.js / Bun runtime, Express 5, TypeScript |
 | Database | Supabase (PostgreSQL + Auth + Storage + RLS) |
 | Cache | Redis 7 |
@@ -168,7 +168,7 @@ rentars/
 |---|---|---|
 | [Bun](https://bun.sh) | ≥ 1.0 | Backend dev and test |
 | [Node.js](https://nodejs.org) | ≥ 20 | Frontend and tooling |
-| [npm](https://npmjs.com) | ≥ 10 | Workspace management |
+| [Yarn](https://yarnpkg.com) | ≥ 1.22 | Workspace management |
 | [Supabase account](https://supabase.com) | — | Database and auth |
 | [Redis](https://redis.io) | ≥ 7 | Caching (Docker included) |
 | [Rust + Cargo](https://rustup.rs) | stable | Contracts only |
@@ -184,7 +184,7 @@ rentars/
 ```bash
 git clone https://github.com/Rentars/Rentars.git
 cd Rentars
-npm install
+yarn install
 ```
 
 ### 2. Configure environment
@@ -215,7 +215,7 @@ bun run dev
 
 # Terminal 2: frontend (port 3001)
 cd apps/web
-npm run dev
+yarn dev
 ```
 
 Option B — full Docker stack (frontend + backend + Redis):
@@ -273,10 +273,10 @@ bun test tests/rls
 cd apps/web
 
 # Unit and component tests (Vitest)
-npm test
+yarn test --run
 
 # End-to-end tests (Playwright — requires a running dev server)
-npm run e2e
+yarn e2e
 
 # Visual regression baselines — capture new snapshots
 npx playwright test e2e/visual-regression.spec.ts --update-snapshots
@@ -321,6 +321,7 @@ All endpoints are prefixed with `/api/v1`. The full OpenAPI spec is at
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Testnet and mainnet deployment, rollback, monitoring |
 | [`apps/backend/RUNBOOKS.md`](apps/backend/RUNBOOKS.md) | On-call incident response procedures |
 | [`docs/INCIDENT_REVIEW_TEMPLATE.md`](docs/INCIDENT_REVIEW_TEMPLATE.md) | Post-incident review template |
+| [`docs/RECOVERY_RUNBOOK.md`](docs/RECOVERY_RUNBOOK.md) | Cross-component recovery: DB, storage, Redis, contracts, RPC, email, frontend; monthly drill |
 | [`docs/CAPACITY_PLANNING.md`](docs/CAPACITY_PLANNING.md) | Throughput targets, benchmarking, scaling triggers |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 
