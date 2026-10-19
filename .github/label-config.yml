@@ -1,0 +1,84 @@
+# Label configuration for quarterly backlog triage
+# See .github/BACKLOG_TRIAGE.md for the full process
+#
+# To apply these labels to the repository, use:
+#   gh label create "prio:P0" --description "Launch blocker" --color B60205
+#   gh label create "prio:P1" --description "High - current sprint" --color D93F0B
+#   ... etc.
+#
+# Or import via a script that reads this file.
+
+labels:
+  # Priority
+  - name: "prio:P0"
+    description: "Launch blocker — must land before next release"
+    color: "B60205"
+  - name: "prio:P1"
+    description: "High — target current sprint"
+    color: "D93F0B"
+  - name: "prio:P2"
+    description: "Medium — target current quarter"
+    color: "FBCA04"
+  - name: "prio:P3"
+    description: "Low — backlog candidate, not committed"
+    color: "0E8A16"
+
+  # Scope
+  - name: "scope:backend"
+    description: "Backend / API / database"
+    color: "1D76DB"
+  - name: "scope:frontend"
+    description: "Web frontend / UI"
+    color: "6B7FAD"
+  - name: "scope:blockchain"
+    description: "Stellar / Soroban contracts"
+    color: "7057FF"
+  - name: "scope:infra"
+    description: "CI/CD, Docker, infrastructure"
+    color: "0052CC"
+  - name: "scope:security"
+    description: "Security, auth, RLS"
+    color: "5319E7"
+  - name: "scope:docs"
+    description: "Documentation only"
+    color: "0075CA"
+
+  # Status
+  - name: "status:triage"
+    description: "Awaiting initial triage"
+    color: "F9D0C4"
+  - name: "status:ready"
+    description: "Triaged, ready for work"
+    color: "0E8A16"
+  - name: "status:in-progress"
+    description: "Actively being worked"
+    color: "FBCA04"
+  - name: "status:blocked"
+    description: "Blocked by a dependency"
+    color: "B60205"
+  - name: "status:review"
+    description: "In code review / QA"
+    color: "5319E7"
+  - name: "status:stale"
+    description: "No activity for 90+ days — candidate for closure"
+    color: "C5DEF5"
+  - name: "status:dupe"
+    description: "Duplicate of another issue"
+    color: "C2E0C6"
+
+  # Ownership
+  - name: "owner:unassigned"
+    description: "No owner yet — must be assigned during triage"
+    color: "E4E669"
+  - name: "owner:backend"
+    description: "Backend team owner"
+    color: "1D76DB"
+  - name: "owner:frontend"
+    description: "Frontend team owner"
+    color: "6B7FAD"
+  - name: "owner:blockchain"
+    description: "Blockchain team owner"
+    color: "7057FF"
+  - name: "owner:devops"
+    description: "DevOps / infra owner"
+    color: "0052CC"
