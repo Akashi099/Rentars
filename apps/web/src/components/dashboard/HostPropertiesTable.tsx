@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Edit2, Eye, EyeOff, FileText, Star, Loader2 } from 'lucide-react';
 import type { HostProperty } from '@/hooks/useHostDashboard';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 interface Props {
   properties: HostProperty[];
@@ -18,6 +19,7 @@ const STATUS_BADGE: Record<string, string> = {
 
 export default function HostPropertiesTable({ properties, onEdit, onStatusChange }: Props) {
   const [toggling, setToggling] = useState<string | null>(null);
+  const isMobile = useMediaQuery('(max-width: 768px)');
 
   const handleTogglePublish = async (property: HostProperty) => {
     if (!onStatusChange) return;
@@ -41,139 +43,226 @@ export default function HostPropertiesTable({ properties, onEdit, onStatusChange
 
   return (
     <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
-      <div className="px-6 py-4 border-b border-gray-100 dark:border-gray-800">
+      <div className="px-4 sm:px-6 py-4 border-b border-gray-100 dark:border-gray-800">
         <h3 className="text-base font-semibold text-gray-900 dark:text-white">
           Your Properties ({properties.length})
         </h3>
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
-              <th className="text-left px-6 py-3 font-medium text-gray-500 dark:text-gray-400">Property</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Status</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Price</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Bookings</th>
-              <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Rating</th>
-              <th className="text-right px-6 py-3 font-medium text-gray-500 dark:text-gray-400">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-50 dark:divide-gray-800">
-            {properties.map((prop) => (
-              <tr
-                key={prop.id}
-                className="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition"
-              >
-                {/* Property name + location */}
-                <td className="px-6 py-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-gray-200 dark:bg-gray-700 overflow-hidden flex-shrink-0">
-                      {prop.images[0] ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={prop.images[0]}
-                          alt={prop.title}
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-gray-400">
-                          <FileText size={16} />
-                        </div>
-                      )}
+      {isMobile ? (
+        <div className="divide-y divide-gray-100 dark:divide-gray-800">
+          {properties.map((prop) => (
+            <div key={prop.id} className="p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <div className="w-16 h-16 rounded-lg bg-gray-200 dark:bg-gray-700 overflow-hidden flex-shrink-0">
+                  {prop.images[0] ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={prop.images[0]}
+                      alt={prop.title}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-gray-400">
+                      <FileText size={20} />
                     </div>
-                    <div>
-                      <p className="font-medium text-gray-900 dark:text-white line-clamp-1">
-                        {prop.title}
-                      </p>
-                      <p className="text-xs text-gray-400 line-clamp-1">{prop.location}</p>
-                    </div>
-                  </div>
-                </td>
-
-                {/* Status badge */}
-                <td className="px-4 py-4">
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-gray-900 dark:text-white truncate">
+                    {prop.title}
+                  </p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400 truncate">{prop.location}</p>
                   <span
-                    className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                    className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium mt-1 ${
                       STATUS_BADGE[prop.status] ?? STATUS_BADGE.draft
                     }`}
                   >
                     {prop.status}
                   </span>
-                </td>
+                </div>
+              </div>
 
-                {/* Price */}
-                <td className="px-4 py-4 text-gray-700 dark:text-gray-300">
-                  {prop.price_per_night} USDC/night
-                </td>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs">Price</p>
+                  <p className="font-medium text-gray-900 dark:text-white break-words">
+                    {prop.price_per_night} USDC/night
+                  </p>
+                </div>
+                <div>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs">Bookings</p>
+                  <p className="font-medium text-gray-900 dark:text-white">
+                    {prop.active_bookings} / {prop.total_bookings}
+                  </p>
+                </div>
+              </div>
 
-                {/* Bookings */}
-                <td className="px-4 py-4">
-                  <span className="text-gray-900 dark:text-white font-medium">
-                    {prop.active_bookings}
+              {prop.review_count > 0 && (
+                <div className="flex items-center gap-1">
+                  <Star size={14} className="text-yellow-400 fill-yellow-400" />
+                  <span className="text-sm text-gray-900 dark:text-white font-medium">
+                    {prop.average_rating.toFixed(1)}
                   </span>
-                  <span className="text-gray-400 text-xs"> active / {prop.total_bookings} total</span>
-                </td>
+                  <span className="text-xs text-gray-400">({prop.review_count} reviews)</span>
+                </div>
+              )}
 
-                {/* Rating */}
-                <td className="px-4 py-4">
-                  {prop.review_count > 0 ? (
-                    <div className="flex items-center gap-1">
-                      <Star size={14} className="text-yellow-400 fill-yellow-400" />
-                      <span className="text-gray-900 dark:text-white text-sm">
-                        {prop.average_rating.toFixed(1)}
-                      </span>
-                      <span className="text-xs text-gray-400">({prop.review_count})</span>
-                    </div>
-                  ) : (
-                    <span className="text-xs text-gray-400">No reviews</span>
-                  )}
-                </td>
-
-                {/* Actions */}
-                <td className="px-6 py-4 text-right">
-                  <div className="flex items-center justify-end gap-2">
-                    {/* Edit */}
-                    {onEdit && (
-                      <button
-                        onClick={() => onEdit(prop)}
-                        className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition text-gray-500 dark:text-gray-400"
-                        title="Edit property"
-                        aria-label={`Edit ${prop.title}`}
-                      >
-                        <Edit2 size={16} />
-                      </button>
+              <div className="flex gap-2 pt-2">
+                {onEdit && (
+                  <button
+                    onClick={() => onEdit(prop)}
+                    className="flex-1 px-3 py-2 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-300 transition"
+                    aria-label={`Edit ${prop.title}`}
+                  >
+                    Edit
+                  </button>
+                )}
+                {onStatusChange && (
+                  <button
+                    onClick={() => handleTogglePublish(prop)}
+                    disabled={toggling === prop.id}
+                    className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 rounded-lg text-sm font-medium text-white transition disabled:opacity-50"
+                    aria-label={
+                      prop.status === 'published'
+                        ? `Unpublish ${prop.title}`
+                        : `Publish ${prop.title}`
+                    }
+                  >
+                    {toggling === prop.id ? (
+                      <Loader2 size={16} className="animate-spin mx-auto" />
+                    ) : prop.status === 'published' ? (
+                      'Unpublish'
+                    ) : (
+                      'Publish'
                     )}
-
-                    {/* Publish/Unpublish toggle */}
-                    {onStatusChange && (
-                      <button
-                        onClick={() => handleTogglePublish(prop)}
-                        disabled={toggling === prop.id}
-                        className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition text-gray-500 dark:text-gray-400 disabled:opacity-50"
-                        title={prop.status === 'published' ? 'Unpublish' : 'Publish'}
-                        aria-label={
-                          prop.status === 'published'
-                            ? `Unpublish ${prop.title}`
-                            : `Publish ${prop.title}`
-                        }
-                      >
-                        {toggling === prop.id ? (
-                          <Loader2 size={16} className="animate-spin" />
-                        ) : prop.status === 'published' ? (
-                          <EyeOff size={16} />
-                        ) : (
-                          <Eye size={16} />
-                        )}
-                      </button>
-                    )}
-                  </div>
-                </td>
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
+                <th className="text-left px-6 py-3 font-medium text-gray-500 dark:text-gray-400">Property</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Status</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Price</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Bookings</th>
+                <th className="text-left px-4 py-3 font-medium text-gray-500 dark:text-gray-400">Rating</th>
+                <th className="text-right px-6 py-3 font-medium text-gray-500 dark:text-gray-400">Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody className="divide-y divide-gray-50 dark:divide-gray-800">
+              {properties.map((prop) => (
+                <tr
+                  key={prop.id}
+                  className="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition"
+                >
+                  <td className="px-6 py-4">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-lg bg-gray-200 dark:bg-gray-700 overflow-hidden flex-shrink-0">
+                        {prop.images[0] ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={prop.images[0]}
+                            alt={prop.title}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center text-gray-400">
+                            <FileText size={16} />
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-medium text-gray-900 dark:text-white line-clamp-1">
+                          {prop.title}
+                        </p>
+                        <p className="text-xs text-gray-400 line-clamp-1">{prop.location}</p>
+                      </div>
+                    </div>
+                  </td>
+
+                  <td className="px-4 py-4">
+                    <span
+                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                        STATUS_BADGE[prop.status] ?? STATUS_BADGE.draft
+                      }`}
+                    >
+                      {prop.status}
+                    </span>
+                  </td>
+
+                  <td className="px-4 py-4 text-gray-700 dark:text-gray-300">
+                    {prop.price_per_night} USDC/night
+                  </td>
+
+                  <td className="px-4 py-4">
+                    <span className="text-gray-900 dark:text-white font-medium">
+                      {prop.active_bookings}
+                    </span>
+                    <span className="text-gray-400 text-xs"> active / {prop.total_bookings} total</span>
+                  </td>
+
+                  <td className="px-4 py-4">
+                    {prop.review_count > 0 ? (
+                      <div className="flex items-center gap-1">
+                        <Star size={14} className="text-yellow-400 fill-yellow-400" />
+                        <span className="text-gray-900 dark:text-white text-sm">
+                          {prop.average_rating.toFixed(1)}
+                        </span>
+                        <span className="text-xs text-gray-400">({prop.review_count})</span>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-gray-400">No reviews</span>
+                    )}
+                  </td>
+
+                  <td className="px-6 py-4 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      {onEdit && (
+                        <button
+                          onClick={() => onEdit(prop)}
+                          className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition text-gray-500 dark:text-gray-400"
+                          title="Edit property"
+                          aria-label={`Edit ${prop.title}`}
+                        >
+                          <Edit2 size={16} />
+                        </button>
+                      )}
+
+                      {onStatusChange && (
+                        <button
+                          onClick={() => handleTogglePublish(prop)}
+                          disabled={toggling === prop.id}
+                          className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition text-gray-500 dark:text-gray-400 disabled:opacity-50"
+                          title={prop.status === 'published' ? 'Unpublish' : 'Publish'}
+                          aria-label={
+                            prop.status === 'published'
+                              ? `Unpublish ${prop.title}`
+                              : `Publish ${prop.title}`
+                          }
+                        >
+                          {toggling === prop.id ? (
+                            <Loader2 size={16} className="animate-spin" />
+                          ) : prop.status === 'published' ? (
+                            <EyeOff size={16} />
+                          ) : (
+                            <Eye size={16} />
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
