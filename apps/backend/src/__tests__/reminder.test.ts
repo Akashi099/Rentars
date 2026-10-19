@@ -6,6 +6,9 @@
  *  2. isReminderSent — checks existence without inserting
  *  3. runReminderScheduler — sends reminders once, skips on re-run (dedup),
  *     respects notification preferences
+ *  4. isInQuietHours — quiet-window evaluation (wrap-midnight, same-day,
+ *     timezone handling, invalid timezone fallback)
+ *  5. Scheduler quiet-hours integration — defers without consuming idempotency slot
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -14,7 +17,9 @@ import {
   isReminderSent,
   runReminderScheduler,
   getLeadTimeHours,
+  isInQuietHours,
 } from '../services/reminder.service.js';
+import type { NotificationPreferences } from '../services/notification.service.js';
 
 // ─── Supabase mock ────────────────────────────────────────────────────────────
 
@@ -26,10 +31,26 @@ const mockSelectEq    = vi.fn(() => ({
   maybeSingle: mockMaybeSingle,
   eq: mockSelectEqEq,
 }));
-const mockNot         = vi.fn();
-const mockLte         = vi.fn(() => ({ not: mockNot }));
-const mockGte         = vi.fn(() => ({ lte: mockLte }));
-const mockBookingSelect = vi.fn(() => ({ gte: mockGte }));
+
+// Terminal resolved value for any booking query that doesn't have an explicit
+// mockResolvedValueOnce set (e.g. payment-deadline / dispute queries in tests
+// that only care about check-in/check-out behaviour).
+const EMPTY_BOOKINGS = Promise.resolve({ data: [], error: null });
+
+const mockNot = vi.fn();
+
+// mockLte is both chainable (returns { not: mockNot }) AND directly awaitable
+// (falls back to an empty result).  Object.assign attaches .not onto a Promise
+// so `await chain.lte(...)` resolves to EMPTY_BOOKINGS while
+// `chain.lte(...).not(...)` still works via the mocked mockNot.
+const makeLteResult = () =>
+  Object.assign(Promise.resolve({ data: [], error: null }), { not: mockNot });
+const mockLte   = vi.fn(makeLteResult);
+const mockGte   = vi.fn(() => ({ lte: mockLte }));
+
+// eq() used by processPaymentDeadlineReminders / processDisputeReminders
+const mockBookingEq = vi.fn(() => ({ gte: mockGte, lte: mockLte }));
+const mockBookingSelect = vi.fn(() => ({ gte: mockGte, eq: mockBookingEq }));
 
 const mockFrom = vi.fn((table: string) => {
   if (table === 'booking_reminders') {
@@ -134,7 +155,7 @@ describe('runReminderScheduler()', () => {
     // Notification succeeds
     mockCreateNotificationWithEmail.mockResolvedValue({ success: true });
 
-    // Preferences: all enabled
+    // Preferences: all enabled, no quiet hours
     mockGetPreferences.mockResolvedValue({
       success: true,
       data: { email_notifications: true, push_notifications: true, notification_types: {} },
@@ -142,6 +163,9 @@ describe('runReminderScheduler()', () => {
 
     // Email lookup
     mockSingle.mockResolvedValue({ data: { email: 'u@example.com' }, error: null });
+
+    // isReminderSent: default = not yet sent
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
   });
 
   it('sends reminders for a booking in the window and returns sent count > 0', async () => {
@@ -388,5 +412,191 @@ describe('getLeadTimeHours()', () => {
     const { checkIn, checkOut } = getLeadTimeHours();
     expect(checkIn).toBe(24);  // falls back
     expect(checkOut).toBe(6);  // valid, kept as-is
+  });
+
+  it('payment and dispute lead times default correctly', () => {
+    delete process.env.REMINDER_PAYMENT_HOURS;
+    delete process.env.REMINDER_DISPUTE_HOURS;
+    const { payment, dispute } = getLeadTimeHours();
+    expect(payment).toBe(48);
+    expect(dispute).toBe(72);
+  });
+
+  it('accepts custom payment and dispute lead times from env', () => {
+    process.env.REMINDER_PAYMENT_HOURS = '36';
+    process.env.REMINDER_DISPUTE_HOURS = '96';
+    const { payment, dispute } = getLeadTimeHours();
+    expect(payment).toBe(36);
+    expect(dispute).toBe(96);
+    delete process.env.REMINDER_PAYMENT_HOURS;
+    delete process.env.REMINDER_DISPUTE_HOURS;
+  });
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makePrefs(
+  start: string | null,
+  end:   string | null,
+  tz:    string | null = 'UTC',
+): NotificationPreferences {
+  return {
+    user_id:              'user-1',
+    email_notifications:  true,
+    push_notifications:   true,
+    notification_types:   {},
+    quiet_hours_start:    start,
+    quiet_hours_end:      end,
+    quiet_hours_timezone: tz,
+  };
+}
+
+function utcAt(hour: number, minute = 0): Date {
+  const d = new Date('2027-01-15T00:00:00Z');
+  d.setUTCHours(hour, minute, 0, 0);
+  return d;
+}
+
+// ─── isInQuietHours ───────────────────────────────────────────────────────────
+
+describe('isInQuietHours()', () => {
+
+  it('returns false when both fields are null', () => {
+    expect(isInQuietHours(makePrefs(null, null))).toBe(false);
+  });
+
+  it('returns false when start is null', () => {
+    expect(isInQuietHours(makePrefs(null, '08:00'))).toBe(false);
+  });
+
+  it('returns false when end is null', () => {
+    expect(isInQuietHours(makePrefs('22:00', null))).toBe(false);
+  });
+
+  // ── Wrap-midnight window 22:00–08:00 ──────────────────────────────────────
+
+  it('returns true at 23:00 UTC inside a 22:00–08:00 window', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(23))).toBe(true);
+  });
+
+  it('returns true at 00:00 UTC (midnight) inside a 22:00–08:00 window', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(0))).toBe(true);
+  });
+
+  it('returns true at 07:59 UTC inside a 22:00–08:00 window', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(7, 59))).toBe(true);
+  });
+
+  it('returns false at 08:00 UTC (end is exclusive) for 22:00–08:00 window', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(8, 0))).toBe(false);
+  });
+
+  it('returns false at 14:00 UTC outside a 22:00–08:00 window', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(14))).toBe(false);
+  });
+
+  it('returns true at the start boundary exactly (22:00)', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00'), utcAt(22, 0))).toBe(true);
+  });
+
+  // ── Same-day window 09:00–17:00 ───────────────────────────────────────────
+
+  it('returns true at 12:00 UTC inside a 09:00–17:00 window', () => {
+    expect(isInQuietHours(makePrefs('09:00', '17:00'), utcAt(12))).toBe(true);
+  });
+
+  it('returns false at 08:59 UTC before a 09:00–17:00 window', () => {
+    expect(isInQuietHours(makePrefs('09:00', '17:00'), utcAt(8, 59))).toBe(false);
+  });
+
+  it('returns false at 17:00 UTC (end exclusive) for 09:00–17:00 window', () => {
+    expect(isInQuietHours(makePrefs('09:00', '17:00'), utcAt(17, 0))).toBe(false);
+  });
+
+  // ── Invalid timezone — fail-open ─────────────────────────────────────────
+
+  it('returns false for an unrecognised timezone string', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00', 'Not/Real'), utcAt(23))).toBe(false);
+  });
+
+  it('returns false for an empty timezone string', () => {
+    expect(isInQuietHours(makePrefs('22:00', '08:00', ''), utcAt(23))).toBe(false);
+  });
+});
+
+// ─── Scheduler respects quiet hours without consuming idempotency slot ────────
+
+describe('runReminderScheduler() — quiet-hours deferral', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreateNotificationWithEmail.mockResolvedValue({ success: true });
+    mockSingle.mockResolvedValue({ data: { email: 'u@example.com' }, error: null });
+  });
+
+  it('does not mark reminder sent and skips delivery when user is in quiet hours', async () => {
+    const row = makeBookingRow('booking-quiet');
+
+    mockNot.mockResolvedValueOnce({ data: [row], error: null });
+    mockNot.mockResolvedValueOnce({ data: [], error: null });
+
+    // isReminderSent check → no row yet (maybeSingle returns null)
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+
+    // Quiet window: '00:01'–'00:00' wraps midnight and covers all 24h except
+    // the exact stroke of midnight — no fake clock needed.
+    mockGetPreferences.mockResolvedValue({
+      success: true,
+      data: {
+        email_notifications:  true,
+        push_notifications:   true,
+        notification_types:   {},
+        quiet_hours_start:    '00:01',
+        quiet_hours_end:      '00:00',
+        quiet_hours_timezone: 'UTC',
+      },
+    });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    // No reminders marked as sent — INSERT must NOT have been called
+    expect(mockInsert).not.toHaveBeenCalled();
+    // No notifications delivered
+    expect(mockCreateNotificationWithEmail).not.toHaveBeenCalled();
+    // Both tenant+host counted as skipped
+    expect(result.data!.skipped).toBeGreaterThan(0);
+    expect(result.data!.sent).toBe(0);
+  });
+
+  it('delivers and marks after quiet hours end', async () => {
+    const row = makeBookingRow('booking-after-quiet');
+
+    mockNot.mockResolvedValueOnce({ data: [row], error: null });
+    mockNot.mockResolvedValueOnce({ data: [], error: null });
+
+    // isReminderSent → no row
+    mockMaybeSingle.mockResolvedValue({ data: null, error: null });
+
+    // markReminderSent succeeds
+    mockInsert.mockResolvedValue({ error: null });
+
+    // No quiet hours configured → should deliver
+    mockGetPreferences.mockResolvedValue({
+      success: true,
+      data: {
+        email_notifications:  true,
+        push_notifications:   true,
+        notification_types:   {},
+        quiet_hours_start:    null,
+        quiet_hours_end:      null,
+        quiet_hours_timezone: null,
+      },
+    });
+
+    const result = await runReminderScheduler();
+
+    expect(result.success).toBe(true);
+    expect(result.data!.sent).toBeGreaterThan(0);
+    expect(mockCreateNotificationWithEmail).toHaveBeenCalled();
   });
 });

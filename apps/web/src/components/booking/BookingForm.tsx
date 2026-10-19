@@ -7,6 +7,8 @@ import { useLocale } from '@/lib/i18n/useLocale';
 import { formatCurrency } from '@/lib/i18n/formatting';
 import { getErrorMessage, isApiError } from '@/lib/errors/errorCodes';
 import { useCurrency } from '@/hooks/useCurrency';
+import { useFormErrorFocus } from '@/hooks/useFormErrorFocus';
+import { buildDescribedBy } from '@/components/ui/form-field';
 
 interface BookingFormProps {
   propertyId: string;
@@ -49,10 +51,12 @@ export default function BookingForm({
   const [guestError, setGuestError] = useState('');
   const [pricing, setPricing] = useState<PriceQuote | null>(null);
   const [availabilityError, setAvailabilityError] = useState('');
+  const errorSummaryRef = useRef<HTMLDivElement | null>(null);
 
   const t = useTranslations('booking');
   const { locale } = useLocale();
   const { formatEstimate, displayCurrency, ratesStale } = useCurrency();
+  const { focusFirstError } = useFormErrorFocus();
   const today = new Date().toISOString().split('T')[0];
 
   useEffect(() => {
@@ -93,8 +97,6 @@ export default function BookingForm({
 
   const handleGuestChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(e.target.value, 10);
-    // Store 0 when the field is empty (NaN) so the user can freely edit the value.
-    // The minimum guest count is enforced by the error message and submit guard.
     setGuestCount(isNaN(val) ? 0 : val);
 
     if (isNaN(val) || val < 1) {
@@ -112,37 +114,36 @@ export default function BookingForm({
     setGuestError('');
     setAvailabilityError('');
 
+    // Validation — collect errors before focusing
+    let foundDateError = '';
+    let foundGuestError = '';
+
     if (!checkIn || !checkOut) {
-      setDateError(t('invalidDates'));
-      return;
-    }
-
-    if (new Date(checkIn) >= new Date(checkOut)) {
-      setDateError(t('checkoutAfterCheckin'));
-      return;
-    }
-
-    const stayNights = Math.ceil(
-      (new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86400000,
-    );
-
-    if (minStay !== undefined && stayNights < minStay) {
-      setDateError(`Minimum stay is ${minStay} night${minStay === 1 ? '' : 's'}`);
-      return;
-    }
-
-    if (maxStay !== undefined && stayNights > maxStay) {
-      setDateError(`Maximum stay is ${maxStay} night${maxStay === 1 ? '' : 's'}`);
-      return;
+      foundDateError = t('invalidDates');
+    } else if (new Date(checkIn) >= new Date(checkOut)) {
+      foundDateError = t('checkoutAfterCheckin');
+    } else {
+      const stayNights = Math.ceil(
+        (new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86400000,
+      );
+      if (minStay !== undefined && stayNights < minStay) {
+        foundDateError = `Minimum stay is ${minStay} night${minStay === 1 ? '' : 's'}`;
+      } else if (maxStay !== undefined && stayNights > maxStay) {
+        foundDateError = `Maximum stay is ${maxStay} night${maxStay === 1 ? '' : 's'}`;
+      }
     }
 
     if (guestCount < 1) {
-      setGuestError('At least 1 guest is required');
-      return;
+      foundGuestError = 'At least 1 guest is required';
+    } else if (maxGuests !== undefined && guestCount > maxGuests) {
+      foundGuestError = `Maximum ${maxGuests} guest${maxGuests === 1 ? '' : 's'} allowed`;
     }
 
-    if (maxGuests !== undefined && guestCount > maxGuests) {
-      setGuestError(`Maximum ${maxGuests} guest${maxGuests === 1 ? '' : 's'} allowed`);
+    if (foundDateError || foundGuestError) {
+      if (foundDateError) setDateError(foundDateError);
+      if (foundGuestError) setGuestError(foundGuestError);
+      // Focus the error summary which has role="alert" — screen readers announce it
+      focusFirstError('booking-error-summary');
       return;
     }
 
@@ -160,22 +161,26 @@ export default function BookingForm({
               ? getErrorMessage(data.error.code, data.error.message)
               : (data.reason || t('unavailableDates')),
           );
+          focusFirstError('booking-error-summary');
           return;
         }
       }
     } catch {
       setDateError('Failed to check availability');
+      focusFirstError('booking-error-summary');
       return;
     }
 
     if (!pricing) {
       setDateError(t('cantCalculatePrice'));
+      focusFirstError('booking-error-summary');
       return;
     }
 
     const hasBlocked = pricing.breakdown.some((d) => !d.is_available);
     if (hasBlocked) {
       setDateError(t('hasBlockedDates'));
+      focusFirstError('booking-error-summary');
       return;
     }
 
@@ -198,16 +203,73 @@ export default function BookingForm({
     nights > 0 &&
     ((minStay !== undefined && nights < minStay) || (maxStay !== undefined && nights > maxStay));
 
-  const hasError = !!(dateError || availabilityError);
+  const hasDateError = !!(dateError || availabilityError);
   const isOverCapacity = maxGuests !== undefined && guestCount > maxGuests;
 
+  // Both date inputs share the date error — both should be aria-invalid when
+  // the error relates to the combination of the two fields.
+  const dateDescribedBy = buildDescribedBy('check-in', hasDateError, false);
+
   return (
-    <form onSubmit={handleSubmit} className="bg-white dark:bg-gray-900 rounded-lg shadow-md p-6 space-y-4">
+    <form
+      onSubmit={handleSubmit}
+      className="bg-white dark:bg-gray-900 rounded-lg shadow-md p-6 space-y-4"
+      noValidate
+      aria-label={t('bookNow')}
+    >
+      {/* ── Error summary ──────────────────────────────────────────────── */}
+      {(hasDateError || !!guestError) && (
+        <div
+          id="booking-error-summary"
+          ref={errorSummaryRef}
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+          tabIndex={-1}
+          className="rounded-lg border border-red-300 bg-red-50 dark:bg-red-950/40 dark:border-red-700 p-3 space-y-1"
+        >
+          <p className="text-sm font-semibold text-red-800 dark:text-red-300 flex items-center gap-1">
+            <AlertCircle size={14} aria-hidden="true" />
+            Please fix the following before continuing:
+          </p>
+          <ul className="list-disc list-inside space-y-1">
+            {hasDateError && (
+              <li className="text-sm text-red-700 dark:text-red-400">
+                <a
+                  href="#check-in"
+                  onClick={(e) => { e.preventDefault(); document.getElementById('check-in')?.focus(); }}
+                  className="underline hover:no-underline focus:outline-none focus:ring-2 focus:ring-red-500 rounded"
+                >
+                  {dateError || availabilityError}
+                </a>
+              </li>
+            )}
+            {guestError && (
+              <li className="text-sm text-red-700 dark:text-red-400">
+                <a
+                  href="#guests"
+                  onClick={(e) => { e.preventDefault(); document.getElementById('guests')?.focus(); }}
+                  className="underline hover:no-underline focus:outline-none focus:ring-2 focus:ring-red-500 rounded"
+                >
+                  {guestError}
+                </a>
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+
+      {/* ── Date fields ─────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-4">
         <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" htmlFor="check-in">
-            <Calendar className="inline mr-2" size={16} aria-hidden="true" />
+          <label
+            htmlFor="check-in"
+            className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
+          >
+            <Calendar className="inline mr-1.5" size={15} aria-hidden="true" />
             {t('checkIn')}
+            <span aria-hidden="true" className="ml-1 text-red-500">*</span>
+            <span className="sr-only">(required)</span>
           </label>
           <input
             id="check-in"
@@ -215,14 +277,26 @@ export default function BookingForm({
             min={today}
             value={checkIn}
             onChange={(e) => setCheckIn(e.target.value)}
-            className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
             required
+            aria-required
+            aria-invalid={hasDateError || undefined}
+            aria-describedby={hasDateError ? 'booking-date-error' : undefined}
+            className={`w-full border rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+              hasDateError
+                ? 'border-red-400 dark:border-red-600'
+                : 'border-gray-300 dark:border-gray-600'
+            }`}
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" htmlFor="check-out">
-            <Calendar className="inline mr-2" size={16} aria-hidden="true" />
+          <label
+            htmlFor="check-out"
+            className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
+          >
+            <Calendar className="inline mr-1.5" size={15} aria-hidden="true" />
             {t('checkOut')}
+            <span aria-hidden="true" className="ml-1 text-red-500">*</span>
+            <span className="sr-only">(required)</span>
           </label>
           <input
             id="check-out"
@@ -230,28 +304,50 @@ export default function BookingForm({
             min={checkIn || today}
             value={checkOut}
             onChange={(e) => setCheckOut(e.target.value)}
-            className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
             required
+            aria-required
+            aria-invalid={hasDateError || undefined}
+            aria-describedby={hasDateError ? 'booking-date-error' : undefined}
+            className={`w-full border rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+              hasDateError
+                ? 'border-red-400 dark:border-red-600'
+                : 'border-gray-300 dark:border-gray-600'
+            }`}
           />
         </div>
       </div>
 
-      {hasError && (
-        <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg">
-          <AlertCircle size={16} className="text-red-600 flex-shrink-0 mt-0.5" aria-hidden="true" />
-          <p className="text-sm text-red-700 dark:text-red-300">{dateError || availabilityError}</p>
-        </div>
+      {/* Date / availability error — associated with both date inputs */}
+      {hasDateError && (
+        <p
+          id="booking-date-error"
+          role="alert"
+          aria-live="polite"
+          className="flex items-center gap-1.5 text-sm text-red-700 dark:text-red-300"
+        >
+          <AlertCircle size={14} aria-hidden="true" />
+          {dateError || availabilityError}
+        </p>
       )}
 
+      {/* ── Guest count ─────────────────────────────────────────────────── */}
       <div>
-        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" htmlFor="guests">
-          <Users className="inline mr-2" size={16} aria-hidden="true" />
+        <label
+          htmlFor="guests"
+          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
+        >
+          <Users className="inline mr-1.5" size={15} aria-hidden="true" />
           Guests
           {maxGuests !== undefined && (
-            <span className="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">
+            <span
+              id="guests-hint"
+              className="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400"
+            >
               (max {maxGuests})
             </span>
           )}
+          <span aria-hidden="true" className="ml-1 text-red-500">*</span>
+          <span className="sr-only">(required)</span>
         </label>
         <input
           id="guests"
@@ -261,25 +357,32 @@ export default function BookingForm({
           max={maxGuests}
           value={guestCount}
           onChange={handleGuestChange}
-          className={`w-full border rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 ${
+          required
+          aria-required
+          aria-invalid={!!guestError || undefined}
+          aria-describedby={buildDescribedBy('guests', !!guestError, !!maxGuests)}
+          className={`w-full border rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 ${
             guestError
-              ? 'border-red-400 bg-red-50 dark:bg-red-950 dark:border-red-700'
+              ? 'border-red-400 bg-red-50 dark:bg-red-950/30 dark:border-red-700'
               : 'border-gray-300 dark:border-gray-600'
           }`}
-          aria-describedby={guestError ? 'guest-error' : undefined}
-          aria-invalid={!!guestError}
         />
         {guestError && (
-          <p id="guest-error" className="mt-1 text-sm text-red-600 dark:text-red-400 flex items-center gap-1">
+          <p
+            id="guests-error"
+            role="alert"
+            aria-live="polite"
+            className="mt-1 text-sm text-red-600 dark:text-red-400 flex items-center gap-1"
+          >
             <AlertCircle size={13} aria-hidden="true" />
             {guestError}
           </p>
         )}
       </div>
 
+      {/* ── Pricing breakdown ─────────────────────────────────────────────── */}
       {pricing && (
         <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg space-y-2">
-          {/* Estimate disclaimer */}
           {displayCurrency !== 'USD' && (
             <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
               Charges are always in{' '}
@@ -320,7 +423,6 @@ export default function BookingForm({
           )}
 
           <div className="space-y-1 text-sm text-gray-600 dark:text-gray-400">
-            {/* Base rate line */}
             <div className="flex justify-between">
               <span>
                 {formatCurrency(pricing.base_nightly_rate, locale)} &times; {pricing.nights}{' '}
@@ -338,7 +440,6 @@ export default function BookingForm({
               </span>
             </div>
 
-            {/* Dynamic adjustments */}
             {pricing.dynamic_adjustments !== 0 && (
               <div className="flex justify-between">
                 <span>Dynamic pricing</span>
@@ -357,7 +458,6 @@ export default function BookingForm({
               </div>
             )}
 
-            {/* Platform fee */}
             <div className="flex justify-between">
               <span>Platform fee ({(pricing.platform_fee_pct * 100).toFixed(0)}%)</span>
               <span className="text-right">
@@ -373,7 +473,6 @@ export default function BookingForm({
             </div>
           </div>
 
-          {/* Total */}
           <div className="border-t pt-2 flex justify-between items-start font-semibold">
             <span>Total (charged in USDC)</span>
             <span className="text-right">
@@ -393,7 +492,9 @@ export default function BookingForm({
       <button
         type="submit"
         disabled={isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
-        className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg transition"
+        className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg transition min-h-[44px]"
+        aria-busy={isLoading}
+        aria-disabled={isLoading || nights <= 0 || !pricing || !!guestError || isOverCapacity || stayViolation}
       >
         {isLoading ? t('processing') : t('bookNow')}
       </button>

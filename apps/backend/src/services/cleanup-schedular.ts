@@ -1,18 +1,39 @@
 import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from './sync.service.js';
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
-import { processNotificationOutbox } from './notification.service.js';
+import { BookingService } from './booking.service.js';
+import { processDueAccountDeletions } from './privacy.service.js';
+
+const bookingService = new BookingService();
 
 const SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const RECONCILIATION_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
-const NOTIFICATION_OUTBOX_INTERVAL_MS = 30 * 1000;
+const BOOKING_EXPIRY_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const ACCOUNT_DELETION_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_CONCURRENT_RECONCILIATIONS = 5;
 const INITIAL_BACKOFF_MS = 1000; // 1 second
 const MAX_BACKOFF_MS = 30000; // 30 seconds
 
+/**
+ * How often the full data-retention sweep runs.
+ * Default: once every 24 hours.  Configurable via RETENTION_INTERVAL_HOURS.
+ */
+const RETENTION_INTERVAL_MS =
+  (env.RETENTION_INTERVAL_HOURS ?? 24) * 60 * 60 * 1000;
+
+/**
+ * Delay before the startup dry-run preview fires.
+ * Set short (10 s) so operators see a preview soon after boot without
+ * blocking the server from accepting traffic.
+ */
+const RETENTION_STARTUP_PREVIEW_DELAY_MS = 10_000;
+
 let concurrentReconciliations = 0;
 let reconciliationBackoffMs = INITIAL_BACKOFF_MS;
 let notificationOutboxRunning = false;
+
+/** Guard: prevent two full retention runs from overlapping. */
+let retentionRunning = false;
 
 async function runSync(): Promise<void> {
   const propertiesResult = await syncAllProperties();
@@ -86,18 +107,62 @@ export function startSyncScheduler(): void {
     runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
   }, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 
+  // Booking expiry cleanup — runs every 10 minutes, expires stale Pending bookings.
+  setInterval(() => {
+    runBookingExpiryCleanup().catch((err) => console.error('[expiry] Scheduler error:', err));
+  }, BOOKING_EXPIRY_INTERVAL_MS);
+
+  // Account deletion — executes requests whose 7-day cancellation window has closed.
+  setInterval(() => {
+    processDueAccountDeletions().catch((err) => console.error('[privacy] Deletion worker error:', err));
+  }, ACCOUNT_DELETION_INTERVAL_MS);
+
   // Run an initial cleanup shortly after startup so stale keys don't linger
   // across a server restart that happens to be more than 24 h after creation.
   setTimeout(() => {
     runIdempotencyCleanup().catch((err) =>
       console.error('[idempotency] Initial cleanup error:', err),
     );
+    runBookingExpiryCleanup().catch((err) =>
+      console.error('[expiry] Initial cleanup error:', err),
+    );
   }, 30_000); // 30 seconds after startup
+
+  // ── Data-retention cleanup ────────────────────────────────────────────────
+  //
+  // Scheduled sweep runs every RETENTION_INTERVAL_HOURS (default 24 h).
+  // At startup a dry-run preview fires after a short delay so operators can
+  // verify what the next scheduled run will touch before it mutates anything.
+  //
+  // To trigger an immediate live run without restarting the server, set
+  // RETENTION_RUN_ON_STARTUP=true — useful for one-off cleanups after a
+  // retention-policy change is deployed.
+
+  setInterval(() => {
+    runDataRetention().catch((err) => console.error('[retention] Scheduler error:', err));
+  }, RETENTION_INTERVAL_MS);
+
+  // Startup preview: dry-run only, no deletions.
+  setTimeout(() => {
+    runDataRetention({ dryRun: true, label: 'startup-preview' }).catch((err) =>
+      console.error('[retention] Startup preview error:', err),
+    );
+  }, RETENTION_STARTUP_PREVIEW_DELAY_MS);
+
+  // Optional immediate live run (e.g. after a retention-policy change).
+  if (env.RETENTION_RUN_ON_STARTUP) {
+    setTimeout(() => {
+      runDataRetention({ dryRun: false, label: 'startup-live' }).catch((err) =>
+        console.error('[retention] Startup live-run error:', err),
+      );
+    }, 60_000); // 60 s after startup — after the dry-run preview
+  }
 
   console.log(
     `[sync] Scheduler started — sync interval: ${SYNC_INTERVAL_MS / 1000}s, ` +
     `reconciliation interval: ${RECONCILIATION_INTERVAL_MS / 1000}s, ` +
-    `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s`,
+    `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
+    `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
   );
 }
 
@@ -122,5 +187,43 @@ async function runIdempotencyCleanup(): Promise<void> {
     }
   } else {
     console.error(`[idempotency] Cleanup failed: ${result.error}`);
+  }
+}
+
+async function runBookingExpiryCleanup(): Promise<void> {
+  const result = await bookingService.expireStaleBookings();
+  if (result.success) {
+    const { expired, failed } = result.data ?? { expired: 0, failed: 0 };
+    if (expired > 0 || failed > 0) {
+      console.log(`[expiry] Expired ${expired} booking(s), ${failed} failure(s)`);
+    }
+  } else {
+    console.error(`[expiry] Cleanup failed: ${result.error}`);
+  }
+}
+
+/**
+ * Run one full data-retention sweep, guarding against overlapping runs so two
+ * scheduled invocations can never mutate the same tables concurrently.
+ * Returns the per-class summary, or null when a run was already in progress.
+ */
+async function runDataRetention(
+  options: RetentionOptions & { label?: string } = {},
+): Promise<void> {
+  if (retentionRunning) {
+    console.log(`[retention] Skipping ${options.label ?? 'run'} — previous sweep still in progress`);
+    return;
+  }
+  retentionRunning = true;
+  try {
+    const summary = await runRetentionJobs({ dryRun: options.dryRun, batchSize: options.batchSize });
+    console.log(
+      `[retention] ${summary.dry_run ? 'Dry-run' : 'Cleanup'} (${options.label ?? 'scheduled'}) — ` +
+      `${summary.total_deleted} deleted, ${summary.total_eligible} eligible, ` +
+      `${summary.total_held_skipped} held, ${summary.elapsed_ms}ms` +
+      (summary.failed_classes.length ? `, failures: ${summary.failed_classes.join(',')}` : ''),
+    );
+  } finally {
+    retentionRunning = false;
   }
 }

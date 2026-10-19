@@ -14,7 +14,7 @@ export async function createReport(req: AuthRequest, res: Response): Promise<voi
   const result = await submitReport(reporterId, targetType, targetId, reason, details);
 
   if (!result.success) {
-    res.status(result.conflict ? 409 : 400).json({ error: result.error });
+    res.status(result.conflict ? 409 : (result.statusCode ?? 400)).json({ error: result.error });
     return;
   }
 
@@ -110,11 +110,17 @@ export async function addEvidenceHandler(req: AuthRequest, res: Response): Promi
 }
 
 export async function hidePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const moderatorId = req.userId;
+  if (!moderatorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
   const { hideProperty } = await import('../services/report.service.js');
-  const result = await hideProperty(req.params.id);
+  const result = await hideProperty(req.params.id, moderatorId);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
@@ -122,11 +128,35 @@ export async function hidePropertyHandler(req: AuthRequest, res: Response): Prom
 }
 
 export async function unhidePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const moderatorId = req.userId;
+  if (!moderatorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
   const { unhideProperty } = await import('../services/report.service.js');
-  const result = await unhideProperty(req.params.id);
+  const result = await unhideProperty(req.params.id, moderatorId);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+export async function escalateReportHandler(req: AuthRequest, res: Response): Promise<void> {
+  const moderatorId = req.userId;
+  if (!moderatorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { escalateReport } = await import('../services/report.service.js');
+  const result = await escalateReport(req.params.id as string, moderatorId, req.body?.note);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
@@ -141,7 +171,7 @@ export async function submitAppealHandler(req: AuthRequest, res: Response): Prom
   }
 
   const { appealReason } = req.body;
-  if (!appealReason) {
+  if (!appealReason || typeof appealReason !== 'string') {
     res.status(400).json({ error: 'appealReason is required' });
     return;
   }
@@ -150,7 +180,7 @@ export async function submitAppealHandler(req: AuthRequest, res: Response): Prom
   const result = await submitAppeal(req.params.id, hostId, appealReason);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
@@ -165,7 +195,7 @@ export async function reviewAppealHandler(req: AuthRequest, res: Response): Prom
   }
 
   const { approved } = req.body;
-  if (approved === undefined) {
+  if (typeof approved !== 'boolean') {
     res.status(400).json({ error: 'approved (boolean) is required' });
     return;
   }
@@ -174,7 +204,7 @@ export async function reviewAppealHandler(req: AuthRequest, res: Response): Prom
   const result = await reviewAppeal(req.params.id, moderatorId, approved);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 

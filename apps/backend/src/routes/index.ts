@@ -2,21 +2,27 @@ import { autoDeprecationHeaders } from '@/middleware/deprecation.middleware.js';
 import { type Request, type Response, Router } from 'express';
 import adminRoutes from './admin.routes.js';
 import authRoutes from './auth.routes.js';
+import blockRoutes from './block.routes.js';
 import bookingRoutes from './booking.routes.js';
+import calendarFeedRoutes from './calendarFeed.routes.js';
 import clientErrorRoutes from './clientError.routes.js';
+import emailWebhookRoutes from './emailWebhook.routes.js';
 import exchangeRateRoutes from './exchangeRate.routes.js';
 import followRoutes from './follow.routes.js';
 import healthRoutes from './health.routes.js';
+import readinessRoutes from './readiness.routes.js';
 import hostRoutes from './host.routes.js';
 import locationRoutes from './location.routes.js';
 import notificationRoutes from './notification.routes.js';
 import paymentRoutes from './payment.routes.js';
+import probeRoutes from './probe.routes.js';
 import propertyRoutes from './property.routes.js';
 import pushRoutes from './push.routes.js';
 import reviewRoutes from './review.routes.js';
 import savedSearchRoutes from './savedSearch.routes.js';
 import policyRoutes from './policy.routes.js';
 import privacyRoutes from './privacy.routes.js';
+import supportRoutes from './support.routes.js';
 
 const router = Router();
 
@@ -43,8 +49,11 @@ apiV1.use(autoDeprecationHeaders);
 // Mount all route modules under /api/v1
 apiV1.use('/auth', authRoutes);
 apiV1.use('/admin', adminRoutes);
+apiV1.use('/blocks', blockRoutes);
 apiV1.use('/client-errors', clientErrorRoutes);
 apiV1.use('/bookings', bookingRoutes);
+apiV1.use('/calendar', calendarFeedRoutes);
+apiV1.use('/email', emailWebhookRoutes);
 apiV1.use('/follows', followRoutes);
 apiV1.use('/host', hostRoutes);
 apiV1.use('/properties', propertyRoutes);
@@ -53,10 +62,13 @@ apiV1.use('/reviews', reviewRoutes);
 apiV1.use('/notifications', notificationRoutes);
 apiV1.use('/payments', paymentRoutes);
 apiV1.use('/push', pushRoutes);
+apiV1.use('/probes', probeRoutes);
 apiV1.use('/exchange-rates', exchangeRateRoutes);
 apiV1.use('/saved-searches', savedSearchRoutes);
 apiV1.use('/policy', policyRoutes);
 apiV1.use('/privacy', privacyRoutes);
+apiV1.use('/support/cases', supportRoutes);
+apiV1.use(readinessRoutes);
 
 router.use('/api/v1', apiV1);
 

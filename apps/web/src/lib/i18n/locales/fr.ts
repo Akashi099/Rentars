@@ -159,6 +159,20 @@ const fr: TranslationSchema = {
     emptyWishlist: 'Votre liste de favoris est vide.',
     savedProperties: 'Biens sauvegardés',
   },
+  currency: {
+    selectCurrency: 'Devise d\'affichage',
+    displayNote: 'Les prix en {currency} sont approximatifs. Le règlement est toujours en USDC.',
+    rateAs: 'Taux au {datetime}. Règlement en USDC.',
+    rateStale: 'Le taux de change peut être obsolète. Affichage du montant en USDC uniquement.',
+    settlementLabel: 'Montant de règlement',
+    displayLabel: 'Montant d\'affichage approximatif',
+    rateSourceLabel: 'Source du taux',
+    rateTimestampLabel: 'Horodatage du taux',
+    usdcOnly: 'Montant en USDC (devise de règlement)',
+    // TODO(i18n): translate
+    nightCount: '{count} nuit',
+    nightCountPlural: '{count} nuits',
+  },
 };
 
 export default fr;

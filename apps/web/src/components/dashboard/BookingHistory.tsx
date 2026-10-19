@@ -1,6 +1,7 @@
 'use client';
 
 import BookingCard from '@/app/dashboard/tenant-dashboard/components/BookingCard';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 import type { BookingStatus, BookingSort, BookingOrder } from '@/hooks/useDashboard';
 
 const STATUS_OPTIONS: { label: string; value: BookingStatus }[] = [
@@ -47,30 +48,37 @@ export default function BookingHistory({
   onSortChange,
   onOrderChange,
 }: BookingHistoryProps) {
+  const isMobile = useMediaQuery('(max-width: 640px)');
+
   return (
     <div className="space-y-4">
-      {/* Filter chips */}
-      <div className="flex flex-wrap gap-2 items-center">
-        {STATUS_OPTIONS.map((opt) => (
-          <button
-            key={String(opt.value)}
-            onClick={() => onStatusChange(opt.value)}
-            className={`px-3 py-1 rounded-full text-sm font-medium transition ${
-              statusFilter === opt.value
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'
-            }`}
-          >
-            {opt.label}
-          </button>
-        ))}
+      {/* Filter chips and sort controls */}
+      <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+        <div className="flex flex-wrap gap-2">
+          {STATUS_OPTIONS.map((opt) => (
+            <button
+              key={String(opt.value)}
+              onClick={() => onStatusChange(opt.value)}
+              className={`px-3 py-1.5 rounded-full text-sm font-medium transition ${
+                statusFilter === opt.value
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
 
-        <div className="ml-auto flex items-center gap-2">
-          <label className="text-sm text-gray-600 dark:text-gray-400">Sort:</label>
+        <div className="flex items-center gap-2 sm:ml-auto">
+          <label htmlFor="sort-select" className="text-sm text-gray-600 dark:text-gray-400">
+            Sort:
+          </label>
           <select
+            id="sort-select"
             value={sort}
             onChange={(e) => onSortChange(e.target.value as BookingSort)}
-            className="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300"
+            className="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300"
           >
             {SORT_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -80,7 +88,7 @@ export default function BookingHistory({
           </select>
           <button
             onClick={() => onOrderChange(order === 'asc' ? 'desc' : 'asc')}
-            className="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+            className="text-sm border border-gray-300 dark:border-gray-600 rounded px-3 py-1.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
             aria-label={`Sort ${order === 'asc' ? 'descending' : 'ascending'}`}
           >
             {order === 'asc' ? '↑ Asc' : '↓ Desc'}
@@ -100,7 +108,7 @@ export default function BookingHistory({
           )}
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className={`grid grid-cols-1 gap-4 ${isMobile ? '' : 'md:grid-cols-2 lg:grid-cols-3'}`}>
           {bookings.map((booking) => (
             <BookingCard key={booking.id} {...booking} />
           ))}

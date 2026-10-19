@@ -12,6 +12,8 @@ import {
   getFeaturedProperties,
   setFeatured,
   clearFeatured,
+  getPropertyVersionHistory,
+  rollbackToVersion,
   FEATURED_CAP,
   type AdvancedSearchFilters,
   type Property,
@@ -35,21 +37,31 @@ import type { AuthRequest } from '@/middleware/auth.middleware.js';
  *  1. The property's owner/host
  *  2. A tenant with a Confirmed booking on the property
  */
+/**
+ * Determine the location precision tier for a viewer.
+ *
+ * - host   : property owner or platform admin — full exact coordinates
+ * - booking: tenant with a Pending or Confirmed booking — exact coordinates
+ *            so they can navigate to the property for their upcoming/active stay
+ * - public : everyone else — approximate coordinates only
+ */
 async function viewerHasExactLocationAccess(
   propertyId: string,
   ownerId: string | undefined,
   viewerUserId: string | undefined,
 ): Promise<boolean> {
   if (!viewerUserId) return false;
+  // Host tier: property owner always sees exact coordinates.
   if (ownerId && viewerUserId === ownerId) return true;
 
-  // Check for a confirmed booking
+  // Booking tier: tenants with an active or upcoming booking see exact coords.
+  // Pending is included so tenants can navigate before host confirmation.
   const { data } = await supabase
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
     .eq('tenant_id', viewerUserId)
-    .eq('status', 'Confirmed')
+    .in('status', ['Pending', 'Confirmed'])
     .limit(1);
 
   return Array.isArray(data) && data.length > 0;
@@ -212,7 +224,7 @@ export async function createPropertyHandler(req: AuthRequest, res: Response): Pr
 }
 
 export async function updatePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await updateProperty(req.params.id, req.body);
+  const result = await updateProperty(req.params.id, req.body, req.userId);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -227,6 +239,57 @@ export async function deletePropertyHandler(req: Request, res: Response): Promis
     return;
   }
   res.status(204).send();
+}
+
+// ─── Bounds Search ───────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/properties/search/bounds
+ *
+ * Returns properties whose coordinates fall within a map viewport bounding box.
+ * Used by the map view to populate markers as the user pans or zooms.
+ *
+ * Query params: north, south, east, west (all required, decimal degrees)
+ * Coordinates in the response are always redacted — map markers must use the
+ * approximate_latitude / approximate_longitude fields from the privacy layer.
+ */
+export async function boundsSearchHandler(req: Request, res: Response): Promise<void> {
+  const { north, south, east, west } = req.query;
+
+  const parsedNorth = Number(north);
+  const parsedSouth = Number(south);
+  const parsedEast  = Number(east);
+  const parsedWest  = Number(west);
+
+  if (
+    !Number.isFinite(parsedNorth) || !Number.isFinite(parsedSouth) ||
+    !Number.isFinite(parsedEast)  || !Number.isFinite(parsedWest)
+  ) {
+    res.status(400).json({ error: 'north, south, east, and west query params are required and must be numbers' });
+    return;
+  }
+
+  if (parsedSouth >= parsedNorth) {
+    res.status(400).json({ error: 'south must be less than north' });
+    return;
+  }
+
+  const result = await advancedSearch({
+    bounds: { north: parsedNorth, south: parsedSouth, east: parsedEast, west: parsedWest },
+    limit: 200,
+  });
+
+  if (!result.success || !result.data) {
+    res.status(500).json({ error: result.error ?? 'Search failed' });
+    return;
+  }
+
+  // Map markers are public — always redact exact coordinates.
+  const redacted = result.data.data.map((p) =>
+    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+  );
+
+  res.json({ data: redacted, count: redacted.length });
 }
 
 // ─── Advanced Search ──────────────────────────────────────────────────────────
@@ -602,7 +665,132 @@ export async function publishDraftHandler(req: AuthRequest, res: Response): Prom
   const result = await publishDraft(userId, req.params.id);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/properties/:id/draft
+ *
+ * Resume an unfinished listing. Owner-only.
+ */
+export async function getDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { getDraftProperty } = await import('../services/property.service.js');
+  const result = await getDraftProperty(userId, req.params.id as string);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * PATCH /api/v1/properties/:id/draft
+ *
+ * Autosave draft fields. Send `expected_updated_at` (the `updated_at` from the
+ * last read) to get a 409 with the current draft instead of overwriting a newer edit.
+ */
+export async function updateDraftHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { expected_updated_at, ...patch } = (req.body ?? {}) as Record<string, unknown> & {
+    expected_updated_at?: unknown;
+  };
+
+  if (expected_updated_at !== undefined && typeof expected_updated_at !== 'string') {
+    res.status(400).json({ error: 'expected_updated_at must be an ISO timestamp string' });
+    return;
+  }
+
+  const { updateDraftProperty } = await import('../services/property.service.js');
+  const result = await updateDraftProperty(
+    userId,
+    req.params.id as string,
+    patch,
+    expected_updated_at as string | undefined,
+  );
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 400).json({ error: result.error, ...(result.conflict ? { current: result.data } : {}) });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+// ─── Version history ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/properties/:id/versions
+ *
+ * Returns the version history for a property, newest first.
+ * Only the property owner and platform admins may access this.
+ */
+export async function getPropertyVersionsHandler(req: AuthRequest, res: Response): Promise<void> {
+  const viewerId = req.userId;
+  if (!viewerId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const propertyResult = await getPropertyById(req.params.id);
+  if (!propertyResult.success || !propertyResult.data) {
+    res.status(404).json({ error: propertyResult.error ?? 'Property not found' });
+    return;
+  }
+
+  const isOwner = propertyResult.data.owner_id === viewerId;
+  const isAdmin = ['admin', 'moderator'].includes((req as AuthRequest & { user?: { role?: string } }).user?.role ?? '');
+
+  if (!isOwner && !isAdmin) {
+    res.status(403).json({ error: 'Forbidden: only the property owner or an admin may view version history' });
+    return;
+  }
+
+  const limit = req.query.limit ? Math.min(Number(req.query.limit), 100) : 50;
+  const result = await getPropertyVersionHistory(req.params.id, limit);
+
+  if (!result.success) {
+    res.status(500).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * POST /api/v1/properties/:id/versions/:versionId/rollback
+ *
+ * Restore a property to a prior version.  Creates a new version record rather
+ * than mutating history.  Only the property owner may roll back.
+ */
+export async function rollbackPropertyVersionHandler(req: AuthRequest, res: Response): Promise<void> {
+  const actorId = req.userId;
+  if (!actorId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await rollbackToVersion(req.params.id, req.params.versionId, actorId);
+
+  if (!result.success) {
+    const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
+    res.status(statusCode).json({ error: result.error });
     return;
   }
 

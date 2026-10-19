@@ -120,6 +120,11 @@ export const requestModificationSchema = z.object({
   requested_end: z
     .string({ required_error: 'requested_end is required' })
     .date('requested_end must be a valid ISO date (YYYY-MM-DD)'),
+  guest_count: z
+    .number({ invalid_type_error: 'guest_count must be a number' })
+    .int('guest_count must be an integer')
+    .positive('guest_count must be a positive integer')
+    .optional(),
   reason: z
     .string()
     .max(1000, 'reason must not exceed 1000 characters')

@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — 2026-10-19
+
+#### #740 — Recovery and verification token hardening
+- Email verification and password reset tokens are claimed with conditional updates, so a concurrent reuse of the same link fails.
+- Password reset looks accounts up by email in the `users` table. The previous `listUsers()` call only saw the first page.
+- Password reset responses take a constant minimum time and send email without awaiting delivery, so known and unknown addresses look the same.
+- A successful reset or logout-all-devices revokes access tokens issued before that moment. The new `sessionRevocationGuard` enforces this and fails closed.
+- Removed the hard-coded `'secret'` fallback for `JWT_SECRET` in the auth middleware.
+
+#### #741 — Abuse controls for authentication endpoints
+- Each auth route has its own IP bucket, plus an account bucket for login, register, reset request and wallet endpoints.
+- Added `TRUST_PROXY` (hop count or trusted address list; `true` is rejected) so rate limits key on the real client behind a load balancer.
+- Redis failure on auth routes returns 503 instead of silently disabling limits.
+- Operator overrides: `AUTH_IP_RATE_POINTS`, `AUTH_IP_RATE_WINDOW_SECONDS`, `AUTH_ACCOUNT_RATE_POINTS`, `AUTH_ACCOUNT_RATE_WINDOW_SECONDS`.
+
+#### #742 — Audit coverage for account and recovery events
+- Added audit records for password reset requests, email verification and wallet linking.
+- Refund approvals are recorded under `admin.refund_approve` (previously logged as `payment.confirmed`).
+- Audit metadata redaction now covers arrays and raw payload or body keys.
+- Migration `00065_audit_logs_append_only.sql` blocks `UPDATE` and `DELETE` on `audit_logs`.
+
+#### #743 — Cookie, CORS and CSRF review
+- Disallowed origins no longer raise a 500. CORS headers are withheld and the browser blocks the read.
+- In production, `CORS_ORIGIN` must be explicit and use `https://`.
+- Documented token transport, CORS, and CSRF behaviour in `docs/SECURITY_AUTH_HARDENING.md`.
+- Repaired broken imports that stopped `auth.routes.ts` from loading: the auth routes now use `authenticate`, the wallet simulate and transaction preflight use `soroban.ts`, and a stray `await` in `probe.service.ts` is removed.
+- Bearer-authenticated mutations skip the double-submit CSRF check. The web client sends Bearer tokens and never sends `X-CSRF-Token`, so every write was being rejected. Cookie-only cross-site posts still get 403.
+
+### Added — 2026-09-25
+
+#### #576 — Reproducible lockfile and runtime checks
+- Added `.nvmrc` pinning Node 20 and `.tool-versions` for asdf/mise with exact
+  Node, Bun, and Rust versions.
+- Added `scripts/check-engines.sh` — validates Node, Yarn, Bun, and Rust versions
+  before install/build; exits 1 with a clear error when a runtime is unsupported.
+- Added `engines:check` and `versions` scripts to root `package.json`.
+- Added `runtime-check` CI job that enforces `--frozen-lockfile` installs for
+  root, backend, and web workspaces and runs `check-engines.sh`.
+
+#### #575 — Release versioning and changelog automation
+- Added `scripts/validate-changelog.ts` — enforces that CHANGELOG.md has an
+  `[Unreleased]` section with at least one recognised category heading and that
+  every versioned section carries a release date.
+- Added `scripts/generate-release-manifest.ts` — generates a machine-readable
+  `docs/releases/manifest-<version>.json` recording commit SHA, image tag,
+  per-component versions, latest migration, ABI SHA-256 hashes, and rollback
+  documentation pointer.
+- Added `docs/releases/rollback.md` — runbook for selecting and applying a prior
+  release manifest during a rollback.
+- Added `release:validate` and `release:manifest` scripts to root `package.json`.
+- Added `release-validation` CI job that validates CHANGELOG.md and runs the
+  manifest generator on every push and pull request.
+
+#### #574 — Preview environment smoke tests
+- Added `GET /api/v1/readiness` — lightweight process-readiness probe used by
+  smoke tests immediately after a cold deploy; does not probe dependencies.
+- Added `apps/web/e2e/smoke.spec.ts` — post-deploy smoke suite validating backend
+  readiness, health endpoint availability, CORS policy, unauthenticated property
+  search shape, frontend page load, and browser-to-backend connectivity.
+- Added `.github/workflows/smoke-tests.yml` — workflow triggered manually or via
+  `workflow_call` after deployment; uploads a Playwright report as an artifact.
+- No real bookings, escrow side effects, or persistent data are created by the
+  smoke suite outside its isolated test scope.
+
+#### #573 — Dependency and secret scanning
+- Added `.github/workflows/security-scan.yml` — runs on every PR and nightly:
+  - `secret-scan`: gitleaks full-history scan + self-test that detects the
+    planted fixture key.
+  - `yarn-audit`: audits root and web workspaces at `--level high`.
+  - `bun-audit`: audits backend workspace.
+  - `cargo-audit`: audits contracts workspace via `cargo-audit`.
+  - `container-scan`: trivy filesystem scan of backend and web at HIGH/CRITICAL.
+- Added `.gitleaks.toml` — extends gitleaks defaults; suppresses publicly
+  documented Supabase local-dev demo JWTs; excludes lockfiles and the fixture.
+- Added `tests/fixtures/secret-detection.fixture.txt` — intentionally planted
+  fake AWS key used as a CI self-test to prove the scanner detects secrets.
+- Added `.trivyignore` — placeholder for approved CVE exceptions with expiry.
+- Added `docs/security-exceptions.md` — exception process, severity thresholds,
+  and suppression format for each scanning tool.
+
 ### Added — 2026-Q3 roadmap review (2026-09-23)
 
 This entry records the quarterly roadmap review output.

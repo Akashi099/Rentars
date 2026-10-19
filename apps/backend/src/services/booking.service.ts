@@ -6,6 +6,7 @@
 
 import { StrKey } from '@stellar/stellar-sdk';
 import { supabase } from '@/config/supabase.js';
+import { env } from '@/config/env.js';
 import {
   checkAvailability,
   cancelBookingOnChain,
@@ -41,7 +42,31 @@ import {
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice } from './pricing.service.js';
-import { bookingAuthorizationService } from './bookingAuthorization.service.js';
+import {
+  bookingAuthorizationService,
+  type BookingActor,
+} from './bookingAuthorization.service.js';
+import { auditLogger } from './auditLogger.service.js';
+
+// ─── State machine ────────────────────────────────────────────────────────────
+
+/**
+ * Exhaustive map of every valid booking status transition.
+ * Any transition not listed here is rejected with HTTP 409.
+ *
+ * Terminal states (Completed, Cancelled, Expired) have empty arrays —
+ * nothing can follow them.
+ */
+export const VALID_TRANSITIONS: Readonly<Record<string, readonly string[]>> = {
+  Pending:   ['Confirmed', 'Cancelled', 'Expired'],
+  Confirmed: ['Completed', 'Cancelled', 'Disputed'],
+  Disputed:  ['Completed', 'Cancelled'],
+  Completed: [],
+  Cancelled: [],
+  Expired:   [],
+} as const;
+
+export const TERMINAL_STATES = new Set(['Completed', 'Cancelled', 'Expired']);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,6 +90,8 @@ export interface Booking {
   refund_tier?: string | null;
   /** Refund fraction (0..1) applied per the configured policy. */
   refund_policy_pct?: number | null;
+  /** UTC instant at which a Pending booking will be automatically expired. */
+  expires_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -72,8 +99,11 @@ export interface Booking {
 export interface BookingStatusHistory {
   id: string;
   booking_id: string;
+  /** Status the booking transitioned FROM. Null for the initial creation entry. */
+  from_status?: string | null;
   status: string;
   changed_by?: string;
+  reason?: string;
   notes?: string;
   created_at: string;
 }
@@ -85,9 +115,23 @@ export interface BookingModification {
   requested_end: string;
   original_start: string;
   original_end: string;
+  /** Guest count on the booking when the request was created. */
+  original_guest_count?: number | null;
+  /** New guest count being requested; null means no occupancy change. */
+  requested_guest_count?: number | null;
   status: string;
   requested_by: string;
   reason?: string;
+  /** Price of the booking before the modification was requested. */
+  original_total_price?: number | null;
+  /** Repriced total after the modification is accepted. */
+  new_total_price?: number | null;
+  /** new_total_price − original_total_price. Positive means more is owed. */
+  price_delta?: number | null;
+  /** True when delta > 0 and the tenant must authorise an additional payment. */
+  requires_additional_payment?: boolean;
+  /** Full JSON snapshot of the booking row at request time — immutable audit record. */
+  booking_snapshot?: Record<string, unknown> | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -105,6 +149,8 @@ export interface CreateBookingInput {
   /** UTC timestamp when the tenant accepted the terms. */
   terms_accepted_at?: string;
   on_chain_property_id?: bigint;
+  /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
+  quote_token?: string;
 }
 
 export interface RequestModificationInput {
@@ -112,6 +158,8 @@ export interface RequestModificationInput {
   tenant_id: string;
   requested_start: string;
   requested_end: string;
+  /** Optional occupancy change; validated against property max_guests. */
+  guest_count?: number;
   reason?: string;
 }
 
@@ -161,6 +209,125 @@ export class BookingService {
       cancelBookingOnChain,
       updateBookingStatusOnChain,
     };
+  }
+
+  // ── State machine ──────────────────────────────────────────────────────────
+
+  /**
+   * Validate, apply, and record a booking status transition atomically.
+   *
+   * Checks the transition against VALID_TRANSITIONS and returns HTTP 409
+   * (conflict) for any path not in the map. On success the booking row is
+   * updated and a fully-enriched history record (from_status, actor, reason)
+   * is inserted.
+   *
+   * @param extra - Additional columns to update alongside `status` (e.g. cancelled_at).
+   */
+  private async transitionStatus(
+    bookingId: string,
+    fromStatus: string,
+    toStatus: string,
+    actorId: string,
+    reason?: string,
+    extra?: Record<string, unknown>,
+  ): Promise<ServiceResponse<Booking>> {
+    const allowed = VALID_TRANSITIONS[fromStatus];
+    if (!allowed) {
+      return {
+        success: false,
+        error: `Unknown booking status '${fromStatus}'`,
+        statusCode: 409,
+      };
+    }
+    if (!allowed.includes(toStatus)) {
+      const msg =
+        fromStatus === toStatus
+          ? `Booking is already ${toStatus.toLowerCase()}`
+          : `Cannot transition booking from '${fromStatus}' to '${toStatus}'`;
+      return { success: false, error: msg, statusCode: 409 };
+    }
+
+    const payload: Record<string, unknown> = { status: toStatus, ...extra };
+
+    const { data, error } = await supabase
+      .from('bookings')
+      .update(payload)
+      .eq('id', bookingId)
+      .select()
+      .single();
+
+    if (error) return { success: false, error: error.message };
+
+    supabase
+      .from('booking_status_history')
+      .insert({
+        booking_id: bookingId,
+        from_status: fromStatus,
+        status: toStatus,
+        changed_by: actorId || null,
+        reason: reason ?? null,
+      })
+      .then(() => {})
+      .catch((e: unknown) => console.warn('[BookingService] History insert failed:', e));
+
+    return { success: true, data: data as Booking };
+  }
+
+  // ── Expiry cleanup ─────────────────────────────────────────────────────────
+
+  /**
+   * Expire all Pending bookings whose expires_at has passed.
+   *
+   * Safe to rerun — each booking is only expired once. Checks payment state
+   * before expiring so a confirmed payment is never silently discarded.
+   */
+  async expireStaleBookings(): Promise<ServiceResponse<{ expired: number; failed: number }>> {
+    const { data: stale, error } = await supabase
+      .from('bookings')
+      .select('id, status, escrow_id, tenant_id, expires_at')
+      .eq('status', 'Pending')
+      .lt('expires_at', new Date().toISOString())
+      .not('expires_at', 'is', null);
+
+    if (error) return { success: false, error: error.message };
+
+    let expired = 0;
+    let failed = 0;
+
+    for (const b of stale ?? []) {
+      try {
+        // Release escrow back to tenant (non-fatal)
+        if (b.escrow_id) {
+          await trustlessWorkClient.cancelEscrow(b.escrow_id).catch((e: unknown) =>
+            console.warn('[expiry] Escrow cancel failed for', b.id, ':', e),
+          );
+        }
+
+        const result = await this.transitionStatus(
+          b.id,
+          'Pending',
+          'Expired',
+          'system',
+          'Booking expired — payment not received within the allowed window',
+        );
+
+        if (!result.success) {
+          failed++;
+          continue;
+        }
+
+        if (b.tenant_id) {
+          createNotification(b.tenant_id, 'booking_expired', { booking_id: b.id }).catch(() => {});
+        }
+
+        expired++;
+      } catch (e) {
+        console.error('[expiry] Failed to expire booking', b.id, ':', e);
+        failed++;
+      }
+    }
+
+    return { success: true, data: { expired, failed } };
   }
 
   // ── Read ───────────────────────────────────────────────────────────────────
@@ -342,7 +509,7 @@ export class BookingService {
     // 1. Fetch property + owner (include capacity and stay-length limits)
     const { data: property, error: propertyError } = await supabase
       .from('properties')
-      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at')
+      .select('id, owner_id, on_chain_id, max_guests, min_nights, max_nights, check_in_time, check_out_time, deleted_at, draft_status, moderation_state')
       .eq('id', property_id)
       .single();
 
@@ -360,11 +527,27 @@ export class BookingService {
       check_in_time?: string;
       check_out_time?: string;
       deleted_at?: string | null;
+      draft_status?: string | null;
+      moderation_state?: string | null;
     };
 
     // Reject bookings against soft-deleted (removed) listings
     if (prop.deleted_at) {
       return { success: false, error: 'This property is no longer available for booking' };
+    }
+
+    // Drafts are not bookable. A listing hidden by moderation stops accepting new
+    // bookings, but bookings made before the hide are not changed.
+    if (prop.draft_status === 'draft') {
+      return { success: false, error: 'This property is not available for booking' };
+    }
+    if (prop.moderation_state === 'hidden') {
+      return {
+        success: false,
+        error: 'This property is temporarily unavailable for new bookings',
+        statusCode: 409,
+        code: 'LISTING_HIDDEN',
+      };
     }
 
     // Capacity check
@@ -410,6 +593,35 @@ export class BookingService {
       }
     }
 
+    // 1b. Re-price the stay on the server. The tenant's total must match a fresh
+    //     quote (and a supplied quote token, if any) before dates are reserved or
+    //     funds are authorised. The server total is what gets charged.
+    const priceCheck = await assertQuotedTotal({
+      propertyId: property_id,
+      checkIn: check_in,
+      checkOut: check_out,
+      clientTotal: total_price,
+      quoteToken: input.quote_token,
+    });
+    if (!priceCheck.success || !priceCheck.data) {
+      return {
+        success: false,
+        error: priceCheck.error,
+        statusCode: priceCheck.statusCode,
+        conflict: priceCheck.conflict,
+        code: priceCheck.code,
+        details: priceCheck.details,
+      };
+    }
+    const chargedTotal = priceCheck.data.total;
+
+    // Capture the listing terms the tenant is agreeing to, at the same point the
+    // price is confirmed. This is stored with the booking and never changes after.
+    const termsSnapshot = await captureListingTermsSnapshot(property_id);
+    if (!termsSnapshot.success || !termsSnapshot.data) {
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
+
     // 2. Fetch Stellar addresses
     const [ownerStellarAddress, buyerStellarAddress] = await Promise.all([
       fetchStellarAddress(prop.owner_id),
@@ -440,7 +652,7 @@ export class BookingService {
         p_tenant_id: tenant_id,
         p_check_in: check_in,
         p_check_out: check_out,
-        p_total_price: total_price,
+        p_total_price: chargedTotal,
         p_guest_count: guest_count,
         p_rules_acknowledged_at: rules_acknowledged_at ?? null,
         p_terms_version: terms_version ?? null,
@@ -460,6 +672,21 @@ export class BookingService {
     }
 
     const bookingId = reservedId as string;
+
+    // Store the agreed listing terms on the booking. The snapshot is immutable
+    // (see migration 00065), so this is the only write that sets it.
+    const { error: snapshotError } = await supabase
+      .from('bookings')
+      .update({
+        listing_terms_snapshot: termsSnapshot.data.terms,
+        listing_revision: termsSnapshot.data.revision,
+      })
+      .eq('id', bookingId);
+
+    if (snapshotError) {
+      await supabase.from('bookings').delete().eq('id', bookingId);
+      return { success: false, error: 'Could not record the listing terms for this booking' };
+    }
 
     // 5. Check on-chain availability (advisory; non-blocking on error).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -511,7 +738,7 @@ export class BookingService {
         bookingId,
         buyerAddress: buyerStellarAddress,
         sellerAddress: ownerStellarAddress,
-        amountUsdc: String(total_price),
+        amountUsdc: String(chargedTotal),
         checkIn: check_in,
         checkOut: check_out,
       });
@@ -538,10 +765,14 @@ export class BookingService {
       };
     }
 
-    // 7. Attach escrow_id to the reserved booking.
+    // 7. Attach escrow_id and expiry timestamp to the reserved booking.
+    const expiresAt = new Date(
+      Date.now() + (env.PENDING_BOOKING_EXPIRY_HOURS ?? 24) * 3_600_000,
+    ).toISOString();
+
     const { data: bookingData, error: updateError } = await supabase
       .from('bookings')
-      .update({ escrow_id: escrowId })
+      .update({ escrow_id: escrowId, expires_at: expiresAt })
       .eq('id', bookingId)
       .select()
       .single();
@@ -558,29 +789,18 @@ export class BookingService {
 
     const booking = bookingData as Booking;
 
-    // #769 — Snapshot the refund policy at booking creation time so later
-    // policy changes don't affect this booking's refund terms.
-    const snapshotResult = await createRefundSnapshot({
-      bookingId: booking.id,
-      totalPrice: total_price,
-    });
-    if (!snapshotResult.success) {
-      if (escrowId) {
-        try {
-          await trustlessWorkClient.cancelEscrow(escrowId);
-        } catch (rollbackError) {
-          console.error('[BookingService] Failed to cancel escrow after refund snapshot failure:', rollbackError);
-        }
-      }
-      const { error: deleteError } = await supabase.from('bookings').delete().eq('id', booking.id);
-      if (deleteError) {
-        console.error('[BookingService] Failed to remove booking after refund snapshot failure:', deleteError.message);
-      }
-      return {
-        success: false,
-        error: `Failed to establish booking refund terms: ${snapshotResult.error}`,
-      };
-    }
+    // Record initial history entry for the Pending state.
+    supabase
+      .from('booking_status_history')
+      .insert({
+        booking_id: booking.id,
+        from_status: null,
+        status: 'Pending',
+        changed_by: tenant_id,
+        reason: 'Booking created',
+      })
+      .then(() => {})
+      .catch((e: unknown) => console.warn('[BookingService] Initial history insert failed:', e));
 
     // Notify tenant (in-app)
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
@@ -605,7 +825,7 @@ export class BookingService {
           buyerStellarAddress,
           checkInTs,
           checkOutTs,
-          BigInt(Math.round(total_price * 1e7)),
+          BigInt(Math.round(chargedTotal * 1e7)),
         );
 
         loggingService.logBlockchainOperation('createBookingOnChain', {
@@ -703,18 +923,14 @@ export class BookingService {
       };
     }
 
-    // 3. Eligibility: must be in a cancellable state
+    // 3. Eligibility: only Pending or Confirmed bookings may be cancelled by the tenant.
+    //    Disputed bookings require admin resolution before cancellation.
     const status = booking.status ?? '';
-    if (status === 'Cancelled') {
-      return { success: false, error: 'Booking is already cancelled' };
-    }
-    if (status === 'Completed') {
-      return { success: false, error: 'Cannot cancel a completed booking' };
-    }
     if (status === 'Disputed') {
       return {
         success: false,
         error: 'Cannot cancel a disputed booking. Resolve the dispute first.',
+        statusCode: 409,
       };
     }
 
@@ -886,24 +1102,24 @@ export class BookingService {
       }
     }
 
-    // 6. Persist the cancellation + refund outcome
+    // 6. Persist the cancellation + refund outcome via the state machine.
     const cancelledAt = now.toISOString();
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update({
-        status: 'Cancelled',
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      status,
+      'Cancelled',
+      userId,
+      `Cancelled by ${isTenant ? 'tenant' : 'admin/moderator'}`,
+      {
         cancelled_at: cancelledAt,
         refund_amount: refund.refundAmount,
         refund_tier: refund.tier,
         refund_policy_pct: refund.refundPct,
-      })
-      .eq('id', bookingId)
-      .select()
-      .single();
+      },
+    );
 
-    if (updateError) {
-      return { success: false, error: updateError.message };
-    }
+    if (!transitionResult.success) return transitionResult;
+    const updatedData = transitionResult.data!
 
     // 7. Notify both parties
     const notificationData = {
@@ -964,11 +1180,7 @@ export class BookingService {
       }
     }
 
-    return {
-      success: true,
-      data: updatedData as Booking,
-      warning: refundWarning,
-    };
+    return { success: true, data: updatedData };
   }
 
   // ── Confirm ────────────────────────────────────────────────────────────────
@@ -1004,14 +1216,6 @@ export class BookingService {
       };
     }
 
-    if (booking.status === 'Confirmed') {
-      return { success: false, error: 'Booking is already confirmed' };
-    }
-
-    if (booking.status === 'Cancelled') {
-      return { success: false, error: 'Cannot confirm a cancelled booking' };
-    }
-
     // Release escrow to owner
     if (booking.escrow_id) {
       loggingService.logBlockchainOperation('releaseEscrow', {
@@ -1021,51 +1225,26 @@ export class BookingService {
       });
 
       try {
-        const currentEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
-        if (currentEscrow.status !== 'released') {
-          await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking confirmed by tenant');
-        }
-        const settledEscrow = await trustlessWorkClient.getEscrowStatus(booking.escrow_id);
-        if (settledEscrow.status !== 'released') {
-          return { success: false, error: 'Escrow release is pending provider confirmation' };
-        }
-        const ledgerResult = await recordBookingSettlement(
-          hostId,
-          bookingId,
-          booking.total_price ?? 0,
-        );
-        if (!ledgerResult.success) {
-          return { success: false, error: `Escrow was released but earnings ledger update failed: ${ledgerResult.error}` };
-        }
+        await trustlessWorkClient.releaseEscrow(booking.escrow_id, 'Booking confirmed by host');
       } catch (err) {
         loggingService.logBlockchainOperation(
           'releaseEscrow',
-          {
-            bookingId,
-            userId,
-            escrowId: booking.escrow_id,
-          },
+          { bookingId, userId, escrowId: booking.escrow_id },
           undefined,
           String(err),
         );
-        return {
-          success: false,
-          error: `Failed to release escrow: ${String(err)}`,
-        };
+        return { success: false, error: `Failed to release escrow: ${String(err)}` };
       }
     }
 
-    // Update DB status
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update({ status: 'Confirmed' })
-      .eq('id', bookingId)
-      .select()
-      .single();
-
-    if (updateError) {
-      return { success: false, error: updateError.message };
-    }
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      booking.status ?? 'Pending',
+      'Confirmed',
+      userId,
+      'Confirmed by host',
+    );
+    if (!transitionResult.success) return transitionResult;
 
     // Notify tenant
     if (booking.tenant_id) {
@@ -1079,10 +1258,7 @@ export class BookingService {
       const callerAddress = await fetchStellarAddress(userId);
 
       if (callerAddress) {
-        loggingService.logBlockchainOperation('updateBookingStatusOnChain', {
-          bookingId,
-          userId,
-        });
+        loggingService.logBlockchainOperation('updateBookingStatusOnChain', { bookingId, userId });
 
         try {
           await this.blockchain.updateBookingStatusOnChain(
@@ -1093,10 +1269,7 @@ export class BookingService {
         } catch (err) {
           loggingService.logBlockchainOperation(
             'updateBookingStatusOnChain',
-            {
-              bookingId,
-              userId,
-            },
+            { bookingId, userId },
             undefined,
             String(err),
           );
@@ -1105,7 +1278,7 @@ export class BookingService {
       }
     }
 
-    return { success: true, data: updatedData as Booking };
+    return { success: true, data: transitionResult.data! };
   }
 
   // ── Complete ───────────────────────────────────────────────────────────────
@@ -1137,17 +1310,6 @@ export class BookingService {
     }
 
     const booking = bookingData as Booking & { properties: { owner_id: string } };
-
-    // State-machine: only Confirmed bookings can be completed
-    if (booking.status === 'Completed') {
-      return { success: false, error: 'Booking is already completed' };
-    }
-    if (booking.status !== 'Confirmed') {
-      return {
-        success: false,
-        error: `Cannot complete a booking in '${booking.status}' status. Only Confirmed bookings can be completed.`,
-      };
-    }
 
     // Authorisation: only the tenant or admin/moderator may mark as completed
     const isTenant = booking.tenant_id === userId;
@@ -1193,33 +1355,25 @@ export class BookingService {
           undefined,
           String(err),
         );
-        return {
-          success: false,
-          error: `Failed to verify escrow release: ${String(err)}`,
-        };
+        console.warn('[BookingService] Escrow release on complete failed:', err);
       }
     }
 
-    // Update DB status
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update({ status: 'Completed' })
-      .eq('id', bookingId)
-      .select()
-      .single();
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      booking.status ?? 'Confirmed',
+      'Completed',
+      userId,
+      'Completed by tenant',
+    );
+    if (!transitionResult.success) return transitionResult;
 
-    if (updateError) {
-      return { success: false, error: updateError.message };
-    }
-
-    // Notify tenant
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'booking_completed', { booking_id: bookingId }).catch(
         () => {},
       );
     }
 
-    // Update on-chain status (non-fatal)
     if (booking.on_chain_id !== undefined && booking.on_chain_id !== null) {
       const callerAddress = await fetchStellarAddress(userId);
       if (callerAddress) {
@@ -1247,7 +1401,7 @@ export class BookingService {
       }
     }
 
-    return { success: true, data: updatedData as Booking };
+    return { success: true, data: transitionResult.data! };
   }
 
   // ── Dispute ────────────────────────────────────────────────────────────────
@@ -1284,17 +1438,6 @@ export class BookingService {
 
     const booking = bookingData as Booking;
 
-    // State-machine: only Confirmed bookings can be disputed
-    if (booking.status === 'Disputed') {
-      return { success: false, error: 'Booking is already in dispute' };
-    }
-    if (booking.status !== 'Confirmed') {
-      return {
-        success: false,
-        error: `Cannot dispute a booking in '${booking.status}' status. Only Confirmed bookings can be disputed.`,
-      };
-    }
-
     // Authorisation: only the tenant may raise a dispute
     if (booking.tenant_id && booking.tenant_id !== userId) {
       return { success: false, error: 'Forbidden: only the tenant can open a dispute' };
@@ -1304,11 +1447,7 @@ export class BookingService {
     if (booking.on_chain_id !== undefined && booking.on_chain_id !== null) {
       const callerAddress = await fetchStellarAddress(userId);
       if (callerAddress) {
-        loggingService.logBlockchainOperation('disputeBookingOnChain', {
-          bookingId,
-          userId,
-        });
-
+        loggingService.logBlockchainOperation('disputeBookingOnChain', { bookingId, userId });
         try {
           const { disputeBookingOnChain } = await import('@/blockchain/bookingContract.js');
           await disputeBookingOnChain(callerAddress, BigInt(booking.on_chain_id));
@@ -1324,68 +1463,49 @@ export class BookingService {
       }
     }
 
-    // Update DB status (+ persist dispute reason in a metadata column if available)
-    const updatePayload: Record<string, unknown> = { status: 'Disputed' };
-    if (reason) {
-      updatePayload['dispute_reason'] = reason;
-    }
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      booking.status ?? 'Confirmed',
+      'Disputed',
+      userId,
+      reason,
+      reason ? { dispute_reason: reason } : undefined,
+    );
+    if (!transitionResult.success) return transitionResult;
 
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update(updatePayload)
-      .eq('id', bookingId)
-      .select()
-      .single();
-
-    if (updateError) {
-      // Fallback: try without dispute_reason in case column doesn't exist yet
-      if (reason) {
-        const { data: fallback, error: fallbackError } = await supabase
-          .from('bookings')
-          .update({ status: 'Disputed' })
-          .eq('id', bookingId)
-          .select()
-          .single();
-
-        if (fallbackError) {
-          return { success: false, error: fallbackError.message };
-        }
-
-        if (booking.tenant_id) {
-          createNotification(booking.tenant_id, 'booking_disputed', { booking_id: bookingId }).catch(
-            () => {},
-          );
-        }
-
-        return { success: true, data: fallback as Booking };
-      }
-
-      return { success: false, error: updateError.message };
-    }
-
-    // Notify tenant & property owner
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'booking_disputed', { booking_id: bookingId }).catch(
         () => {},
       );
     }
 
-    return { success: true, data: updatedData as Booking };
+    return { success: true, data: transitionResult.data! };
   }
 
   // ── Update / Delete ────────────────────────────────────────────────────────
 
   /**
-   * Update mutable fields of an existing booking.
+   * Update mutable fields of an existing booking. Admin only, and audited.
    *
    * @param id - UUID of the booking
    * @param payload - Partial booking fields to update
+   * @param actor - Authenticated caller; checked against the booking authorization matrix
    * @returns ServiceResponse with the updated booking
    * @throws Does not throw; errors are returned in the ServiceResponse
    */
-  async updateBooking(id: string, payload: Partial<Booking>): Promise<ServiceResponse<Booking>> {
+  async updateBooking(
+    id: string,
+    payload: Partial<Booking>,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<Booking>> {
     if (!id) {
       return { success: false, error: 'Booking ID is required' };
+    }
+
+    const decision = await bookingAuthorizationService.authorize('update', id, actor);
+    if (!decision.allowed) {
+      await this.auditBookingChange('booking.modify', id, actor, false, decision.reason);
+      return { success: false, error: decision.reason, statusCode: decision.status };
     }
 
     if (Object.keys(payload).length === 0) {
@@ -1400,30 +1520,101 @@ export class BookingService {
       .single();
 
     if (error) {
+      await this.auditBookingChange('booking.modify', id, actor, false, 'database update failed');
       return { success: false, error: error.message };
     }
 
+    await this.auditBookingChange('booking.modify', id, actor, true);
     return { success: true, data: data as Booking };
   }
 
   /**
-   * Permanently delete a booking record.
+   * Permanently delete a booking record. Admin only, and audited.
    *
    * @param id - UUID of the booking to delete
+   * @param actor - Authenticated caller; checked against the booking authorization matrix
    * @returns ServiceResponse with no data on success
    */
-  async deleteBooking(id: string): Promise<ServiceResponse<void>> {
+  async deleteBooking(id: string, actor: BookingActor): Promise<ServiceResponse<void>> {
     if (!id) {
       return { success: false, error: 'Booking ID is required' };
+    }
+
+    const decision = await bookingAuthorizationService.authorize('delete', id, actor);
+    if (!decision.allowed) {
+      await this.auditBookingChange('booking.delete', id, actor, false, decision.reason);
+      return { success: false, error: decision.reason, statusCode: decision.status };
     }
 
     const { error } = await supabase.from('bookings').delete().eq('id', id);
 
     if (error) {
+      await this.auditBookingChange('booking.delete', id, actor, false, 'database delete failed');
       return { success: false, error: error.message };
     }
 
+    await this.auditBookingChange('booking.delete', id, actor, true);
     return { success: true };
+  }
+
+  /**
+   * Fetch a booking on behalf of an authenticated caller. Non-participants
+   * without a read role receive 404.
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor - Authenticated caller
+   */
+  async getBookingForActor(bookingId: string, actor: BookingActor): Promise<ServiceResponse<Booking>> {
+    const decision = await bookingAuthorizationService.authorize('read', bookingId, actor);
+    if (!decision.allowed) {
+      return { success: false, error: decision.reason, statusCode: decision.status };
+    }
+
+    return this.getBookingById(bookingId);
+  }
+
+  /**
+   * Fetch a booking's status history on behalf of an authenticated caller.
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor - Authenticated caller
+   */
+  async getBookingStatusHistoryForActor(
+    bookingId: string,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<BookingStatusHistory[]>> {
+    const decision = await bookingAuthorizationService.authorize(
+      'read_status_history',
+      bookingId,
+      actor,
+    );
+    if (!decision.allowed) {
+      return { success: false, error: decision.reason, statusCode: decision.status };
+    }
+
+    return this.getBookingStatusHistory(bookingId);
+  }
+
+  /**
+   * Record a booking change or a denied attempt. Never throws; the audit logger
+   * is best-effort. Error text is limited to our own reasons, not database messages.
+   */
+  private async auditBookingChange(
+    action: 'booking.modify' | 'booking.delete',
+    bookingId: string,
+    actor: BookingActor,
+    success: boolean,
+    error?: string,
+  ): Promise<void> {
+    await auditLogger.log({
+      actorId: actor.id,
+      action,
+      resourceType: 'booking',
+      resourceId: bookingId,
+      success,
+      error,
+      meta: { actor_role: actor.role ?? null },
+    });
   }
 
   // ── Dispute ────────────────────────────────────────────────────────────────
@@ -1470,35 +1661,20 @@ export class BookingService {
       return { success: false, error: 'Only the tenant or host may raise a dispute' };
     }
 
-    // Check booking status
-    if (booking.status === 'Cancelled') {
-      return { success: false, error: 'Cannot dispute a cancelled booking' };
-    }
-
-    if (booking.status === 'Completed') {
-      return { success: false, error: 'Cannot dispute a completed booking' };
-    }
-
     if ((booking as unknown as { dispute_status?: string }).dispute_status === 'raised') {
       return { success: false, error: 'A dispute has already been raised for this booking' };
     }
 
-    // Update booking status to Disputed and dispute_status to raised
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update({
-        status: 'Disputed',
-        dispute_status: 'raised',
-      })
-      .eq('id', bookingId)
-      .select()
-      .single();
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      booking.status ?? 'Confirmed',
+      'Disputed',
+      userId,
+      reason,
+      { dispute_status: 'raised' },
+    );
+    if (!transitionResult.success) return transitionResult;
 
-    if (updateError) {
-      return { success: false, error: updateError.message };
-    }
-
-    // Notify both parties
     const otherPartyId = booking.tenant_id === userId ? hostId : booking.tenant_id;
 
     if (booking.tenant_id) {
@@ -1517,13 +1693,9 @@ export class BookingService {
       }).catch(() => {});
     }
 
-    loggingService.logBlockchainOperation('raiseDispute', {
-      bookingId,
-      userId,
-      reason,
-    });
+    loggingService.logBlockchainOperation('raiseDispute', { bookingId, userId, reason });
 
-    return { success: true, data: updatedData as Booking };
+    return { success: true, data: transitionResult.data! };
   }
 
   /**
@@ -1604,26 +1776,23 @@ export class BookingService {
       }
     }
 
-    // Update booking
-    const { data: updatedData, error: updateError } = await supabase
-      .from('bookings')
-      .update({
-        status: resolution === 'release_to_host' ? 'Completed' : 'Cancelled',
-        dispute_status: 'resolved',
-      })
-      .eq('id', bookingId)
-      .select()
-      .single();
+    const resolvedStatus = resolution === 'release_to_host' ? 'Completed' : 'Cancelled';
+    const resolutionMessage =
+      resolution === 'release_to_host'
+        ? 'Dispute resolved in favor of host'
+        : 'Dispute resolved in favor of tenant';
 
-    if (updateError) {
-      return { success: false, error: updateError.message };
-    }
+    const transitionResult = await this.transitionStatus(
+      bookingId,
+      'Disputed',
+      resolvedStatus,
+      userId,
+      adminNotes ?? resolutionMessage,
+      { dispute_status: 'resolved' },
+    );
+    if (!transitionResult.success) return transitionResult;
 
-    // Notify both parties
     const hostId = booking.properties.owner_id;
-    const resolutionMessage = resolution === 'release_to_host' 
-      ? 'Dispute resolved in favor of host' 
-      : 'Dispute resolved in favor of tenant';
 
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'system_alert', {
@@ -1639,13 +1808,9 @@ export class BookingService {
       }).catch(() => {});
     }
 
-    loggingService.logBlockchainOperation('resolveDispute', {
-      bookingId,
-      userId,
-      resolution,
-    });
+    loggingService.logBlockchainOperation('resolveDispute', { bookingId, userId, resolution });
 
-    return { success: true, data: updatedData as Booking };
+    return { success: true, data: transitionResult.data! };
   }
 
   // ── Modification Request ────────────────────────────────────────────────────
@@ -1669,6 +1834,7 @@ export class BookingService {
     requestedStart: string,
     requestedEnd: string,
     reason?: string,
+    guestCount?: number,
   ): Promise<ServiceResponse<BookingModification>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
@@ -1691,7 +1857,7 @@ export class BookingService {
 
     const { data: bookingData, error: fetchError } = await supabase
       .from('bookings')
-      .select('*, properties!inner(owner_id, check_in_time, check_out_time, min_nights, max_nights)')
+      .select('*, properties!inner(owner_id, check_in_time, check_out_time, min_nights, max_nights, max_guests)')
       .eq('id', bookingId)
       .single();
 
@@ -1706,6 +1872,7 @@ export class BookingService {
         check_out_time?: string;
         min_nights?: number;
         max_nights?: number | null;
+        max_guests?: number | null;
       };
     };
 
@@ -1744,6 +1911,20 @@ export class BookingService {
       };
     }
 
+    // Guest-count validation (only when the caller requests an occupancy change)
+    if (guestCount !== undefined && guestCount !== null) {
+      if (!Number.isFinite(guestCount) || !Number.isInteger(guestCount) || guestCount < 1) {
+        return { success: false, error: 'guest_count must be a positive integer' };
+      }
+      const maxGuests = booking.properties?.max_guests;
+      if (maxGuests !== undefined && maxGuests !== null && guestCount > maxGuests) {
+        return {
+          success: false,
+          error: `Guest count (${guestCount}) exceeds property capacity (${maxGuests})`,
+        };
+      }
+    }
+
     if (booking.properties?.check_in_time && booking.properties?.check_out_time) {
       const { data: sameDayBooking } = await supabase
         .from('bookings')
@@ -1771,6 +1952,10 @@ export class BookingService {
       };
     }
 
+    // Capture an immutable snapshot of the booking before any changes are made.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { properties: _props, ...bookingSnapshot } = booking as Booking & { properties?: unknown };
+
     const { data: modification, error: insertError } = await supabase
       .from('booking_modifications')
       .insert({
@@ -1782,6 +1967,8 @@ export class BookingService {
         status: 'pending',
         requested_by: tenantId,
         reason: reason ?? null,
+        original_total_price: booking.total_price ?? null,
+        booking_snapshot: bookingSnapshot as Record<string, unknown>,
       })
       .select()
       .single();
@@ -1889,15 +2076,25 @@ export class BookingService {
     }
 
     const newTotalPrice = Math.round(priceResult.data!.total * 100) / 100;
+    const originalPrice = modification.original_total_price ?? booking.total_price ?? 0;
+    const priceDelta = Math.round((newTotalPrice - originalPrice) * 100) / 100;
+    const requiresAdditionalPayment = priceDelta > 0;
+
+    const bookingPatch: Record<string, unknown> = {
+      check_in:    modification.requested_start,
+      check_out:   modification.requested_end,
+      total_price: newTotalPrice,
+      updated_at:  new Date().toISOString(),
+    };
+
+    // Apply occupancy change if the modification included one
+    if (modification.requested_guest_count !== undefined && modification.requested_guest_count !== null) {
+      bookingPatch.guest_count = modification.requested_guest_count;
+    }
 
     const { data: updatedBooking, error: updateError } = await supabase
       .from('bookings')
-      .update({
-        check_in: modification.requested_start,
-        check_out: modification.requested_end,
-        total_price: newTotalPrice,
-        updated_at: new Date().toISOString(),
-      })
+      .update(bookingPatch)
       .eq('id', bookingId)
       .select()
       .single();
@@ -1906,9 +2103,16 @@ export class BookingService {
       return { success: false, error: updateError?.message ?? 'Failed to update booking dates' };
     }
 
+    // Persist repricing outcome in the modification record.
     await supabase
       .from('booking_modifications')
-      .update({ status: 'accepted', updated_at: new Date().toISOString() })
+      .update({
+        status: 'accepted',
+        new_total_price: newTotalPrice,
+        price_delta: priceDelta,
+        requires_additional_payment: requiresAdditionalPayment,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', modificationId);
 
     if (booking.tenant_id) {
@@ -1917,7 +2121,10 @@ export class BookingService {
         modification_id: modificationId,
         requested_start: modification.requested_start,
         requested_end: modification.requested_end,
-        total_price: newTotalPrice,
+        original_total_price: originalPrice,
+        new_total_price: newTotalPrice,
+        price_delta: priceDelta,
+        requires_additional_payment: requiresAdditionalPayment,
       }).catch(() => {});
     }
 

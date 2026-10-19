@@ -11,6 +11,7 @@ import {
   addEvidenceHandler,
   hidePropertyHandler,
   unhidePropertyHandler,
+  escalateReportHandler,
   submitAppealHandler,
   reviewAppealHandler,
   getReportImpactHandler,
@@ -37,6 +38,9 @@ router.patch(
 
 // PATCH /api/v1/reports/:id/assign — assign to moderator
 router.patch('/:id/assign', authenticate, requireRole('admin'), assignReportHandler);
+
+// PATCH /api/v1/reports/:id/escalate — hand a pending report to senior review
+router.patch('/:id/escalate', authenticate, requireRole('admin'), escalateReportHandler);
 
 // PATCH /api/v1/reports/:id/severity — set severity level
 router.patch('/:id/severity', authenticate, requireRole('admin'), setSeverityHandler);

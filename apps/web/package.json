@@ -13,6 +13,7 @@
     "e2e": "playwright test",
     "e2e:journey": "playwright test e2e/search-to-booking-journey.spec.ts",
     "e2e:chromium": "playwright test --project=chromium",
+    "playwright": "playwright",
     "docker:build": "docker build -t rentars-web .",
     "docker:run": "docker run --rm -p 3000:3000 --env-file .env.local rentars-web"
   },

@@ -1,11 +1,45 @@
+import { createHmac, timingSafeEqual } from 'crypto';
 import type { Request, Response } from 'express';
 import { BookingService } from '@/services/booking.service.js';
 import { getPropertyById } from '@/services/property.service.js';
-import { generateIcs } from '@/utils/ics.js';
+import { generateIcs, generateIcsFeed } from '@/utils/ics.js';
+import type { IcsEventInput } from '@/utils/ics.js';
+import { supabase } from '@/config/supabase.js';
+import { env } from '@/config/env.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 import type { BookingModification } from '@/services/booking.service.js';
-import { getRefundPreview, getRefundRequestByBooking } from '@/services/refund.service.js';
-import { hashRequestBody, lookup, store } from '@/services/idempotency.service.js';
+import type { BookingActor } from '@/services/bookingAuthorization.service.js';
+import { lookup, store, lockKey, completeKey, releaseKey, hashRequestBody } from '@/services/idempotency.service.js';
+import { fetchReceiptData, generateReceiptPdf } from '@/services/receipt.service.js';
+
+function calendarFeedSecret(): string {
+  return env.CALENDAR_FEED_SECRET ?? env.JWT_SECRET;
+}
+
+/**
+ * The authenticated caller, from the JWT populated by `authenticate`. Returns
+ * undefined when there is no caller, so handlers can answer 401.
+ */
+function bookingActor(req: Request): BookingActor | undefined {
+  const user = (req as Request & { user?: { id: string; role?: string } }).user;
+  return user?.id ? { id: user.id, role: user.role } : undefined;
+}
+
+function generateFeedToken(userId: string): string {
+  return createHmac('sha256', calendarFeedSecret()).update(userId).digest('hex');
+}
+
+function validateFeedToken(token: string, userId: string): boolean {
+  try {
+    const expected = generateFeedToken(userId);
+    const a = Buffer.from(expected, 'hex');
+    const b = Buffer.from(token, 'hex');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
 
 const bookingService = new BookingService();
 
@@ -51,10 +85,11 @@ export async function requestModification(req: Request, res: Response): Promise<
     return;
   }
 
-  const { requested_start, requested_end, reason } = req.body as {
+  const { requested_start, requested_end, reason, guest_count } = req.body as {
     requested_start: string;
     requested_end: string;
     reason?: string;
+    guest_count?: number;
   };
 
   const result = await bookingService.requestModification(
@@ -63,6 +98,7 @@ export async function requestModification(req: Request, res: Response): Promise<
     requested_start,
     requested_end,
     reason,
+    guest_count,
   );
 
   if (!result.success) {
@@ -133,22 +169,45 @@ export async function declineModification(req: Request, res: Response): Promise<
   res.json(result.data);
 }
 
+/**
+ * GET /api/v1/bookings/:id
+ *
+ * Returns the booking to its tenant, its host, or a role that may read any booking.
+ * Anyone else receives 404.
+ */
 export async function getBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.getBookingById(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getBookingForActor(req.params.id, actor);
 
   if (!result.success) {
-    res.status(404).json({ error: result.error });
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 
   res.json(result.data);
 }
 
+/**
+ * GET /api/v1/bookings/:id/status-history
+ *
+ * Same access rule as getBooking.
+ */
 export async function getBookingStatusHistory(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.getBookingStatusHistory(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getBookingStatusHistoryForActor(req.params.id, actor);
 
   if (!result.success) {
-    res.status(404).json({ error: result.error });
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 
@@ -172,66 +231,85 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       return;
     }
 
+    const trimmedKey = idempotencyKey.trim();
     const requestHash = hashRequestBody(req.body);
-    const existing = await lookup(userId, idempotencyKey.trim());
 
-    if (!existing.success) {
-      console.error('[idempotency] lookup error:', existing.error);
-      res.status(503).json({ error: 'Booking idempotency check is temporarily unavailable' });
-      return;
-    }
+    // Atomic claim: win the INSERT race or receive the existing record.
+    const lockResult = await lockKey(userId, trimmedKey, requestHash);
 
-    if (existing.data) {
-      const record = existing.data;
+    if (!lockResult.success) {
+      // DB error during lock — fail safe rather than blocking all bookings.
+      console.error('[idempotency] lock error:', lockResult.error);
+    } else if (lockResult.data) {
+      const lockData = lockResult.data;
 
-      if (record.request_hash !== requestHash) {
-        // Same key, different payload → 422 Unprocessable Entity
-        res.status(422).json({
-          error:
-            'Idempotency-Key has already been used with a different request payload. ' +
-            'Use a new key for a different booking request.',
-        });
+      if (!lockData.claimed) {
+        const record = (lockData as { claimed: false; existing: import('@/services/idempotency.service.js').IdempotencyRecord }).existing;
+
+        if (record.request_hash !== requestHash) {
+          // Same key, different payload → reject to prevent silent mutation.
+          res.status(422).json({
+            error:
+              'Idempotency-Key has already been used with a different request payload. ' +
+              'Use a new key for a different booking request.',
+          });
+          return;
+        }
+
+        if (record.status === 'processing') {
+          // Another request is still in flight with the same key.
+          res.status(409).json({
+            error:
+              'A request with this Idempotency-Key is already being processed. ' +
+              'Retry after a short delay.',
+          });
+          return;
+        }
+
+        // Completed record with matching hash → replay.
+        res
+          .status(record.status_code)
+          .set('Idempotent-Replayed', 'true')
+          .json(record.response_body);
         return;
       }
 
-      // Matching key and hash → replay the original response
-      res
-        .status(record.status_code)
-        .set('Idempotent-Replayed', 'true')
-        .json(record.response_body);
+      // We claimed the key — proceed and complete or release on failure.
+      const claimedId = (lockData as { claimed: true; id: string }).id;
+
+      const result = await bookingService.createBooking(req.body);
+
+      if (!result.success) {
+        // Release the processing lock so the caller can retry.
+        await releaseKey(claimedId);
+        const status = result.statusCode ?? (result.conflict ? 409 : 400);
+        res.status(status).json({ error: result.error, code: result.code, details: result.details });
+        return;
+      }
+
+      const responseBody = result.data as unknown as Record<string, unknown>;
+      const statusCode = 201;
+
+      const completeResult = await completeKey(claimedId, responseBody, statusCode);
+      if (!completeResult.success) {
+        console.error('[idempotency] complete error:', completeResult.error);
+      }
+
+      res.status(statusCode).json(responseBody);
       return;
     }
   }
 
-  // ── Normal booking creation ─────────────────────────────────────────────────
+  // ── Fallback: no idempotency key provided ───────────────────────────────────
   const result = await bookingService.createBooking(req.body);
 
   if (!result.success) {
-    const status = result.conflict ? 409 : 400;
-    res.status(status).json({ error: result.error });
+    const status = result.statusCode ?? (result.conflict ? 409 : 400);
+    res.status(status).json({ error: result.error, code: result.code, details: result.details });
     return;
   }
 
-  if (!result.data) {
-    console.error('[booking] Booking creation succeeded without returning a booking');
-    res.status(500).json({ error: 'Booking creation failed to return a result' });
-    return;
-  }
-
-  const responseBody: Record<string, unknown> = { ...result.data };
-  const statusCode = 201;
-
-  // ── Persist idempotency record ──────────────────────────────────────────────
-  if (idempotencyKey && typeof idempotencyKey === 'string' && userId) {
-    const requestHash = hashRequestBody(req.body);
-    const storeResult = await store(userId, idempotencyKey.trim(), requestHash, responseBody, statusCode);
-    if (!storeResult.success) {
-      // Non-fatal: log but still return the booking response
-      console.error('[idempotency] store error:', storeResult.error);
-    }
-  }
-
-  res.status(statusCode).json(responseBody);
+  res.status(201).json(result.data);
 }
 
 /**
@@ -347,22 +425,44 @@ export async function disputeBooking(req: Request, res: Response): Promise<void>
   res.json(result.data);
 }
 
+/**
+ * PATCH /api/v1/bookings/:id
+ *
+ * Admin only. Denied attempts are audited by the service.
+ */
 export async function updateBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.updateBooking(req.params.id, req.body);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.updateBooking(req.params.id, req.body, actor);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
   res.json(result.data);
 }
 
+/**
+ * DELETE /api/v1/bookings/:id
+ *
+ * Admin only. Denied attempts are audited by the service.
+ */
 export async function deleteBooking(req: Request, res: Response): Promise<void> {
-  const result = await bookingService.deleteBooking(req.params.id);
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.deleteBooking(req.params.id, actor);
 
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
 
@@ -386,20 +486,15 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
 
   const booking = bookingResult.data;
 
-  // Authorization: only the tenant may download their own calendar event
-  if (!authUser || authUser.id !== booking.tenant_id) {
-    res.status(403).json({ error: 'Forbidden' });
-    return;
-  }
-
   if (!booking.check_in || !booking.check_out) {
     res.status(422).json({ error: 'Booking is missing date information' });
     return;
   }
 
-  // Fetch property details for location and title
+  // Fetch property for location, title, and host ID check
   let propertyTitle = 'Rental Stay';
   let propertyLocation = '';
+  let hostOwnerId: string | undefined;
   if (booking.property_id) {
     const propResult = await getPropertyById(booking.property_id);
     if (propResult.success && propResult.data) {
@@ -407,9 +502,19 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
       propertyTitle = p.title ?? propertyTitle;
       const parts = [p.address, p.city, p.country].filter(Boolean);
       propertyLocation = parts.join(', ');
+      hostOwnerId = p.owner_id;
     }
   }
 
+  // Authorization: tenant or host may download
+  const isTenant = authUser?.id === booking.tenant_id;
+  const isHost = !!hostOwnerId && authUser?.id === hostOwnerId;
+  if (!isTenant && !isHost) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  const isCancelled = booking.status === 'Cancelled' || booking.status === 'Expired';
   const description = [
     `Booking ID: ${booking.id}`,
     `Guests: ${booking.guest_count ?? 1}`,
@@ -427,10 +532,104 @@ export async function getBookingCalendar(req: Request, res: Response): Promise<v
     dtStart: booking.check_in,
     dtEnd: booking.check_out,
     created: booking.created_at,
+    status: isCancelled ? 'CANCELLED' : 'CONFIRMED',
+    sequence: isCancelled ? 1 : 0,
   });
 
   res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="booking-${booking.id}.ics"`);
+  res.send(ics);
+}
+
+/**
+ * GET /api/v1/bookings/calendar-feed-token
+ *
+ * Returns an HMAC-signed token and a ready-to-subscribe calendar feed URL
+ * for the authenticated user. The URL is safe to share with calendar apps
+ * because the token prevents enumeration of other users' feeds.
+ */
+export async function getCalendarFeedToken(req: Request, res: Response): Promise<void> {
+  const authUser = (req as Request & { user?: { id: string } }).user;
+  if (!authUser) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const token = generateFeedToken(authUser.id);
+  const baseUrl = (req.headers['x-forwarded-proto'] ?? req.protocol) + '://' + req.headers.host;
+  const feedUrl = `${baseUrl}/api/v1/calendar/feed/${authUser.id}/${token}.ics`;
+
+  res.json({ token, feed_url: feedUrl });
+}
+
+/**
+ * GET /api/v1/calendar/feed/:userId/:token.ics  (public — no auth middleware)
+ *
+ * Validates the HMAC token, then returns a full iCalendar feed containing all
+ * bookings (tenant and host) for the given user. Cancelled and expired bookings
+ * are included with STATUS:CANCELLED so calendar clients remove them cleanly.
+ */
+export async function getCalendarFeed(req: Request, res: Response): Promise<void> {
+  const { userId, token } = req.params as { userId: string; token: string };
+
+  // Strip .ics suffix if present (Express won't strip it automatically)
+  const cleanToken = token.replace(/\.ics$/, '');
+
+  if (!validateFeedToken(cleanToken, userId)) {
+    res.status(403).json({ error: 'Invalid or expired calendar feed token' });
+    return;
+  }
+
+  // Fetch all bookings where the user is tenant
+  const { data: tenantBookings } = await supabase
+    .from('bookings')
+    .select('*, properties(title, address, city, country)')
+    .eq('tenant_id', userId)
+    .order('check_in', { ascending: true });
+
+  // Fetch all bookings for properties the user owns
+  const { data: hostBookings } = await supabase
+    .from('bookings')
+    .select('*, properties!inner(title, address, city, country, owner_id)')
+    .eq('properties.owner_id', userId)
+    .neq('tenant_id', userId)
+    .order('check_in', { ascending: true });
+
+  const allBookings = [
+    ...(tenantBookings ?? []),
+    ...(hostBookings ?? []),
+  ];
+
+  const events: IcsEventInput[] = allBookings
+    .filter((b) => b.check_in && b.check_out)
+    .map((b) => {
+      const prop = b.properties as { title?: string; address?: string; city?: string; country?: string } | null;
+      const title = prop?.title ?? 'Rental Stay';
+      const location = [prop?.address, prop?.city, prop?.country].filter(Boolean).join(', ');
+      const isCancelled = b.status === 'Cancelled' || b.status === 'Expired';
+      return {
+        uid: `booking-${b.id}@rentars.app`,
+        summary: `Stay at ${title}`,
+        description: [
+          `Booking ID: ${b.id}`,
+          `Guests: ${b.guest_count ?? 1}`,
+          `Total: ${b.total_price ?? ''} USDC`,
+          `Status: ${b.status ?? ''}`,
+        ].join('\\n'),
+        location,
+        dtStart: b.check_in as string,
+        dtEnd: b.check_out as string,
+        created: b.created_at as string | undefined,
+        status: isCancelled ? 'CANCELLED' : ('CONFIRMED' as const),
+        sequence: isCancelled ? 1 : 0,
+      };
+    });
+
+  const ics = generateIcsFeed(events);
+
+  res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="rentars-calendar.ics"`);
+  res.setHeader('Cache-Control', 'no-store');
   res.send(ics);
 }
 
@@ -487,18 +686,25 @@ export async function getBookingReceipt(req: Request, res: Response): Promise<vo
     return;
   }
 
-  let pdfBuffer: Buffer;
-  try {
-    pdfBuffer = generateReceiptPdf(receiptResult.data);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to generate PDF receipt' });
-    return;
+  let pdfBuffer: Buffer | undefined;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      pdfBuffer = generateReceiptPdf(receiptResult.data);
+      break;
+    } catch {
+      if (attempt === 2) {
+        res.status(500).json({ error: 'Failed to generate PDF receipt' });
+        return;
+      }
+    }
   }
 
+  // pdfBuffer is always set here — the loop returns early on the second failure
+  const buf = pdfBuffer!;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="receipt-${booking.id}.pdf"`);
-  res.setHeader('Content-Length', pdfBuffer.length);
-  res.send(pdfBuffer);
+  res.setHeader('Content-Length', buf.length);
+  res.send(buf);
 }
 
 /**

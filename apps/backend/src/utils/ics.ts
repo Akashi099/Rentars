@@ -1,8 +1,8 @@
 /**
  * Minimal RFC 5545-compliant iCalendar (.ics) generator.
  *
- * Produces a single VEVENT calendar file. No external dependencies — the
- * format is simple enough to build as a string with a few helpers.
+ * Produces single-event and multi-event calendar files. No external
+ * dependencies — the format is simple enough to build as a string.
  */
 
 export interface IcsEventInput {
@@ -16,11 +16,18 @@ export interface IcsEventInput {
   dtEnd: string;
   /** ISO-8601 date-time when the event was created */
   created?: string;
+  /**
+   * RFC 5545 STATUS value. CONFIRMED is the default when omitted.
+   * Set to CANCELLED for cancelled bookings so calendar clients remove the event.
+   */
+  status?: 'CONFIRMED' | 'CANCELLED' | 'TENTATIVE';
+  /**
+   * SEQUENCE number — increment on each modification so clients replace
+   * the old event rather than creating a duplicate. Defaults to 0.
+   */
+  sequence?: number;
 }
 
-/**
- * Format a Date to the iCalendar UTC date-time value: YYYYMMDDTHHmmssZ
- */
 function toIcsDateTime(iso: string): string {
   const d = new Date(iso);
   return (
@@ -35,12 +42,7 @@ function toIcsDateTime(iso: string): string {
   );
 }
 
-/**
- * Format an ISO date string that has no time component as an all-day
- * iCalendar DATE value: YYYYMMDD
- */
 function toIcsDate(iso: string): string {
-  // Handles both "YYYY-MM-DD" and full ISO strings
   const datePart = iso.split('T')[0];
   return datePart.replace(/-/g, '');
 }
@@ -51,7 +53,6 @@ function pad(n: number): string {
 
 /**
  * Fold long iCalendar lines at 75 octets (RFC 5545 §3.1).
- * Each continuation line starts with a single space.
  */
 function foldLine(line: string): string {
   if (line.length <= 75) return line;
@@ -77,52 +78,78 @@ function escapeText(s: string): string {
 }
 
 /**
- * Generate a full iCalendar string for a single event.
- *
- * The function uses DATE-only values when the input strings have no time
- * component, so the event shows as an all-day event in most calendar apps.
- * When a time component is present it uses UTC DATETIME values.
+ * Build VEVENT lines for a single event (without VCALENDAR wrapper).
  */
-export function generateIcs(event: IcsEventInput): string {
+function buildVEvent(event: IcsEventInput): string[] {
   const hasTime = (iso: string) => iso.includes('T');
 
   const dtStart = hasTime(event.dtStart)
     ? `DTSTART:${toIcsDateTime(event.dtStart)}`
     : `DTSTART;VALUE=DATE:${toIcsDate(event.dtStart)}`;
 
-  // For all-day check-out we use the day *after* check-out as DTEND so the
-  // whole stay is covered inclusively, matching how most calendars render it.
   const dtEnd = hasTime(event.dtEnd)
     ? `DTEND:${toIcsDateTime(event.dtEnd)}`
     : (() => {
         const d = new Date(event.dtEnd + 'T00:00:00Z');
         d.setUTCDate(d.getUTCDate() + 1);
-        const y = d.getUTCFullYear();
-        const m = pad(d.getUTCMonth() + 1);
-        const day = pad(d.getUTCDate());
-        return `DTEND;VALUE=DATE:${y}${m}${day}`;
+        return `DTEND;VALUE=DATE:${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
       })();
 
   const stamp = toIcsDateTime(event.created ?? new Date().toISOString());
+  const status = event.status ?? 'CONFIRMED';
+  const sequence = event.sequence ?? 0;
 
+  return [
+    'BEGIN:VEVENT',
+    foldLine(`UID:${escapeText(event.uid)}`),
+    `DTSTAMP:${stamp}`,
+    dtStart,
+    dtEnd,
+    `STATUS:${status}`,
+    `SEQUENCE:${sequence}`,
+    foldLine(`SUMMARY:${escapeText(event.summary)}`),
+    foldLine(`DESCRIPTION:${escapeText(event.description)}`),
+    foldLine(`LOCATION:${escapeText(event.location)}`),
+    'END:VEVENT',
+  ];
+}
+
+/**
+ * Generate a full iCalendar string for a single event.
+ */
+export function generateIcs(event: IcsEventInput): string {
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//Rentars//Rentars Booking//EN',
     'CALSCALE:GREGORIAN',
     'METHOD:PUBLISH',
-    'BEGIN:VEVENT',
-    foldLine(`UID:${escapeText(event.uid)}`),
-    `DTSTAMP:${stamp}`,
-    dtStart,
-    dtEnd,
-    foldLine(`SUMMARY:${escapeText(event.summary)}`),
-    foldLine(`DESCRIPTION:${escapeText(event.description)}`),
-    foldLine(`LOCATION:${escapeText(event.location)}`),
-    'END:VEVENT',
+    ...buildVEvent(event),
     'END:VCALENDAR',
   ];
+  return lines.join('\r\n') + '\r\n';
+}
 
-  // RFC 5545 mandates CRLF line endings
+/**
+ * Generate a full iCalendar string containing multiple events.
+ * Cancelled events are included with STATUS:CANCELLED so calendar clients
+ * remove them rather than leaving stale entries.
+ */
+export function generateIcsFeed(events: IcsEventInput[]): string {
+  const lines = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Rentars//Rentars Booking Feed//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'X-WR-CALNAME:Rentars Bookings',
+    'X-WR-CALDESC:Your Rentars booking calendar',
+  ];
+
+  for (const event of events) {
+    lines.push(...buildVEvent(event));
+  }
+
+  lines.push('END:VCALENDAR');
   return lines.join('\r\n') + '\r\n';
 }

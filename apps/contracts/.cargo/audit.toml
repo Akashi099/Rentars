@@ -1,0 +1,23 @@
+# cargo-audit configuration for the Rentars contracts workspace.
+# See docs/security-exceptions.md for the full exception process.
+#
+# To suppress a finding, add an entry to [[advisories.ignore]] with:
+#   id      — the RUSTSEC advisory ID (e.g. "RUSTSEC-2023-0001")
+#   reason  — why it is not exploitable in this deployment
+#   expires — max 90 days from today; set to upstream patch ETA if known
+#   issue   — GitHub issue number with security-exception label (e.g. "#999")
+#
+# Example:
+# [[advisories.ignore]]
+# id      = "RUSTSEC-2023-0001"
+# reason  = "Affected API surface is not used in any contract — see #999"
+# expires = "2027-03-01"
+
+[advisories]
+# Fail on any unignored advisory — no blanket severity filter.
+# Individual suppression via [[advisories.ignore]] above requires an issue link.
+ignore = []
+
+[output]
+# Emit machine-readable JSON so CI can parse counts.
+format = "json"

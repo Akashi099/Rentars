@@ -50,6 +50,8 @@ import {
   // Audit logs
   getAuditLogsHandler,
 } from '@/controllers/admin.controller.js';
+import emailAdminRoutes from './emailAdmin.routes.js';
+import notificationMonitorRoutes from './notificationMonitor.routes.js';
 
 const router = Router();
 
@@ -119,11 +121,14 @@ router.get('/audit-logs', requireScope('admin:audit:read'), getAuditLogsHandler)
 import { approveRefundHandler } from '@/controllers/admin.controller.js';
 router.post('/refunds/approve', requireScope('admin:refunds:approve'), approveRefundHandler);
 
-// ── Ledger adjustment (finance) ───────────────────────────────────────────────
-// #770 — Posts an auditable correction entry to the host earnings ledger.
-// Scope: admin:ledger:adjust → admin, finance (HIGH-RISK — dual approval required)
-// Body: { direction: 'credit'|'debit', amount: number, adminNote: string, bookingId?: string }
-import { postLedgerAdjustment } from '@/routes/host.routes.js';
-router.post('/host/:hostId/ledger/adjustment', requireScope('admin:ledger:adjust'), postLedgerAdjustment);
+// ── Email delivery tracking ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:email:read
+// Mounted at /api/v1/admin/email/*
+router.use('/email', emailAdminRoutes);
+
+// ── Notification monitoring ───────────────────────────────────────────────────
+// Scoped sub-router — all routes inside require admin:notifications:read
+// Mounted at /api/v1/admin/notifications/*
+router.use('/notifications', notificationMonitorRoutes);
 
 export default router;

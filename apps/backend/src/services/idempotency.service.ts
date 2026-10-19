@@ -46,6 +46,8 @@ export interface IdempotencyRecord {
   /** Stored as JSONB in the DB, returned as a plain JS object here. */
   response_body: Record<string, unknown>;
   status_code: number;
+  /** 'processing' = request in flight; 'completed' = safe to replay. */
+  status: 'processing' | 'completed';
   created_at: string;
 }
 
@@ -94,6 +96,90 @@ export async function lookup(
 }
 
 /**
+ * Atomically claim an idempotency key with status='processing'.
+ *
+ * Returns `{ claimed: true, id }` when this call wins the INSERT race and may
+ * proceed with the real request.  Returns `{ claimed: false, existing }` when a
+ * record already exists (either in-flight or completed) so the caller can
+ * replay or reject.
+ *
+ * @param userId      - Authenticated user ID (scopes the key).
+ * @param key         - Value of the `Idempotency-Key` header.
+ * @param requestHash - SHA-256 hex digest of the canonical request body.
+ */
+export async function lockKey(
+  userId: string,
+  key: string,
+  requestHash: string,
+): Promise<ServiceResponse<{ claimed: true; id: string } | { claimed: false; existing: IdempotencyRecord }>> {
+  const cutoff = new Date(Date.now() - IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000).toISOString();
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('idempotency_keys')
+    .insert({
+      key,
+      user_id: userId,
+      request_hash: requestHash,
+      response_body: {},
+      status_code: 0,
+      status: 'processing',
+    })
+    .select('id')
+    .single();
+
+  if (!insertError && inserted) {
+    return { success: true, data: { claimed: true, id: (inserted as { id: string }).id } };
+  }
+
+  // Unique constraint fired — fetch the existing record.
+  const { data: existing, error: fetchError } = await supabase
+    .from('idempotency_keys')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('key', key)
+    .gte('created_at', cutoff)
+    .maybeSingle();
+
+  if (fetchError || !existing) {
+    return { success: false, error: `Idempotency lock failed: ${fetchError?.message ?? 'record not found'}` };
+  }
+
+  return { success: true, data: { claimed: false, existing: existing as IdempotencyRecord } };
+}
+
+/**
+ * Complete a previously claimed idempotency record by storing the response.
+ *
+ * @param id          - UUID of the record returned by lockKey.
+ * @param responseBody - The JSON-serialisable response body that was sent.
+ * @param statusCode  - The HTTP status code that was sent (e.g. 201).
+ */
+export async function completeKey(
+  id: string,
+  responseBody: Record<string, unknown>,
+  statusCode: number,
+): Promise<ServiceResponse<void>> {
+  const { error } = await supabase
+    .from('idempotency_keys')
+    .update({ status: 'completed', response_body: responseBody, status_code: statusCode })
+    .eq('id', id);
+
+  if (error) {
+    return { success: false, error: `Idempotency complete failed: ${error.message}` };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Release a processing record when the underlying request fails, so the key
+ * can be retried with the same payload.
+ */
+export async function releaseKey(id: string): Promise<void> {
+  await supabase.from('idempotency_keys').delete().eq('id', id).eq('status', 'processing');
+}
+
+/**
  * Persist an idempotency record after a successful (or deterministic) response.
  *
  * An `upsert` with `ignoreDuplicates: false` ensures that if two concurrent
@@ -122,6 +208,7 @@ export async function store(
       request_hash: requestHash,
       response_body: responseBody,
       status_code: statusCode,
+      status: 'completed',
     })
     .select()
     .single();

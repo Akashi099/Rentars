@@ -2,7 +2,10 @@ import { supabase } from '@/config/supabase.js';
 import { uploadImage, deleteImage as deleteStorageImage } from '@/config/supabase-storage.js';
 import { env } from '@/config/env.js';
 import * as cache from './cache.service.js';
+import { ImageValidationError } from './imageValidation.js';
 import type { ServiceResponse } from './index.js';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface PropertyImage {
   id: string;
@@ -27,6 +30,9 @@ export async function addPropertyImage(
   ownerId: string,
   file: Express.Multer.File,
 ): Promise<ServiceResponse<PropertyImage>> {
+  // The property id becomes part of the storage path, so it must be a plain UUID.
+  if (!UUID_PATTERN.test(propertyId)) return { success: false, error: 'Property not found' };
+
   // Verify ownership
   const { data: property, error: propError } = await supabase
     .from('properties')
@@ -55,8 +61,16 @@ export async function addPropertyImage(
     };
   }
 
-  // Upload main image and thumbnail variant to storage
-  const { url, thumbnailUrl } = await uploadImage(propertyId, file);
+  // Upload main image and thumbnail variant to storage. Content that is not a
+  // valid image is rejected here, before anything reaches storage.
+  let url: string;
+  let thumbnailUrl: string;
+  try {
+    ({ url, thumbnailUrl } = await uploadImage(propertyId, file));
+  } catch (err) {
+    if (err instanceof ImageValidationError) return { success: false, error: err.message };
+    throw err;
+  }
 
   const displayOrder = currentCount + 1;
   const isPrimary = displayOrder === 1;
@@ -221,7 +235,17 @@ export async function setPrimaryImage(
     return { success: false, error: 'Forbidden: you do not own this property' };
   }
 
-  // Clear existing primary
+  // Confirm the target belongs to this property before touching the current primary,
+  // so a bad id cannot leave the property with no primary image.
+  const { data: target, error: targetError } = await supabase
+    .from('property_images')
+    .select('id')
+    .eq('id', imageId)
+    .eq('property_id', propertyId)
+    .single();
+
+  if (targetError || !target) return { success: false, error: 'Image not found' };
+
   await supabase
     .from('property_images')
     .update({ is_primary: false })

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ListingFormData, ListingStep } from './types';
 import { formStyles } from './styles';
 import BasicInfoStep from './steps/BasicInfoStep';
@@ -11,6 +11,7 @@ import PricingStep from './steps/PricingStep';
 import HouseRulesStep from './steps/HouseRulesStep';
 import ReviewStep from './steps/ReviewStep';
 import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
+import { useFormErrorFocus } from '@/hooks/useFormErrorFocus';
 
 const STEPS: ListingStep[] = [
   'basic',
@@ -50,6 +51,8 @@ export default function ListingForm() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadsInProgress, setUploadsInProgress] = useState(false);
   const [termsAcceptance, setTermsAcceptance] = useState<TermsAcceptance | null>(null);
+  const submitErrorRef = useRef<HTMLParagraphElement | null>(null);
+  const { focusFirstError } = useFormErrorFocus();
 
   const currentStepIndex = STEPS.indexOf(currentStep);
 
@@ -68,6 +71,8 @@ export default function ListingForm() {
   const handleSubmit = async () => {
     if (!termsAcceptance) {
       setErrors({ submit: 'You must accept the platform terms before publishing your listing.' });
+      // Focus the error message so screen readers announce it immediately
+      setTimeout(() => submitErrorRef.current?.focus(), 50);
       return;
     }
 
@@ -87,7 +92,6 @@ export default function ListingForm() {
           formDataToSend.append(key, String(value));
         }
       });
-      // Record terms acceptance alongside the listing
       formDataToSend.append('terms_version', termsAcceptance.termsVersion);
       formDataToSend.append('terms_accepted_at', termsAcceptance.termsAcceptedAt);
 
@@ -101,7 +105,6 @@ export default function ListingForm() {
 
       const property = await response.json();
 
-      // Trigger on-chain registration via Freighter
       if (window.freighter) {
         await window.freighter.signTransaction({
           xdr: property.xdr,
@@ -112,30 +115,56 @@ export default function ListingForm() {
       alert('Property listed successfully!');
       window.location.href = '/dashboard';
     } catch (error) {
-      setErrors({ submit: error instanceof Error ? error.message : 'Failed to submit' });
+      const message = error instanceof Error ? error.message : 'Failed to submit';
+      setErrors({ submit: message });
+      setTimeout(() => submitErrorRef.current?.focus(), 50);
     }
   };
 
   return (
     <div className={formStyles.container}>
-      {/* Step Indicator */}
-      <div className={formStyles.stepIndicator}>
-        {STEPS.map((step) => (
-          <div
+      {/*
+       * Step indicator — each dot has a visually-hidden label so screen-reader
+       * users know their position in the multi-step form.
+       */}
+      <nav aria-label="Form steps" className={formStyles.stepIndicator}>
+        {STEPS.map((step, index) => (
+          <span
             key={step}
-            className={`${formStyles.step} ${
-              STEPS.indexOf(step) <= currentStepIndex
-                ? formStyles.stepActive
-                : formStyles.stepInactive
+            role="img"
+            aria-label={`Step ${index + 1} of ${STEPS.length}: ${STEP_LABELS[step]}${
+              step === currentStep
+                ? ' (current)'
+                : index < currentStepIndex
+                  ? ' (completed)'
+                  : ''
             }`}
-            title={STEP_LABELS[step]}
+            aria-current={step === currentStep ? 'step' : undefined}
+            className={`${formStyles.step} ${
+              index <= currentStepIndex ? formStyles.stepActive : formStyles.stepInactive
+            }`}
           />
         ))}
-      </div>
+      </nav>
 
-      {/* Current Step */}
       <div className={formStyles.section}>
-        <h2 className={formStyles.heading}>{STEP_LABELS[currentStep]}</h2>
+        <h2 className={formStyles.heading} id="listing-step-heading">
+          {`Step ${currentStepIndex + 1} of ${STEPS.length}: ${STEP_LABELS[currentStep]}`}
+        </h2>
+
+        {/* Submit / server error — focusable so screen readers are notified */}
+        {errors.submit && (
+          <p
+            ref={submitErrorRef}
+            id="listing-submit-error"
+            role="alert"
+            aria-live="assertive"
+            tabIndex={-1}
+            className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700 focus:outline-none focus:ring-2 focus:ring-red-500"
+          >
+            {errors.submit}
+          </p>
+        )}
 
         {currentStep === 'basic' && (
           <BasicInfoStep formData={formData} setFormData={setFormData} errors={errors} />
@@ -164,7 +193,6 @@ export default function ListingForm() {
           <ReviewStep formData={formData} errors={errors} />
         )}
 
-        {/* Terms — shown on final review step only */}
         {currentStep === 'review' && (
           <div className="mt-6">
             <TermsDisclosure
@@ -175,39 +203,49 @@ export default function ListingForm() {
           </div>
         )}
 
-        {/* Navigation */}
+        {/* Navigation — type="button" prevents accidental form submission */}
         <div className="flex gap-4 mt-8">
           <button
+            type="button"
             onClick={handlePrevious}
             disabled={currentStepIndex === 0}
+            aria-label={
+              currentStepIndex > 0
+                ? `Go back to ${STEP_LABELS[STEPS[currentStepIndex - 1]]}`
+                : 'Already on first step'
+            }
             className={`${formStyles.button} ${formStyles.buttonSecondary} disabled:opacity-50`}
           >
             Previous
           </button>
+
           {currentStepIndex < STEPS.length - 1 ? (
             <button
+              type="button"
               onClick={handleNext}
               disabled={currentStep === 'photos' && uploadsInProgress}
+              aria-label={`Continue to ${STEP_LABELS[STEPS[currentStepIndex + 1]]}`}
+              aria-busy={currentStep === 'photos' && uploadsInProgress}
               className={`${formStyles.button} ${formStyles.buttonPrimary} ${
                 currentStep === 'photos' && uploadsInProgress ? 'opacity-50 cursor-not-allowed' : ''
               }`}
             >
-              Next
+              {currentStep === 'photos' && uploadsInProgress ? 'Uploading…' : 'Next'}
             </button>
           ) : (
             <button
+              type="button"
               onClick={handleSubmit}
-              disabled={currentStep === 'review' && !termsAcceptance}
+              disabled={!termsAcceptance}
+              aria-disabled={!termsAcceptance}
               className={`${formStyles.button} ${formStyles.buttonPrimary} ${
-                currentStep === 'review' && !termsAcceptance ? 'opacity-50 cursor-not-allowed' : ''
+                !termsAcceptance ? 'opacity-50 cursor-not-allowed' : ''
               }`}
             >
               Submit Listing
             </button>
           )}
         </div>
-
-        {errors.submit && <p className={formStyles.error}>{errors.submit}</p>}
       </div>
     </div>
   );

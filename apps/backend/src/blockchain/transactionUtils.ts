@@ -82,12 +82,12 @@ export function signTransaction(tx: Transaction, keypair: Keypair): Transaction 
 }
 
 /**
- * Build, prepare (simulate + fill auth entries), and sign using the server admin keypair.
+ * Build, simulate (preflight), prepare (fill auth entries), and sign using the server admin keypair.
+ *
+ * The simulation is run before signing so that obviously invalid operations are
+ * rejected before a signature is produced.
  */
-export async function buildPrepareAndSign(
-  server: rpc.Server,
-  operations: xdr.Operation[],
-): Promise<Transaction> {
+export async function buildPrepareAndSign(server: rpc.Server, operations: xdr.Operation[]): Promise<Transaction> {
   if (!STELLAR_ADMIN_SECRET) {
     throw new BlockchainError(
       'STELLAR_ADMIN_SECRET is not configured',
@@ -97,6 +97,10 @@ export async function buildPrepareAndSign(
 
   const adminKeypair = Keypair.fromSecret(STELLAR_ADMIN_SECRET);
   const tx = await buildTransaction(operations, adminKeypair.publicKey());
+
+  // Preflight: simulate and surface any contract or transaction errors before signing.
+  await simulateOrThrow(server, tx);
+
   const prepared = await server.prepareTransaction(tx);
   (prepared as Transaction).sign(adminKeypair);
   return prepared as Transaction;
@@ -146,15 +150,15 @@ export interface TransactionStatusResult {
  * Returns the transaction status and response if confirmed.
  *
  * @param server - Soroban RPC server instance
- * @param txHash - Transaction hash to poll
+ * @param tyHash - Transaction hash to poll
  * @returns Transaction status and response (if confirmed)
  */
 export async function getTransactionStatus(
   server: rpc.Server,
-  txHash: string,
+  tyHash: string,
 ): Promise<TransactionStatusResult> {
   try {
-    const response = await server.getTransaction(txHash);
+    const response = await server.getTransaction(tyHash);
 
     if (response.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
       return { status: 'pending' };
@@ -170,8 +174,18 @@ export async function getTransactionStatus(
 
     return { status: 'pending' };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[transaction-status] Failed to get status for ${txHash}: ${message}`);
-    return { status: 'not_found', error: message };
+    console.error(`[transaction-status] Failed to get status for ${tyHash}: ${(err as Error).message}`);
+    return { status: 'failed' };
   }
+}
+
+/**
+ * Preflight a transaction and return the simulation result (fee estimate, events, auth).
+ * Throws ContractError/TransactionError on failure so callers can reject signing.
+ */
+export async function preflightTransaction(
+  server: rpc.Server,
+  tx: Transaction,
+): Promise<SimulationResult> {
+  return simulateOrThrow(server, tx);
 }

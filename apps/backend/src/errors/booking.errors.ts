@@ -8,6 +8,7 @@ export enum BookingErrorCode {
   BOOKING_NOT_FOUND = 'BOOKING_NOT_FOUND',
   UNAUTHORIZED = 'UNAUTHORIZED',
   INVALID_STATUS = 'INVALID_STATUS',
+  INVALID_TRANSITION = 'INVALID_TRANSITION',
 }
 
 export class BookingError extends Error {

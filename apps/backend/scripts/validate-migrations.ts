@@ -15,6 +15,11 @@
  * Usage:
  *   bun run apps/backend/scripts/validate-migrations.ts
  *   bun run apps/backend/scripts/validate-migrations.ts --dir path/to/migrations
+ *   bun run apps/backend/scripts/validate-migrations.ts --dry-run
+ *
+ * Flags:
+ *   --dry-run   Report all findings but always exit 0 (useful for local triage
+ *               without blocking CI).
  */
 
 import * as fs from 'node:fs';
@@ -28,6 +33,8 @@ const argDir = (() => {
   const idx = process.argv.indexOf('--dir');
   return idx !== -1 ? process.argv[idx + 1] : undefined;
 })();
+
+const DRY_RUN = process.argv.includes('--dry-run');
 
 const MIGRATIONS_DIR =
   argDir ??
@@ -130,6 +137,10 @@ function printReport(
 ): boolean {
   let hasErrors = false;
 
+  if (DRY_RUN) {
+    console.log('\n[DRY RUN] Validation results will be reported but exit code will be 0.\n');
+  }
+
   console.log(`\n📂 Migration directory: ${dir}`);
   console.log(`   ${files.length} SQL file(s) found\n`);
 
@@ -172,6 +183,8 @@ function printReport(
 
   if (!hasErrors) {
     console.log('✅ All migration filenames are valid (unique, monotonically increasing).\n');
+  } else if (DRY_RUN) {
+    console.log('⚠️  Issues found above. Exiting 0 because --dry-run was passed.\n');
   }
 
   return hasErrors;
@@ -193,7 +206,7 @@ function main(): void {
   const result = validateMigrations(files);
   const hasErrors = printReport(MIGRATIONS_DIR, files, { ...result, unparseable });
 
-  process.exit(hasErrors ? 1 : 0);
+  process.exit(hasErrors && !DRY_RUN ? 1 : 0);
 }
 
 if (import.meta.main) {

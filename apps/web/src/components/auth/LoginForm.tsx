@@ -7,16 +7,21 @@ import { useState, useCallback } from 'react';
 import { Mail, Lock, Loader } from 'lucide-react';
 import { HCaptcha } from './HCaptcha';
 import { useTranslations } from '@/lib/i18n/useTranslations';
+import { FormInput, FormErrorSummary } from '@/components/ui/form-field';
+import { useFormErrorFocus } from '@/hooks/useFormErrorFocus';
 
 interface LoginFormProps {
   onSubmit: (data: LoginInput & { captchaToken: string }) => Promise<void>;
+  /** Server-returned error (e.g. invalid credentials). */
+  serverError?: string | null;
 }
 
-export function LoginForm({ onSubmit }: LoginFormProps) {
+export function LoginForm({ onSubmit, serverError }: LoginFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [captchaToken, setCaptchaToken] = useState<string>('');
   const [captchaError, setCaptchaError] = useState<string>('');
   const t = useTranslations('auth');
+  const { summaryRef, focusFirstError } = useFormErrorFocus();
 
   const captchaEnabled =
     process.env.NEXT_PUBLIC_HCAPTCHA_ENABLED !== 'false' &&
@@ -39,9 +44,13 @@ export function LoginForm({ onSubmit }: LoginFormProps) {
     setCaptchaToken('');
   }, []);
 
+  /** Called by react-hook-form when client validation fails. */
+  const onInvalid = () => focusFirstError('login-error-summary');
+
   const onSubmitHandler = async (data: LoginInput) => {
     if (captchaEnabled && !captchaToken) {
       setCaptchaError(t('captchaRequired'));
+      focusFirstError('login-error-summary');
       return;
     }
 
@@ -53,77 +62,80 @@ export function LoginForm({ onSubmit }: LoginFormProps) {
     }
   };
 
+  // Build field-error list for the summary
+  const fieldErrors = [
+    errors.email && { fieldId: 'login-email', message: errors.email.message ?? 'Invalid email' },
+    errors.password && { fieldId: 'login-password', message: errors.password.message ?? 'Invalid password' },
+    captchaError && { fieldId: 'login-captcha', message: captchaError },
+  ].filter(Boolean) as { fieldId: string; message: string }[];
+
+  const hasFieldErrors = fieldErrors.length > 0;
+
   return (
-    <form onSubmit={handleSubmit(onSubmitHandler)} className="space-y-4" noValidate>
+    <form
+      onSubmit={handleSubmit(onSubmitHandler, onInvalid)}
+      className="space-y-4"
+      noValidate
+      aria-label={t('signIn')}
+    >
+      {/* Error summary — shown when field errors exist or server returns an error */}
+      {(hasFieldErrors || serverError) && (
+        <FormErrorSummary
+          id="login-error-summary"
+          // @ts-expect-error — summaryRef is RefObject<HTMLDivElement | null>; tabIndex makes div focusable
+          ref={summaryRef}
+          fieldErrors={hasFieldErrors ? fieldErrors : []}
+          serverError={serverError}
+        />
+      )}
+
       {/* Email */}
-      <div>
-        <label
-          htmlFor="login-email"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('emailLabel')}
-        </label>
-        <div className="relative">
-          <Mail
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('email')}
-            id="login-email"
-            type="email"
-            autoComplete="email"
-            placeholder="you@example.com"
-            aria-describedby={errors.email ? 'login-email-error' : undefined}
-            aria-invalid={errors.email ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.email && (
-          <p id="login-email-error" role="alert" className="text-red-500 text-sm mt-1">
-            {errors.email.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="login-email"
+        label={t('emailLabel')}
+        type="email"
+        autoComplete="email"
+        placeholder="you@example.com"
+        error={errors.email?.message}
+        prefix={<Mail size={16} />}
+        required
+        {...register('email')}
+      />
 
       {/* Password */}
-      <div>
-        <label
-          htmlFor="login-password"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('passwordLabel')}
-        </label>
-        <div className="relative">
-          <Lock
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('password')}
-            id="login-password"
-            type="password"
-            autoComplete="current-password"
-            placeholder="••••••••"
-            aria-describedby={errors.password ? 'login-password-error' : undefined}
-            aria-invalid={errors.password ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.password && (
-          <p id="login-password-error" role="alert" className="text-red-500 text-sm mt-1">
-            {errors.password.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="login-password"
+        label={t('passwordLabel')}
+        type="password"
+        autoComplete="current-password"
+        placeholder="••••••••"
+        error={errors.password?.message}
+        prefix={<Lock size={16} />}
+        required
+        {...register('password')}
+      />
 
       {/* CAPTCHA */}
       <div>
-        <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} />
+        {/* Give the captcha widget a labelled region so AT users know what it is */}
+        <div
+          id="login-captcha"
+          role="group"
+          aria-labelledby="login-captcha-label"
+        >
+          <span id="login-captcha-label" className="sr-only">
+            Security verification
+          </span>
+          <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} />
+        </div>
         {captchaError && (
-          <p role="alert" className="text-red-500 text-sm mt-1">
+          <p
+            id="login-captcha-error"
+            role="alert"
+            aria-live="polite"
+            className="text-red-600 dark:text-red-400 text-sm mt-1 flex items-center gap-1"
+          >
+            <span aria-hidden="true">⚠</span>
             {captchaError}
           </p>
         )}

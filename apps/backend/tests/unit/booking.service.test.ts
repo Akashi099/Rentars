@@ -12,9 +12,6 @@ import { mockBookings, mockProperties, mockUsers } from '../mocks/supabase.mock.
 const mockFrom = mock((_: string) => ({}));
 const mockRpc = mock(async () => ({ data: 'reserved-id', error: null }));
 const mockSupabase = { from: mockFrom, rpc: mockRpc };
-const supabaseMod = await import('../../src/config/supabase.js');
-(supabaseMod as any).supabase = mockSupabase;
-
 // ── TrustlessWork mock ────────────────────────────────────────────────────────
 
 const mockTrustlessWork = {
@@ -23,41 +20,51 @@ const mockTrustlessWork = {
   releaseEscrow: mock(async () => {}),
 };
 
-const trustlessMod = await import('../../src/blockchain/trustlessWork.js');
-(trustlessMod as any).trustlessWorkClient = mockTrustlessWork;
+mock.module('../../src/config/supabase.js', () => ({
+  supabase: mockSupabase,
+}));
+
+mock.module('../../src/blockchain/trustlessWork.js', () => ({
+  trustlessWorkClient: mockTrustlessWork,
+}));
 
 // ── Logging mock (suppress logs) ──────────────────────────────────────────────
 
-const loggingMod = await import('../../src/services/logging.service.js');
-(loggingMod as any).loggingService = { logBlockchainOperation: mock(() => {}) };
+mock.module('../../src/services/logging.service.js', () => ({
+  loggingService: { logBlockchainOperation: mock(() => {}) },
+}));
 
 // ── Notification mock ─────────────────────────────────────────────────────────
 
-const notifMod = await import('../../src/services/notification.service.js');
-(notifMod as any).createNotification = mock(async () => ({ success: true }));
+mock.module('../../src/services/notification.service.js', () => ({
+  createNotification: mock(async () => ({ success: true })),
+}));
 
 // ── Availability mock ─────────────────────────────────────────────────────────
 
-const availabilityMod = await import('../../src/services/availability.service.js');
-(availabilityMod as any).checkDateRangeAvailability = mock(async () => ({
-  success: true,
-  data: { is_available: true, nights: 3, property_id: mockProperties[0].id, check_in: '2026-08-01', check_out: '2026-08-04', settings: { min_stay_nights: 1 } },
+mock.module('../../src/services/availability.service.js', () => ({
+  checkDateRangeAvailability: mock(async () => ({
+    success: true,
+    data: { is_available: true, nights: 3, property_id: mockProperties[0].id, check_in: '2026-08-01', check_out: '2026-08-04', settings: { min_stay_nights: 1 } },
+  })),
 }));
 
 // ── Pricing mock ──────────────────────────────────────────────────────────────
 
-const pricingMod = await import('../../src/services/pricing.service.js');
-(pricingMod as any).calculateRangePrice = mock(async () => ({
-  success: true,
-  data: { total: 300, breakdown: [] },
+mock.module('../../src/services/pricing.service.js', () => ({
+  calculateRangePrice: mock(async () => ({
+    success: true,
+    data: { total: 300, breakdown: [] },
+  })),
 }));
 
-import {
-  BookingService,
-  type Booking,
-  type BlockchainServices,
-  type CreateBookingInput,
-} from '../../src/services/booking.service.js';
+// Loaded after the mocks above so the service binds to them.
+const { BookingService } = await import('../../src/services/booking.service.js');
+const availabilityMod = await import('../../src/services/availability.service.js');
+const pricingMod = await import('../../src/services/pricing.service.js');
+type Booking = import('../../src/services/booking.service.js').Booking;
+type BlockchainServices = import('../../src/services/booking.service.js').BlockchainServices;
+type CreateBookingInput = import('../../src/services/booking.service.js').CreateBookingInput;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -528,6 +535,8 @@ describe('BookingService', () => {
   // ── updateBooking ───────────────────────────────────────────────────────────
 
   describe('updateBooking', () => {
+    const admin = { id: 'admin-1', role: 'admin' };
+
     it('should update booking fields', async () => {
       const booking = mockBookings[0];
       mockFrom.mockImplementation(() => ({
@@ -543,19 +552,19 @@ describe('BookingService', () => {
         })),
       }));
 
-      const result = await bookingService.updateBooking(booking.id, { total_price: 600 });
+      const result = await bookingService.updateBooking(booking.id, { total_price: 600 }, admin);
       expect(result.success).toBe(true);
       expect(result.data?.total_price).toBe(600);
     });
 
     it('should return error when ID is empty', async () => {
-      const result = await bookingService.updateBooking('', { total_price: 100 });
+      const result = await bookingService.updateBooking('', { total_price: 100 }, admin);
       expect(result.success).toBe(false);
       expect(result.error).toBe('Booking ID is required');
     });
 
     it('should return error when no fields provided', async () => {
-      const result = await bookingService.updateBooking('booking-1', {});
+      const result = await bookingService.updateBooking('booking-1', {}, admin);
       expect(result.success).toBe(false);
       expect(result.error).toBe('No fields provided for update');
     });
@@ -564,6 +573,8 @@ describe('BookingService', () => {
   // ── deleteBooking ───────────────────────────────────────────────────────────
 
   describe('deleteBooking', () => {
+    const admin = { id: 'admin-1', role: 'admin' };
+
     it('should delete a booking successfully', async () => {
       mockFrom.mockImplementation(() => ({
         delete: mock(() => ({
@@ -571,12 +582,12 @@ describe('BookingService', () => {
         })),
       }));
 
-      const result = await bookingService.deleteBooking('booking-1');
+      const result = await bookingService.deleteBooking('booking-1', admin);
       expect(result.success).toBe(true);
     });
 
     it('should return error when ID is empty', async () => {
-      const result = await bookingService.deleteBooking('');
+      const result = await bookingService.deleteBooking('', admin);
       expect(result.success).toBe(false);
       expect(result.error).toBe('Booking ID is required');
     });

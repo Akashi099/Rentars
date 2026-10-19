@@ -161,6 +161,23 @@ const en = {
     emptyWishlist: 'Your wishlist is empty.',
     savedProperties: 'Saved Properties',
   },
+  currency: {
+    /** Selector UI */
+    selectCurrency: 'Display currency',
+    displayNote: 'Prices shown in {currency} are approximate. Settlement is always in USDC.',
+    /** Conversion attribution line */
+    rateAs: 'Rate as of {datetime}. Settlement in USDC.',
+    rateStale: 'Exchange rate may be outdated. Showing USDC amount only.',
+    /** Receipt / confirmation */
+    settlementLabel: 'Settlement amount',
+    displayLabel: 'Approximate display amount',
+    rateSourceLabel: 'Rate source',
+    rateTimestampLabel: 'Rate timestamp',
+    usdcOnly: 'Amount shown in USDC (settlement currency)',
+    /** Pluralisation helpers — used via t('nightCount', { count }) */
+    nightCount: '{count} night',
+    nightCountPlural: '{count} nights',
+  },
 } as const;
 
 export type TranslationSchema = typeof en;

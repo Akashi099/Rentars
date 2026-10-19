@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
@@ -28,7 +29,7 @@ function StatCard({ title, value }: { title: string; value: number }) {
         <CardTitle className="text-sm font-medium text-gray-500">{title}</CardTitle>
       </CardHeader>
       <CardContent>
-        <p className="text-3xl font-bold text-gray-900">{value.toLocaleString()}</p>
+        <p className="text-2xl sm:text-3xl font-bold text-gray-900 break-words">{value.toLocaleString()}</p>
       </CardContent>
     </Card>
   );
@@ -38,6 +39,7 @@ export default function AdminDashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const isMobile = useMediaQuery('(max-width: 768px)');
 
   useEffect(() => {
     const token = localStorage.getItem('token');
@@ -55,10 +57,10 @@ export default function AdminDashboardPage() {
   if (!data) return null;
 
   return (
-    <div className="space-y-8">
-      <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
+    <div className="space-y-6 sm:space-y-8">
+      <h1 className="text-xl sm:text-2xl font-bold text-gray-900">Dashboard</h1>
 
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard title="Total Users" value={data.totalUsers} />
         <StatCard title="Active Listings" value={data.activeListings} />
         <StatCard title="Bookings This Week" value={data.bookingsThisWeek} />
@@ -66,42 +68,70 @@ export default function AdminDashboardPage() {
       </div>
 
       <section aria-labelledby="security-events-title">
-        <h2 id="security-events-title" className="text-lg font-semibold text-gray-900 mb-3">
+        <h2 id="security-events-title" className="text-base sm:text-lg font-semibold text-gray-900 mb-3">
           Recent Security Events
         </h2>
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b border-gray-200">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Time</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Resource</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">IP</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {data.recentSecurityEvents.length === 0 && (
-                <tr>
-                  <td colSpan={4} className="px-4 py-6 text-center text-gray-400">
-                    No recent events
-                  </td>
-                </tr>
+          {isMobile ? (
+            <div className="divide-y divide-gray-100">
+              {data.recentSecurityEvents.length === 0 ? (
+                <div className="px-4 py-6 text-center text-gray-400">No recent events</div>
+              ) : (
+                data.recentSecurityEvents.map((event) => (
+                  <div key={event.id} className="p-4 space-y-2">
+                    <div className="flex justify-between items-start gap-2">
+                      <span className="font-medium text-gray-900 break-words">{event.action}</span>
+                      <span className="text-xs text-gray-500 whitespace-nowrap">
+                        {new Date(event.timestamp).toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div className="text-sm text-gray-600 break-words">
+                      {event.resource_type}
+                      {event.resource_id ? ` / ${event.resource_id.slice(0, 8)}…` : ''}
+                    </div>
+                    {event.ip && (
+                      <div className="text-xs text-gray-500 break-all">{event.ip}</div>
+                    )}
+                  </div>
+                ))
               )}
-              {data.recentSecurityEvents.map((event) => (
-                <tr key={event.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 text-gray-600">
-                    {new Date(event.timestamp).toLocaleString()}
-                  </td>
-                  <td className="px-4 py-3 font-medium text-gray-900">{event.action}</td>
-                  <td className="px-4 py-3 text-gray-600">
-                    {event.resource_type}
-                    {event.resource_id ? ` / ${event.resource_id.slice(0, 8)}…` : ''}
-                  </td>
-                  <td className="px-4 py-3 text-gray-600">{event.ip ?? '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Time</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Resource</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">IP</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {data.recentSecurityEvents.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="px-4 py-6 text-center text-gray-400">
+                        No recent events
+                      </td>
+                    </tr>
+                  )}
+                  {data.recentSecurityEvents.map((event) => (
+                    <tr key={event.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 text-gray-600">
+                        {new Date(event.timestamp).toLocaleString()}
+                      </td>
+                      <td className="px-4 py-3 font-medium text-gray-900">{event.action}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {event.resource_type}
+                        {event.resource_id ? ` / ${event.resource_id.slice(0, 8)}…` : ''}
+                      </td>
+                      <td className="px-4 py-3 text-gray-600">{event.ip ?? '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </section>
     </div>

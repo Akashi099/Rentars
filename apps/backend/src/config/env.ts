@@ -77,6 +77,11 @@ const envSchema = z.object({
   HCAPTCHA_SECRET_KEY: z.string().optional(),
   HCAPTCHA_ENABLED: z.string().optional(),
 
+  // ── Email webhook ─────────────────────────────────────────────────────────
+  // HMAC-SHA256 secret used to verify inbound delivery-status webhooks from
+  // the SMTP/ESP provider.  When unset all webhook requests are rejected.
+  EMAIL_WEBHOOK_SECRET: z.string().optional(),
+
   // ── Booking rate limits ────────────────────────────────────────────────────
   // Per-user rate limit window for booking creation, in milliseconds.
   // Default: 60 000 ms (1 minute).
@@ -99,6 +104,22 @@ const envSchema = z.object({
       if (!Number.isInteger(n) || n < 1) throw new Error('BOOKING_RATE_LIMIT_MAX must be a positive integer');
       return n;
     }),
+
+  // ── Booking expiry ────────────────────────────────────────────────────────
+  // Hours before a Pending booking automatically expires (default: 24 h).
+  PENDING_BOOKING_EXPIRY_HOURS: z
+    .string()
+    .default('24')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('PENDING_BOOKING_EXPIRY_HOURS must be positive');
+      return n;
+    }),
+
+  // ── Calendar feed ─────────────────────────────────────────────────────────
+  // HMAC secret used to sign calendar feed subscription URLs.
+  // Falls back to JWT_SECRET in code when unset.
+  CALENDAR_FEED_SECRET: z.string().optional(),
 
   // ── Body size limits ───────────────────────────────────────────────────────
   // Maximum size for JSON request bodies (Express body-parser format: "1mb", "512kb", etc.)
@@ -134,6 +155,32 @@ const envSchema = z.object({
   // When unset the endpoint is restricted to localhost only.
   METRICS_TOKEN: z.string().optional(),
 
+  // Distributed tracing sample rate (0.0 to 1.0). Default: 0.1 (10%)
+  TRACE_SAMPLE_RATE: z
+    .string()
+    .default('0.1')
+    .transform((v) => {
+      const n = Number(v);
+      if (isNaN(n) || n < 0 || n > 1) throw new Error('TRACE_SAMPLE_RATE must be between 0 and 1');
+      return n;
+    }),
+
+  // Deployment version for trace tagging
+  DEPLOYMENT_VERSION: z.string().optional(),
+
+  // Probe configuration
+  PROBES_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
+  PROBE_LOCATION: z.string().optional(),
+  FRONTEND_URL: z.string().url().optional(),
+  API_URL: z.string().url().optional(),
+  PROBE_TEST_EMAIL: z.string().email().optional(),
+  PROBE_TEST_PASSWORD: z.string().optional(),
+  PROBE_BOOKING_EMAIL: z.string().email().optional(),
+  PROBE_BOOKING_PASSWORD: z.string().optional(),
+
   // ── Security headers ──────────────────────────────────────────────────────
   // Set to "true" to force-enable HSTS even outside NODE_ENV=production.
   // Useful when running behind a TLS-terminating proxy in staging.
@@ -141,6 +188,173 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+
+  // ── Data retention ────────────────────────────────────────────────────────
+  // How often the full retention sweep runs, in hours. Default: 24 (once/day).
+  RETENTION_INTERVAL_HOURS: z
+    .string()
+    .default('24')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('RETENTION_INTERVAL_HOURS must be a positive number');
+      return n;
+    }),
+
+  // Maximum rows deleted per table per retention run. Default: 500.
+  // Lower this on high-traffic databases to reduce lock contention.
+  RETENTION_BATCH_SIZE: z
+    .string()
+    .default('500')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_BATCH_SIZE must be a positive integer');
+      return n;
+    }),
+
+  // Set to "true" to run a live (non-dry-run) retention sweep 60 s after
+  // startup.  Useful for one-off cleanups after a policy change is deployed.
+  // The dry-run preview always fires at startup regardless of this flag.
+  RETENTION_RUN_ON_STARTUP: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
+  // ── Retention windows ─────────────────────────────────────────────────────
+  // Each window controls how long a data class is kept before deletion.
+  // All values are in DAYS unless the variable name says HOURS.
+
+  // Expired wallet challenge tokens (hours — they have a 10-min DB TTL).
+  RETENTION_WALLET_CHALLENGES_HOURS: z
+    .string()
+    .default('1')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('RETENTION_WALLET_CHALLENGES_HOURS must be positive');
+      return n;
+    }),
+
+  // Password reset tokens past their expiry timestamp.
+  RETENTION_PASSWORD_RESET_TOKENS_DAYS: z
+    .string()
+    .default('7')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_PASSWORD_RESET_TOKENS_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Blockchain operation logs.
+  RETENTION_BLOCKCHAIN_LOGS_DAYS: z
+    .string()
+    .default('90')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_BLOCKCHAIN_LOGS_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Blockchain→DB sync log rows.
+  RETENTION_SYNC_LOG_DAYS: z
+    .string()
+    .default('30')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_SYNC_LOG_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Read notifications (shorter window — already actioned).
+  RETENTION_NOTIFICATIONS_READ_DAYS: z
+    .string()
+    .default('90')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_NOTIFICATIONS_READ_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Unread notifications (longer window — user may not have seen them yet).
+  RETENTION_NOTIFICATIONS_UNREAD_DAYS: z
+    .string()
+    .default('180')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_NOTIFICATIONS_UNREAD_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Search analytics query records.
+  RETENTION_SEARCH_ANALYTICS_DAYS: z
+    .string()
+    .default('365')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_SEARCH_ANALYTICS_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Deduplicated property view tracking rows.
+  RETENTION_PROPERTY_VIEWS_DAYS: z
+    .string()
+    .default('90')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_PROPERTY_VIEWS_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Failed / timed-out payment intent records (no active dispute).
+  RETENTION_PAYMENTS_FAILED_DAYS: z
+    .string()
+    .default('90')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_PAYMENTS_FAILED_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Soft-deleted properties (deleted_at IS NOT NULL, no active dispute).
+  RETENTION_SOFT_DELETED_PROPERTIES_DAYS: z
+    .string()
+    .default('180')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_SOFT_DELETED_PROPERTIES_DAYS must be a positive integer');
+      return n;
+    }),
+
+  // Completed or cancelled account deletion request records.
+  RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS: z
+    .string()
+    .default('30')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS must be a positive integer');
+      return n;
+    }),
+}).superRefine((value, ctx) => {
+  // Production must name its browser origins explicitly. The development default
+  // (localhost) must never become the production allowlist by omission.
+  if (value.NODE_ENV !== 'production') return;
+
+  if (!process.env.CORS_ORIGIN?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CORS_ORIGIN'],
+      message: 'CORS_ORIGIN must be set explicitly in production',
+    });
+    return;
+  }
+
+  for (const origin of value.CORS_ORIGIN) {
+    if (!origin.startsWith('https://')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CORS_ORIGIN'],
+        message: `Production CORS origin must use https:// (got '${origin}')`,
+      });
+    }
+  }
 });
 
 // ── Type export ───────────────────────────────────────────────────────────────

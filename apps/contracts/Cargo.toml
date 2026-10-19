@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "contracts/booking",
+    "contracts/property-listing",
     "contracts/rental-contract",
     "contracts/review-contract",
 ]

@@ -1,11 +1,14 @@
 /**
  * Unit tests for:
  *  1. Guest-capacity enforcement in BookingService.createBooking
- *  2. ICS generation in utils/ics.ts
+ *  2. Guest-capacity enforcement in BookingService.requestModification
+ *  3. requestModificationSchema guest_count validation
+ *  4. ICS generation in utils/ics.ts
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BookingService } from '../services/booking.service.js';
+import { requestModificationSchema } from '../validators/booking.validator.js';
 import { generateIcs } from '../utils/ics.js';
 
 // ─── Supabase mock ────────────────────────────────────────────────────────────
@@ -161,7 +164,11 @@ describe('BookingService — guest capacity enforcement', () => {
       error: null,
     });
 
-    const result = await service.createBooking({ ...BASE_INPUT, guest_count: 3 });
+    const result = await service.createBooking({
+      ...BASE_INPUT,
+      guest_count: 3,
+      rules_acknowledged_at: '2027-07-01T00:00:00Z',
+    });
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/exceeds property capacity/i);
@@ -217,6 +224,189 @@ describe('BookingService — guest capacity enforcement', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/required/i);
+  });
+});
+
+// ─── Modification capacity enforcement ───────────────────────────────────────
+
+describe('BookingService — requestModification guest-count enforcement', () => {
+  let service: BookingService;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    service = new BookingService(mockBlockchain);
+  });
+
+  /** Self-referential chain: every filter method returns itself; awaitable. */
+  function makeChain(resolveWith: unknown = { data: [], error: null }): any {
+    const chain: any = {
+      then: (res: any) => Promise.resolve(resolveWith).then(res),
+      catch: (rej: any) => Promise.resolve(resolveWith).catch(rej),
+      single: vi.fn().mockResolvedValue(resolveWith),
+      maybeSingle: vi.fn().mockResolvedValue(resolveWith),
+    };
+    for (const m of ['select','eq','neq','lt','gt','lte','gte','not','limit','overlaps','order']) {
+      chain[m] = vi.fn(() => chain);
+    }
+    return chain;
+  }
+
+  /**
+   * Return mock chain for requestModification:
+   *  call 1 → booking row with embedded property (owner_id, max_guests, etc.)
+   */
+  function setupModificationMocks(maxGuests: number, currentGuestCount = 2) {
+    const bookingRow = {
+      id: 'booking-1',
+      property_id: 'prop-1',
+      tenant_id: 'tenant-1',
+      check_in: '2027-08-01',
+      check_out: '2027-08-05',
+      guest_count: currentGuestCount,
+      total_price: 400,
+      status: 'Confirmed',
+      properties: {
+        owner_id: 'owner-1',
+        check_in_time: null,
+        check_out_time: null,
+        min_nights: 1,
+        max_nights: null,
+        max_guests: maxGuests,
+      },
+    };
+
+    mockFrom.mockImplementation((table: string) => {
+      if (table === 'bookings') {
+        // First .select().eq().single() resolves the booking row;
+        // further chaining (for conflict checks) resolves with empty array.
+        let selectCallCount = 0;
+        return {
+          select: vi.fn().mockImplementation(() => {
+            selectCallCount += 1;
+            if (selectCallCount === 1) {
+              // Booking lookup — supports .eq().single() and longer chains
+              const bookingChain = makeChain({ data: [], error: null });
+              bookingChain.eq = vi.fn().mockReturnValue({
+                ...makeChain({ data: [], error: null }),
+                single: vi.fn().mockResolvedValue({ data: bookingRow, error: null }),
+              });
+              return bookingChain;
+            }
+            return makeChain({ data: [], error: null });
+          }),
+          insert: vi.fn(() => makeChain({ data: { id: 'mod-1' }, error: null })),
+        };
+      }
+      // All other tables (property_settings, availability_ranges, etc.):
+      // return a fully chainable mock that resolves with empty/null.
+      return {
+        select: vi.fn(() => makeChain({ data: null, error: null })),
+        insert: vi.fn(() => makeChain({ data: null, error: null })),
+        update: vi.fn(() => makeChain({ data: null, error: null })),
+      };
+    });
+  }
+
+  it('rejects a modification when requested guest_count exceeds max_guests', async () => {
+    setupModificationMocks(2);
+
+    const result = await service.requestModification(
+      'booking-1', 'tenant-1', '2027-08-02', '2027-08-07', undefined, 5,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/exceeds property capacity/i);
+    expect(result.error).toContain('5');
+    expect(result.error).toContain('2');
+  });
+
+  it('rejects a modification with guest_count of 0', async () => {
+    setupModificationMocks(4);
+
+    const result = await service.requestModification(
+      'booking-1', 'tenant-1', '2027-08-02', '2027-08-07', undefined, 0,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/positive integer/i);
+  });
+
+  it('rejects a modification with negative guest_count', async () => {
+    setupModificationMocks(4);
+
+    const result = await service.requestModification(
+      'booking-1', 'tenant-1', '2027-08-02', '2027-08-07', undefined, -1,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/positive integer/i);
+  });
+
+  it('allows a modification exactly at capacity', async () => {
+    // Max 4 guests; requesting 4 should pass capacity check
+    setupModificationMocks(4, 2);
+
+    // The service will also call checkDateRangeAvailability — mock it through
+    // the availability-service import (already handled by mockFrom returning
+    // null for unknown tables).  The test just verifies no capacity error.
+    const result = await service.requestModification(
+      'booking-1', 'tenant-1', '2027-08-02', '2027-08-07', undefined, 4,
+    );
+
+    if (!result.success) {
+      expect(result.error).not.toMatch(/exceeds property capacity/i);
+    }
+  });
+
+  it('allows a modification with no guest_count change (date-only modification)', async () => {
+    setupModificationMocks(2, 2);
+
+    const result = await service.requestModification(
+      'booking-1', 'tenant-1', '2027-08-02', '2027-08-07',
+    );
+
+    if (!result.success) {
+      expect(result.error).not.toMatch(/exceeds property capacity/i);
+      expect(result.error).not.toMatch(/guest_count/i);
+    }
+  });
+});
+
+// ─── requestModificationSchema — guest_count validation ──────────────────────
+
+describe('requestModificationSchema — guest_count field', () => {
+  const BASE = {
+    requested_start: '2027-09-01',
+    requested_end:   '2027-09-05',
+  };
+
+  it('accepts a valid modification without guest_count', () => {
+    expect(requestModificationSchema.safeParse(BASE).success).toBe(true);
+  });
+
+  it('accepts a modification with a valid positive integer guest_count', () => {
+    expect(requestModificationSchema.safeParse({ ...BASE, guest_count: 3 }).success).toBe(true);
+  });
+
+  it('rejects guest_count of 0', () => {
+    const r = requestModificationSchema.safeParse({ ...BASE, guest_count: 0 });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error.issues.some(i => /positive/i.test(i.message))).toBe(true);
+    }
+  });
+
+  it('rejects fractional guest_count', () => {
+    const r = requestModificationSchema.safeParse({ ...BASE, guest_count: 1.5 });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error.issues.some(i => /integer/i.test(i.message))).toBe(true);
+    }
+  });
+
+  it('rejects a non-numeric guest_count', () => {
+    const r = requestModificationSchema.safeParse({ ...BASE, guest_count: 'three' });
+    expect(r.success).toBe(false);
   });
 });
 
@@ -315,7 +505,8 @@ describe('generateIcs — RFC 5545 output', () => {
   });
 
   it('falls back to current timestamp when created is omitted', () => {
-    const before = Date.now();
+    // Floor to second precision: ICS format has second resolution only.
+    const before = Math.floor(Date.now() / 1000) * 1000;
     const ics = generateIcs({ ...baseEvent, created: undefined });
     const after = Date.now();
     // Just verify DTSTAMP is present and parseable

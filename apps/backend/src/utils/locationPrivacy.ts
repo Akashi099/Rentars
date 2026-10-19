@@ -1,18 +1,30 @@
 /**
  * Location privacy utilities.
  *
- * Public and unauthenticated viewers must only see an approximate location
- * (snapped to a ~500 m grid with a small randomised offset) plus a radius
- * value indicating the uncertainty circle.
+ * Three precision tiers control what coordinates are returned per viewer:
  *
- * Exact coordinates are revealed only to:
- *   - the property's host/owner
- *   - a tenant who has a *confirmed* booking for that property
- *   - platform admins (handled at the call site via role check)
+ *   public   — Anonymous visitors, search results, and unauthenticated calls.
+ *              Coordinates are snapped to a ~500 m grid with a deterministic
+ *              jitter.  Exact lat/lng are never exposed.
+ *
+ *   booking  — A tenant whose booking for this property is Pending OR Confirmed.
+ *              Exact coordinates are revealed so they can navigate to the
+ *              property for their upcoming or active stay.
+ *
+ *   host     — The property owner (host) or a platform admin.
+ *              Always receives exact coordinates.
+ *
+ * Tiers are evaluated in the controller via viewerHasExactLocationAccess and
+ * enforced by redactExactCoordinates / toApproximateLocation.
+ * Logs and data-exports must never include exact coordinates for public-tier
+ * viewers; strip them before writing to any external sink.
  */
 
 /** Approximate radius shown on public map, in metres */
 export const PUBLIC_LOCATION_RADIUS_M = 500;
+
+/** Location precision tier assigned to a viewer. */
+export type LocationPrecisionTier = 'public' | 'booking' | 'host';
 
 /**
  * Snap a coordinate to a ~500 m grid and apply a small deterministic offset

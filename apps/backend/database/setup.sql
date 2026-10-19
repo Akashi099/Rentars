@@ -1,7 +1,7 @@
 -- Rentars Database Setup
--- Runs all migrations in order to initialize the database schema.
--- Run from the migrations/ directory:
---   psql "$DATABASE_URL" -f setup.sql
+-- Runs all migrations in the canonical application order defined in MIGRATIONS_NAMING.md.
+-- Run from the apps/backend/database/ directory:
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f setup.sql
 
 \i migrations/00001_initial_schema.sql
 \i migrations/00002_add_booking_blockchain_fields.sql
@@ -16,10 +16,10 @@
 \i migrations/00010_create_wishlists_table.sql
 \i migrations/00011_create_notifications_table.sql
 \i migrations/00012_create_property_images_table.sql
-\i migrations/00012_add_booking_dispute_status.sql
 \i migrations/00013_add_property_search_vector.sql
 \i migrations/00013_update_availability_ranges.sql
 \i migrations/00014_add_dynamic_pricing.sql
+\i migrations/00014_pricing_and_settings.sql
 \i migrations/00014_search_analytics_and_geolocation.sql
 \i migrations/00015_add_review_moderation_and_responses.sql
 \i migrations/00016_add_notification_preferences.sql
@@ -31,6 +31,53 @@
 \i migrations/00018_add_house_rules_to_properties.sql
 \i migrations/00019_add_rules_acknowledged_to_bookings.sql
 \i migrations/00020_add_missing_indexes.sql
+\i migrations/00020_add_property_views.sql
+\i migrations/00020_add_review_eligibility_constraints.sql
+\i migrations/00021_add_booking_reminders.sql
+\i migrations/00021_add_flag_reason_to_reviews.sql
 \i migrations/00021_add_rls_wishlists_notifications.sql
+\i migrations/00021_create_funnel_events.sql
+\i migrations/00022_add_featured_until_to_properties.sql
+\i migrations/00023_create_host_follows_table.sql
+\i migrations/00024_add_slug_to_properties.sql
+\i migrations/00025_search_analytics_aggregation_indexes.sql
+\i migrations/00026_booking_conflict_exclusion.sql
+\i migrations/00027_add_stay_time_and_earnings.sql
+\i migrations/00028_add_property_type_and_bathrooms.sql
+\i migrations/00028_add_role_to_users.sql
+\i migrations/00028_booking_lifecycle_disputed_complete.sql
+\i migrations/00028_create_audit_and_payments.sql
+\i migrations/00028_create_booking_status_history.sql
+\i migrations/00029_create_reports_table.sql
+\i migrations/00030_create_audit_logs_table.sql
+\i migrations/00031_create_messages_table.sql
+\i migrations/00032_add_cancellation_refund_fields.sql
+\i migrations/00032_add_soft_delete_to_properties.sql
+\i migrations/00032_add_thumbnail_url_to_property_images.sql
+\i migrations/00032_create_idempotency_keys_table.sql
 \i migrations/00033_weighted_search_vector.sql
 \i migrations/00034_create_saved_searches_table.sql
+\i migrations/00035_add_booking_dispute_status.sql
+\i migrations/00055_add_terms_version_to_bookings.sql
+\i migrations/00056_update_booking_atomic_v2_terms.sql
+\i migrations/00057_add_admin_roles.sql
+\i migrations/00058_add_deleted_user_status.sql
+\i migrations/00059_create_data_exports_table.sql
+\i migrations/00059_create_probe_results_table.sql
+\i migrations/00059_enhance_audit_logs_table.sql
+\i migrations/00059_enhance_saved_searches.sql
+\i migrations/00059_search_infrastructure_validation.sql
+\i migrations/00060_add_property_draft_status.sql
+\i migrations/00060_create_account_deletions_table.sql
+\i migrations/00060_geocoding_status_tracking.sql
+\i migrations/00061_enhance_reports_and_moderation.sql
+\i migrations/00061_search_performance_tracking.sql
+\i migrations/00062_add_guest_count_to_booking_modifications.sql
+\i migrations/00062_add_legal_holds.sql
+\i migrations/00062_add_quiet_hours_to_notification_preferences.sql
+\i migrations/00062_booking_date_exclusion_constraint.sql
+\i migrations/00062_booking_expiry_and_timeout.sql
+\i migrations/00062_booking_lifecycle_state_machine.sql
+\i migrations/00062_booking_modifications_snapshot.sql
+\i migrations/00063_idempotency_keys_status.sql
+\i migrations/00064_property_versions.sql

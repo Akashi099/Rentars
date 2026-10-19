@@ -7,16 +7,21 @@ import { useState, useCallback } from 'react';
 import { User, Mail, Lock, Loader } from 'lucide-react';
 import { HCaptcha } from './HCaptcha';
 import { useTranslations } from '@/lib/i18n/useTranslations';
+import { FormInput, FormErrorSummary } from '@/components/ui/form-field';
+import { useFormErrorFocus } from '@/hooks/useFormErrorFocus';
 
 interface RegisterFormProps {
   onSubmit: (data: RegisterInput & { captchaToken: string }) => Promise<void>;
+  /** Server-returned error (e.g. email already in use). */
+  serverError?: string | null;
 }
 
-export function RegisterForm({ onSubmit }: RegisterFormProps) {
+export function RegisterForm({ onSubmit, serverError }: RegisterFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [captchaToken, setCaptchaToken] = useState<string>('');
   const [captchaError, setCaptchaError] = useState<string>('');
   const t = useTranslations('auth');
+  const { summaryRef, focusFirstError } = useFormErrorFocus();
 
   const captchaEnabled =
     process.env.NEXT_PUBLIC_HCAPTCHA_ENABLED !== 'false' &&
@@ -39,9 +44,13 @@ export function RegisterForm({ onSubmit }: RegisterFormProps) {
     setCaptchaToken('');
   }, []);
 
+  /** Called by react-hook-form when client validation fails. */
+  const onInvalid = () => focusFirstError('register-error-summary');
+
   const onSubmitHandler = async (data: RegisterInput) => {
     if (captchaEnabled && !captchaToken) {
       setCaptchaError(t('captchaRequired'));
+      focusFirstError('register-error-summary');
       return;
     }
 
@@ -53,147 +62,108 @@ export function RegisterForm({ onSubmit }: RegisterFormProps) {
     }
   };
 
+  // Build field-error list for the summary
+  const fieldErrors = [
+    errors.name && { fieldId: 'register-name', message: errors.name.message ?? 'Invalid name' },
+    errors.email && { fieldId: 'register-email', message: errors.email.message ?? 'Invalid email' },
+    errors.password && { fieldId: 'register-password', message: errors.password.message ?? 'Invalid password' },
+    errors.confirmPassword && { fieldId: 'register-confirm-password', message: errors.confirmPassword.message ?? 'Passwords do not match' },
+    captchaError && { fieldId: 'register-captcha', message: captchaError },
+  ].filter(Boolean) as { fieldId: string; message: string }[];
+
+  const hasFieldErrors = fieldErrors.length > 0;
+
   return (
-    <form onSubmit={handleSubmit(onSubmitHandler)} className="space-y-4" noValidate>
+    <form
+      onSubmit={handleSubmit(onSubmitHandler, onInvalid)}
+      className="space-y-4"
+      noValidate
+      aria-label={t('createAccount')}
+    >
+      {/* Error summary */}
+      {(hasFieldErrors || serverError) && (
+        <FormErrorSummary
+          id="register-error-summary"
+          // @ts-expect-error — summaryRef typing
+          ref={summaryRef}
+          fieldErrors={hasFieldErrors ? fieldErrors : []}
+          serverError={serverError}
+        />
+      )}
+
       {/* Full Name */}
-      <div>
-        <label
-          htmlFor="register-name"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('fullNameLabel')}
-        </label>
-        <div className="relative">
-          <User
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('name')}
-            id="register-name"
-            type="text"
-            autoComplete="name"
-            placeholder="John Doe"
-            aria-describedby={errors.name ? 'register-name-error' : undefined}
-            aria-invalid={errors.name ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.name && (
-          <p id="register-name-error" role="alert" className="text-red-500 text-sm mt-1">
-            {errors.name.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="register-name"
+        label={t('fullNameLabel')}
+        type="text"
+        autoComplete="name"
+        placeholder="John Doe"
+        error={errors.name?.message}
+        prefix={<User size={16} />}
+        required
+        {...register('name')}
+      />
 
       {/* Email */}
-      <div>
-        <label
-          htmlFor="register-email"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('emailLabel')}
-        </label>
-        <div className="relative">
-          <Mail
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('email')}
-            id="register-email"
-            type="email"
-            autoComplete="email"
-            placeholder="you@example.com"
-            aria-describedby={errors.email ? 'register-email-error' : undefined}
-            aria-invalid={errors.email ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.email && (
-          <p id="register-email-error" role="alert" className="text-red-500 text-sm mt-1">
-            {errors.email.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="register-email"
+        label={t('emailLabel')}
+        type="email"
+        autoComplete="email"
+        placeholder="you@example.com"
+        error={errors.email?.message}
+        prefix={<Mail size={16} />}
+        required
+        {...register('email')}
+      />
 
       {/* Password */}
-      <div>
-        <label
-          htmlFor="register-password"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('passwordLabel')}
-        </label>
-        <div className="relative">
-          <Lock
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('password')}
-            id="register-password"
-            type="password"
-            autoComplete="new-password"
-            placeholder="••••••••"
-            aria-describedby={errors.password ? 'register-password-error' : undefined}
-            aria-invalid={errors.password ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.password && (
-          <p id="register-password-error" role="alert" className="text-red-500 text-sm mt-1">
-            {errors.password.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="register-password"
+        label={t('passwordLabel')}
+        type="password"
+        autoComplete="new-password"
+        placeholder="••••••••"
+        error={errors.password?.message}
+        prefix={<Lock size={16} />}
+        required
+        hint="Minimum 6 characters"
+        {...register('password')}
+      />
 
       {/* Confirm Password */}
-      <div>
-        <label
-          htmlFor="register-confirm-password"
-          className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
-        >
-          {t('confirmPasswordLabel')}
-        </label>
-        <div className="relative">
-          <Lock
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-            size={18}
-            aria-hidden="true"
-          />
-          <input
-            {...register('confirmPassword')}
-            id="register-confirm-password"
-            type="password"
-            autoComplete="new-password"
-            placeholder="••••••••"
-            aria-describedby={
-              errors.confirmPassword ? 'register-confirm-password-error' : undefined
-            }
-            aria-invalid={errors.confirmPassword ? 'true' : undefined}
-            className="w-full pl-10 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        {errors.confirmPassword && (
-          <p
-            id="register-confirm-password-error"
-            role="alert"
-            className="text-red-500 text-sm mt-1"
-          >
-            {errors.confirmPassword.message}
-          </p>
-        )}
-      </div>
+      <FormInput
+        id="register-confirm-password"
+        label={t('confirmPasswordLabel')}
+        type="password"
+        autoComplete="new-password"
+        placeholder="••••••••"
+        error={errors.confirmPassword?.message}
+        prefix={<Lock size={16} />}
+        required
+        {...register('confirmPassword')}
+      />
 
       {/* CAPTCHA */}
       <div>
-        <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} />
+        <div
+          id="register-captcha"
+          role="group"
+          aria-labelledby="register-captcha-label"
+        >
+          <span id="register-captcha-label" className="sr-only">
+            Security verification
+          </span>
+          <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} />
+        </div>
         {captchaError && (
-          <p role="alert" className="text-red-500 text-sm mt-1">
+          <p
+            id="register-captcha-error"
+            role="alert"
+            aria-live="polite"
+            className="text-red-600 dark:text-red-400 text-sm mt-1 flex items-center gap-1"
+          >
+            <span aria-hidden="true">⚠</span>
             {captchaError}
           </p>
         )}

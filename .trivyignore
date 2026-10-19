@@ -1,0 +1,7 @@
+# Trivy container scan ignore file.
+# Add suppressed CVEs here with a reason comment and expiry date.
+# See docs/security-exceptions.md for the full exception process.
+#
+# Format:
+#   # REASON: <why it's safe> — see #<issue> | EXPIRES: <YYYY-MM-DD>
+#   CVE-XXXX-YYYYY

@@ -1,0 +1,114 @@
+name: Smoke Tests
+
+# Triggered manually (post-deploy hook) or via workflow_dispatch.
+# For automatic post-deploy runs, call this workflow from your deployment
+# pipeline with:
+#   uses: ./.github/workflows/smoke-tests.yml
+#   with:
+#     api_url: https://api.your-env.example.com
+#     frontend_url: https://your-env.example.com
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Backend API base URL'
+        required: true
+        default: 'http://localhost:3000'
+      frontend_url:
+        description: 'Frontend base URL'
+        required: true
+        default: 'http://localhost:3001'
+      deployment_id:
+        description: 'Deployment identifier (commit SHA, image tag, or run ID)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment name (e.g. staging, preview-pr-42)'
+        required: false
+        default: 'unknown'
+  workflow_call:
+    inputs:
+      api_url:
+        type: string
+        required: true
+      frontend_url:
+        type: string
+        required: true
+      deployment_id:
+        type: string
+        required: false
+        default: ''
+      environment:
+        type: string
+        required: false
+        default: 'unknown'
+
+jobs:
+  smoke:
+    name: Post-deploy Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.0'
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        run: yarn playwright install --with-deps chromium
+
+      - name: Resolve deployment identity
+        id: identity
+        run: |
+          DEPLOY_ID="${{ inputs.deployment_id }}"
+          if [[ -z "$DEPLOY_ID" ]]; then
+            DEPLOY_ID="${{ github.sha }}"
+          fi
+          echo "deployment_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+
+      - name: Run smoke tests
+        working-directory: apps/web
+        env:
+          CI: true
+          SMOKE_API_URL: ${{ inputs.api_url }}
+          SMOKE_FRONTEND_URL: ${{ inputs.frontend_url }}
+          SMOKE_DEPLOYMENT_ID: ${{ steps.identity.outputs.deployment_id }}
+          SMOKE_ENVIRONMENT: ${{ steps.identity.outputs.environment }}
+          PLAYWRIGHT_BASE_URL: ${{ inputs.frontend_url }}
+        run: yarn playwright test --project=chromium e2e/smoke.spec.ts
+
+      - name: Publish smoke test summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          {
+            echo "## Smoke Test Results"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Environment | \`${{ steps.identity.outputs.environment }}\` |"
+            echo "| Deployment ID | \`${{ steps.identity.outputs.deployment_id }}\` |"
+            echo "| API URL | \`${{ inputs.api_url }}\` |"
+            echo "| Frontend URL | \`${{ inputs.frontend_url }}\` |"
+            echo "| Status | $STATUS |"
+            echo "| Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-report-${{ steps.identity.outputs.environment }}-${{ steps.identity.outputs.deployment_id }}
+          path: apps/web/playwright-report/
+          retention-days: 7

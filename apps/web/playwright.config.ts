@@ -15,6 +15,16 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
+  // Visual regression snapshots are stored adjacent to each spec file so that
+  // baselines are versioned in Git alongside the tests that reference them.
+  snapshotPathTemplate: '{testDir}/{testFilePath}-snapshots/{arg}{ext}',
+  // Tolerances for snapshot comparisons — overridden per-test where needed.
+  expect: {
+    toHaveScreenshot: {
+      // Ignore anti-aliasing differences between platforms
+      threshold: 0.2,
+    },
+  },
   projects: [
     {
       name: 'chromium',
@@ -35,7 +45,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'yarn dev',
+    command: process.env.CI ? 'yarn start' : 'yarn dev',
     url: 'http://localhost:3001',
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

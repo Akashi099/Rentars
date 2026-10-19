@@ -1,0 +1,138 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run nightly at 02:00 UTC to catch newly published advisories
+    - cron: '0 2 * * *'
+
+jobs:
+  # ─── Secret scanning ────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Detection (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks scans all commits on PRs
+
+      - name: Run gitleaks on repository
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is not required for public repos / FOSS
+        with:
+          config-path: .gitleaks.toml
+          # Fail on any finding not covered by the allowlist in .gitleaks.toml
+          fail: true
+
+      - name: Verify fixture detection (CI self-test)
+        # Re-scan only the fixture file without the allowlist to confirm
+        # gitleaks CAN detect the planted fake key.  A failure here means
+        # gitleaks itself is broken, not that a real secret escaped.
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            zricethezav/gitleaks:latest detect \
+            --source /repo/tests/fixtures/secret-detection.fixture.txt \
+            --no-git \
+            --exit-code 1 \
+          && echo "Fixture detection: gitleaks correctly found the test secret." \
+          || { echo "ERROR: gitleaks did not detect the planted test secret — scanner may be misconfigured."; exit 1; }
+
+  # ─── Yarn / npm dependency audit ────────────────────────────────────────────
+  yarn-audit:
+    name: Yarn Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.0'
+          cache: yarn
+          cache-dependency-path: apps/web/yarn.lock
+
+      - name: Install web dependencies (frozen)
+        working-directory: apps/web
+        run: yarn install --frozen-lockfile
+
+      - name: Audit web workspace
+        working-directory: apps/web
+        # --level high — fail on high and critical only; medium tracked but not blocking
+        run: yarn audit --level high
+        continue-on-error: false
+
+      - name: Install root dependencies (frozen)
+        run: yarn install --frozen-lockfile
+
+      - name: Audit root workspace
+        run: yarn audit --level high
+        continue-on-error: false
+
+  # ─── Bun dependency audit ────────────────────────────────────────────────────
+  bun-audit:
+    name: Bun Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.1.38'
+
+      - name: Install backend dependencies (frozen)
+        working-directory: apps/backend
+        run: bun install --frozen-lockfile
+
+      - name: Audit backend workspace
+        working-directory: apps/backend
+        # bun audit exits non-zero when high/critical findings exist
+        run: bun audit --level high
+
+  # ─── Cargo / Rust dependency audit ──────────────────────────────────────────
+  cargo-audit:
+    name: Cargo Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit contracts workspace
+        working-directory: apps/contracts
+        # Per-finding suppression configured in .cargo/audit.toml
+        run: cargo audit --config .cargo/audit.toml
+
+  # ─── Container image scan ────────────────────────────────────────────────────
+  container-scan:
+    name: Container Image Scan (trivy)
+    runs-on: ubuntu-latest
+    # Only run when a Dockerfile is present and changed; skip for docs-only PRs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan backend Dockerfile
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'apps/backend'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
+
+      - name: Scan web Dockerfile
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'apps/web'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'

@@ -9,6 +9,8 @@
  * Keep in sync with the ABI files whenever contracts are updated.
  */
 
+import type { xdr } from '@stellar/stellar-sdk';
+
 // ─── Property Listing Types ───────────────────────────────────────────────────
 
 /** Mirrors ListingStatus enum in property_listing_abi.json */
@@ -130,4 +132,89 @@ export interface ResolveDisputeParams {
   caller: string;
   booking_id: bigint;
   release_to_owner: boolean;
+}
+
+// ─── Simulation & Fee Estimation Types ────────────────────────────────────────
+
+/**
+ * A single diagnostic entry surfaced by Soroban RPC simulation.
+ * Mirrors the shape of `DiagnosticEvent` / error entries returned by
+ * `simulateTransaction`, normalized for safe consumption by the client.
+ */
+export interface SimulationDiagnostic {
+  /** Machine-readable diagnostic code, e.g. "auth", "contract", "budget". */
+  code: string;
+  /** Human-readable message safe to display to end users. */
+  message: string;
+  /** Optional contract error code when the failure originated on-chain. */
+  contract_error_code?: number;
+  /** Whether the caller can recover by adjusting inputs and retrying. */
+  recoverable: boolean;
+}
+
+/** Estimated resource usage returned by simulation. */
+export interface SimulationResources {
+  /** CPU instructions consumed by the simulated invocation. */
+  cpu_instructions: bigint;
+  /** Memory bytes consumed by the simulated invocation. */
+  memory_bytes: bigint;
+  /** Number of ledger entries read during simulation. */
+  read_bytes: bigint;
+  /** Number of ledger entries written during simulation. */
+  write_bytes: bigint;
+}
+
+/** Estimated fee breakdown for a simulated transaction. */
+export interface FeeEstimate {
+  /** Inclusion fee in stroops (1 XLM = 10_000_000 stroops). */
+  inclusion_fee: bigint;
+  /** Resource fee in stroops covering CPU, memory, and ledger I/O. */
+  resource_fee: bigint;
+  /** Total estimated fee in stroops (inclusion + resource). */
+  total_fee: bigint;
+  /** Asset used to pay the fee, e.g. "XLM" or "USDC". */
+  fee_asset: string;
+}
+
+/** Result of simulating a Soroban transaction prior to signing. */
+export interface SimulationResult {
+  /** Whether the simulated transaction would succeed on-chain. */
+  success: boolean;
+  /** Estimated fee for the transaction. Present even on failure when available. */
+  fee_estimate?: FeeEstimate;
+  /** Estimated resource consumption. Present when simulation completed. */
+  resources?: SimulationResources;
+  /** Diagnostics describing failures or warnings. Empty when success is true. */
+  diagnostics: SimulationDiagnostic[];
+  /** Latest ledger sequence observed during simulation. */
+  latest_ledger: number;
+  /** Unix timestamp (seconds) when this simulation was produced. */
+  simulated_at: number;
+  /** Opaque cache key derived from the transaction intent. */
+  intent_key: string;
+}
+
+/**
+ * Cache entry for a short-lived simulation result keyed by transaction intent.
+ * Invalidated when inputs change or the observed ledger advances.
+ */
+export interface SimulationCacheEntry {
+  /** Cache key derived from the transaction intent. */
+  intent_key: string;
+  /** Cached simulation result. */
+  result: SimulationResult;
+  /** Ledger sequence at which the cached result was produced. */
+  ledger: number;
+  /** Unix timestamp (seconds) when the entry expires. */
+  expires_at: number;
+}
+
+/** Inputs required to simulate a supported Soroban transaction. */
+export interface SimulateTransactionParams {
+  /** Base64-encoded unsigned transaction envelope XDR. */
+  transaction_xdr: string;
+  /** Optional pre-built auth entries to include in the simulation. */
+  auth?: xdr.SorobanAuthorizationEntry[];
+  /** Optional override for the ledger used during simulation. */
+  ledger_override?: number;
 }

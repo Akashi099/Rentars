@@ -37,6 +37,67 @@ Before you deploy, confirm each item below:
 - [ ] Frontend can connect to backend and Stellar RPC endpoints
 - [ ] Secrets are stored in an encrypted secrets manager, not in Git
 
+### 2.1 Preflight checks
+
+Run these before touching staging or testnet. Every command is read-only and
+safe to run repeatedly.
+
+```bash
+# 1. Runtime versions match the pinned toolchain (.nvmrc / .tool-versions)
+node --version && bun --version && rustc --version
+bash scripts/check-engines.sh
+
+# 2. Environment files parse and required keys are present (values are NOT printed)
+node -e "const r=require('./apps/backend/.env.example');"  # placeholder check only
+grep -q '^SUPABASE_URL=' apps/backend/.env || echo "MISSING: SUPABASE_URL"
+grep -q '^JWT_SECRET='  apps/backend/.env || echo "MISSING: JWT_SECRET"
+
+# 3. Database is reachable and migrations are current
+psql "$DATABASE_URL" -c '\q' && echo "DB reachable"
+
+# 4. Redis is reachable
+redis-cli -u "$REDIS_URL" ping
+
+# 5. Contract artifacts exist for the target network
+ls apps/contracts/target/wasm32-unknown-unknown/release/*.wasm
+
+# 6. Dependency trees install cleanly from lockfiles
+cd apps/backend && bun install --frozen-lockfile
+cd ../web && yarn install --frozen-lockfile
+```
+
+Never paste secret values into tickets, chat, or logs. Record only the key name
+and whether it is present.
+
+### 2.2 Post-deployment verification
+
+After deploying to staging or testnet, confirm every item below and record the
+observed output. Failures must be resolved before promotion.
+
+```bash
+# Backend liveness + dependency health
+curl -sf "$BACKEND_URL/health" | jq .
+curl -sf "$BACKEND_URL/health/deep" | jq .
+
+# API contract compatibility against the published OpenAPI document
+cd apps/backend && API_BASE_URL="$BACKEND_URL" bun run test:contract
+
+# A real read path and an authentication guard
+curl -sf "$BACKEND_URL/api/v1/properties?limit=1" | jq '.data | length'
+curl -s -o /dev/null -w '%{http_code}\n' "$BACKEND_URL/api/v1/bookings"  # expect 401
+
+# Frontend reachable and serving the expected build
+curl -sfI "$FRONTEND_URL" | head -1
+```
+
+| Check | Expected | Rollback trigger |
+|---|---|---|
+| `/health` | `status: ok` | non-200 or degraded dependency |
+| `/health/deep` | all dependencies `connected` | any dependency down |
+| Contract tests | all pass | any undocumented change |
+| `GET /properties` | 200 + JSON array | 5xx or malformed body |
+| `GET /bookings` unauthenticated | 401 | unexpected 200 |
+
 ---
 
 ## 3. Stellar Testnet Setup
@@ -142,39 +203,25 @@ Use `apps/backend/.env.example` as a template and populate the following values:
 
 ### 4.2 Database migration
 
-The backend schema is managed under `apps/backend/database`.
-
-Run all migrations with PostgreSQL / Supabase credentials:
+The backend schema is managed under `apps/backend/database`. All migrations are
+applied in the canonical order defined in
+[`apps/backend/database/MIGRATIONS_NAMING.md`](apps/backend/database/MIGRATIONS_NAMING.md)
+and listed in `setup.sql`. **Do not apply individual migration files by hand** —
+always run the canonical entrypoint so ordering, duplicate-prefix handling, and
+idempotency rules are preserved:
 
 ```bash
 cd apps/backend/database
-psql -U postgres -d rentars -f setup.sql
+# DATABASE_URL may be a direct PostgreSQL connection string or a Supabase pooler URL.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f setup.sql
 ```
 
-If your environment is Supabase and the project already exists, run the SQL from `setup.sql` and then apply any additional migrations manually:
+`-v ON_ERROR_STOP=1` makes `psql` abort on the first SQL error, matching the CI
+pipeline (`.github/workflows/ci.yml`, job `rls-tests`). This is the only supported
+migration path for staging and production.
 
-```bash
-psql -U postgres -d rentars -f apps/backend/database/migrations/00009_create_reviews_table.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00010_create_wishlists_table.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00011_create_notifications_table.sql
-psql -U postgres -d rentars -f database/migrations/001_create_sync_tables.sql
-```
-
-Apply the remaining root migrations in numerical order. The payment, refund,
-ledger, and reconciliation schema changes require migrations 007 and 008 first:
-
-```bash
-psql -U postgres -d rentars -f database/migrations/007_create_earnings_ledger_entries.sql
-psql -U postgres -d rentars -f database/migrations/008_create_refund_snapshots_and_requests.sql
-psql -U postgres -d rentars -f database/migrations/009_payment_escrow_reconciliation.sql
-```
-
-Configure `STELLAR_USDC_ISSUER` in the backend and `NEXT_PUBLIC_USDC_ISSUER` in
-the frontend with the same network-specific classic USDC asset issuer. Payment
-submission is rejected unless the signed Stellar operation uses that issuer and
-the quoted amount.
-
-If the backend is deployed inside Docker, ensure the DB credentials in `SUPABASE_URL` or `DATABASE_URL` are reachable from the container.
+If the backend is deployed inside Docker, ensure the DB credentials in
+`SUPABASE_URL` or `DATABASE_URL` are reachable from the container.
 
 ### 4.3 Redis setup
 
@@ -346,7 +393,9 @@ ROLLED_BACK
 
 ## 7.6 Rollback Health Gates
 
-Automated health gates determine if a rollout should pause or roll back:
+Automated health gates determine if a rollout should pause or roll back.
+
+The thresholds below are also kept in machine-readable form in [`docs/releases/health-gates.json`](docs/releases/health-gates.json). `scripts/release-health-gate.ts` evaluates a metrics snapshot against that file and exits `0` (proceed), `10` (pause), or `20` (rollback). If this section and the JSON file disagree, the JSON file is authoritative. Ownership of pause and rollback decisions, and the irreversible operations that limit rollback, are in [`docs/releases/rollback.md`](docs/releases/rollback.md).
 
 ### 7.6.1 Error Rate Gate
 

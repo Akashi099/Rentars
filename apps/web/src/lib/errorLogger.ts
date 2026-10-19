@@ -138,3 +138,40 @@ export async function logClientError(
     // Silently swallow — we must never throw from the logger
   }
 }
+
+/**
+ * Capture an exception with additional context and generate a correlation ID.
+ * Returns the digest for user reference.
+ */
+export function captureException(
+  error: Error,
+  context: string,
+  extra?: Record<string, unknown>
+): string {
+  const digest = `ERR-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
+  const message = extra
+    ? `${sanitiseMessage(error.message)} | ${JSON.stringify(extra)}`
+    : error.message;
+
+  logClientError({ ...error, message }, context, digest);
+  return digest;
+}
+
+/**
+ * Log a warning message for debugging (dev-only by default).
+ */
+export function logWarning(message: string, context?: string): void {
+  if (process.env.NODE_ENV === 'development') {
+    console.warn(`[${context || 'Warning'}] ${message}`);
+  }
+}
+
+/**
+ * Log info message for debugging (dev-only).
+ */
+export function logInfo(message: string, context?: string): void {
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[${context || 'Info'}] ${message}`);
+  }
+}

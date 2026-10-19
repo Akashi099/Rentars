@@ -2,6 +2,7 @@
 
 import type { ListingFormData } from '../types';
 import { formStyles } from '../styles';
+import { buildDescribedBy } from '@/components/ui/form-field';
 
 interface HouseRulesStepProps {
   formData: Partial<ListingFormData>;
@@ -17,6 +18,14 @@ interface RuleToggleProps {
   onChange: (v: boolean) => void;
 }
 
+/**
+ * Toggle-style checkbox.
+ *
+ * The label wraps both the checkbox and the descriptive text so the entire
+ * row is clickable.  The description is rendered as a visible <span> so
+ * screen readers can associate it with the control without requiring a
+ * separate aria-describedby.
+ */
 function RuleToggle({ id, label, description, checked, onChange }: RuleToggleProps) {
   return (
     <label
@@ -31,8 +40,8 @@ function RuleToggle({ id, label, description, checked, onChange }: RuleTogglePro
         className="mt-1 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
       />
       <div>
-        <p className="font-medium text-gray-900">{label}</p>
-        <p className="text-sm text-gray-500">{description}</p>
+        <span className="block font-medium text-gray-900">{label}</span>
+        <span className="block text-sm text-gray-500">{description}</span>
       </div>
     </label>
   );
@@ -52,39 +61,42 @@ export default function HouseRulesStep({ formData, setFormData, errors }: HouseR
       </p>
 
       {/* Boolean rule flags */}
-      <div className="space-y-3">
-        <RuleToggle
-          id="petsAllowed"
-          label="Pets allowed"
-          description="Guests may bring well-behaved pets."
-          checked={formData.petsAllowed ?? false}
-          onChange={(v) => update({ petsAllowed: v })}
-        />
-        <RuleToggle
-          id="smokingAllowed"
-          label="Smoking allowed"
-          description="Guests may smoke on the property."
-          checked={formData.smokingAllowed ?? false}
-          onChange={(v) => update({ smokingAllowed: v })}
-        />
-        <RuleToggle
-          id="eventsAllowed"
-          label="Events / parties allowed"
-          description="Guests may host gatherings or events."
-          checked={formData.eventsAllowed ?? false}
-          onChange={(v) => update({ eventsAllowed: v })}
-        />
-      </div>
+      <fieldset>
+        <legend className="text-sm font-semibold text-gray-700 mb-3">Property rules</legend>
+        <div className="space-y-3">
+          <RuleToggle
+            id="rule-petsAllowed"
+            label="Pets allowed"
+            description="Guests may bring well-behaved pets."
+            checked={formData.petsAllowed ?? false}
+            onChange={(v) => update({ petsAllowed: v })}
+          />
+          <RuleToggle
+            id="rule-smokingAllowed"
+            label="Smoking allowed"
+            description="Guests may smoke on the property."
+            checked={formData.smokingAllowed ?? false}
+            onChange={(v) => update({ smokingAllowed: v })}
+          />
+          <RuleToggle
+            id="rule-eventsAllowed"
+            label="Events / parties allowed"
+            description="Guests may host gatherings or events."
+            checked={formData.eventsAllowed ?? false}
+            onChange={(v) => update({ eventsAllowed: v })}
+          />
+        </div>
+      </fieldset>
 
       {/* Quiet hours */}
-      <div className="border border-gray-200 rounded-lg p-4 space-y-3">
-        <p className="font-medium text-gray-900">Quiet hours</p>
-        <p className="text-sm text-gray-500">
+      <fieldset className="border border-gray-200 rounded-lg p-4 space-y-3">
+        <legend className="text-sm font-semibold text-gray-900 px-1">Quiet hours</legend>
+        <p id="quiet-hours-hint" className="text-sm text-gray-500">
           Leave both fields empty if there are no quiet hours.
         </p>
         <div className="grid grid-cols-2 gap-4">
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="quietHoursStart">
+            <label htmlFor="quietHoursStart" className={formStyles.label}>
               Start
             </label>
             <input
@@ -92,11 +104,12 @@ export default function HouseRulesStep({ formData, setFormData, errors }: HouseR
               type="time"
               value={formData.quietHoursStart ?? ''}
               onChange={(e) => update({ quietHoursStart: e.target.value })}
+              aria-describedby="quiet-hours-hint"
               className={formStyles.input}
             />
           </div>
           <div className={formStyles.formGroup}>
-            <label className={formStyles.label} htmlFor="quietHoursEnd">
+            <label htmlFor="quietHoursEnd" className={formStyles.label}>
               End
             </label>
             <input
@@ -104,20 +117,21 @@ export default function HouseRulesStep({ formData, setFormData, errors }: HouseR
               type="time"
               value={formData.quietHoursEnd ?? ''}
               onChange={(e) => update({ quietHoursEnd: e.target.value })}
+              aria-describedby="quiet-hours-hint"
               className={formStyles.input}
             />
           </div>
         </div>
         {quietEnabled && (
-          <p className="text-xs text-blue-700 bg-blue-50 px-3 py-2 rounded">
+          <p className="text-xs text-blue-700 bg-blue-50 px-3 py-2 rounded" aria-live="polite">
             Quiet hours: {formData.quietHoursStart || '—'} → {formData.quietHoursEnd || '—'}
           </p>
         )}
-      </div>
+      </fieldset>
 
       {/* Additional rules */}
       <div className={formStyles.formGroup}>
-        <label className={formStyles.label} htmlFor="additionalRules">
+        <label htmlFor="additionalRules" className={formStyles.label}>
           Additional rules
           <span className="ml-1 font-normal text-gray-400">(optional)</span>
         </label>
@@ -127,14 +141,27 @@ export default function HouseRulesStep({ formData, setFormData, errors }: HouseR
           value={formData.additionalRules ?? ''}
           onChange={(e) => update({ additionalRules: e.target.value })}
           placeholder="e.g. No shoes indoors, take trash out before checkout…"
-          className={formStyles.textarea}
           maxLength={2000}
+          aria-invalid={!!errors.additionalRules || undefined}
+          aria-describedby={buildDescribedBy('additionalRules', !!errors.additionalRules, true)}
+          className={errors.additionalRules ? formStyles.textareaError : formStyles.textarea}
         />
-        <p className="text-xs text-gray-400 text-right mt-1">
+        <p
+          id="additionalRules-hint"
+          className="text-xs text-gray-400 text-right mt-1"
+          aria-live="polite"
+        >
           {(formData.additionalRules ?? '').length} / 2000
         </p>
         {errors.additionalRules && (
-          <p className={formStyles.error}>{errors.additionalRules}</p>
+          <p
+            id="additionalRules-error"
+            role="alert"
+            aria-live="polite"
+            className={formStyles.error}
+          >
+            {errors.additionalRules}
+          </p>
         )}
       </div>
     </div>

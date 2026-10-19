@@ -1,6 +1,8 @@
+import { randomBytes } from 'node:crypto';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import jwt from 'jsonwebtoken';
 import { supabase } from '@/config/supabase.js';
+import { getJwtSecret } from '@/config/jwtSecret.js';
 import type { ServiceResponse } from './index.js';
 
 export interface ChallengeResponse {
@@ -21,8 +23,8 @@ export class WalletAuthService {
     }
 
     try {
-      // Generate a random challenge
-      const challenge = Keypair.random().publicKey();
+      // 256 bits of randomness, single use (consumed in verifySignature).
+      const challenge = randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + CHALLENGE_EXPIRY);
 
       // Store challenge in database
@@ -52,46 +54,35 @@ export class WalletAuthService {
     }
 
     try {
-      // Retrieve challenge from database
-      const { data: challengeData, error: fetchError } = await supabase
+      // Consume the challenge atomically before checking the signature. A
+      // delete that returns no row means another request already used it, so
+      // concurrent replays cannot both succeed.
+      const { data: consumed, error: consumeError } = await supabase
         .from('wallet_challenges')
-        .select('*')
+        .delete()
         .eq('address', address)
         .eq('challenge', challenge)
-        .single();
+        .gt('expires_at', new Date().toISOString())
+        .select('id');
 
-      if (fetchError || !challengeData) {
+      if (consumeError || !consumed || consumed.length === 0) {
         return { success: false, error: 'Challenge not found or expired' };
       }
 
-      // Check if challenge is expired
-      if (new Date(challengeData.expires_at) < new Date()) {
-        return { success: false, error: 'Challenge expired' };
-      }
-
-      // Verify signature
+      // Verify signature over the challenge bytes
       try {
         const keypair = Keypair.fromPublicKey(address);
         const signatureBuffer = Buffer.from(signature, 'base64');
         const challengeBuffer = Buffer.from(challenge);
 
-        keypair.verify(challengeBuffer, signatureBuffer);
+        if (!keypair.verify(challengeBuffer, signatureBuffer)) {
+          return { success: false, error: 'Invalid signature' };
+        }
       } catch (err) {
         return { success: false, error: 'Invalid signature' };
       }
 
-      // Delete used challenge
-      await supabase
-        .from('wallet_challenges')
-        .delete()
-        .eq('id', challengeData.id);
-
-      // Generate JWT token
-      const token = jwt.sign(
-        { address, type: 'wallet' },
-        process.env.JWT_SECRET || 'secret',
-        { expiresIn: '24h' },
-      );
+      const token = jwt.sign({ address, type: 'wallet' }, getJwtSecret(), { expiresIn: '24h' });
 
       // Create or update user profile
       const { error: upsertError } = await supabase.from('profiles').upsert({

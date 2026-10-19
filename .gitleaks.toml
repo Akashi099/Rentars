@@ -1,0 +1,38 @@
+# Gitleaks configuration — secret detection for Rentars.
+# Docs: https://github.com/gitleaks/gitleaks
+
+title = "Rentars gitleaks config"
+
+[extend]
+# Extend the default ruleset shipped with gitleaks.
+useDefault = true
+
+# ── False-positive suppression ────────────────────────────────────────────────
+# Suppress findings that are known-safe: test fixtures, mocked keys in CI env
+# blocks, and Supabase local-dev demo JWTs (publicly documented, not secret).
+
+[[rules]]
+id = "supabase-demo-anon-key"
+description = "Supabase local-dev demo anon key (public, not secret)"
+regex = '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9'''
+allowlist.description = "Supabase demo key — publicly documented, never a real credential"
+allowlist.regexes = ['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9']
+
+[[rules]]
+id = "supabase-demo-service-role-key"
+description = "Supabase local-dev demo service-role key (public, not secret)"
+regex = '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0'''
+allowlist.description = "Supabase demo service-role key — publicly documented, never a real credential"
+allowlist.regexes = ['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0']
+
+[allowlist]
+description = "Global allowlist — paths that should never be scanned"
+paths = [
+  # Lockfiles contain package registry tokens in integrity hashes — not secrets
+  '''yarn\.lock''',
+  '''package-lock\.json''',
+  '''bun\.lockb''',
+  '''Cargo\.lock''',
+  # The secret-detection fixture is intentionally a fake secret for CI tests
+  '''tests/fixtures/secret-detection\.fixture\.txt''',
+]

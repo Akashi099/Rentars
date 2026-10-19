@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import { searchPropertiesByQuery, searchPropertiesNearby } from '@/services/propertySearch.service.js';
 import type { NearbySearchParams } from '@/services/propertySearch.service.js';
+import { redactExactCoordinates } from '@/utils/locationPrivacy.js';
 
 export async function searchPropertiesEndpoint(req: Request, res: Response): Promise<void> {
   const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -15,7 +16,14 @@ export async function searchPropertiesEndpoint(req: Request, res: Response): Pro
     return;
   }
 
-  res.json(result.data);
+  // Search results are always public — redact exact coordinates.
+  const redacted = Array.isArray(result.data)
+    ? result.data.map((p) =>
+        redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+      )
+    : result.data;
+
+  res.json(redacted);
 }
 
 export async function searchNearbyEndpoint(req: Request, res: Response): Promise<void> {
@@ -31,6 +39,17 @@ export async function searchNearbyEndpoint(req: Request, res: Response): Promise
     return;
   }
 
-  res.json(result.data);
+  // Nearby results are public — redact exact coordinates.
+  // The spatial query uses server-side exact coordinates; only the response is redacted.
+  const items = Array.isArray(result.data) ? result.data : (result.data as { data?: unknown[] }).data ?? [];
+  const redacted = items.map((p) =>
+    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+  );
+
+  const responsePayload = Array.isArray(result.data)
+    ? redacted
+    : { ...(result.data as object), data: redacted };
+
+  res.json(responsePayload);
 }
 

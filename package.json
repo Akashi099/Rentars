@@ -19,7 +19,11 @@
     "lint": "biome check .",
     "lint:fix": "biome check . --write",
     "format": "biome format --write .",
-    "clean": "find . -name 'node_modules' -type d -prune -exec rm -rf '{}' + && find . -name 'dist' -type d -prune -exec rm -rf '{}' + && find . -name '.next' -type d -prune -exec rm -rf '{}' +"
+    "clean": "find . -name 'node_modules' -type d -prune -exec rm -rf '{}' + && find . -name 'dist' -type d -prune -exec rm -rf '{}' + && find . -name '.next' -type d -prune -exec rm -rf '{}' +",
+    "engines:check": "bash scripts/check-engines.sh",
+    "versions": "bash scripts/check-engines.sh",
+    "release:validate": "bun run scripts/validate-changelog.ts",
+    "release:manifest": "bun run scripts/generate-release-manifest.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
