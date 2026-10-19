@@ -159,6 +159,20 @@ const pt: TranslationSchema = {
     emptyWishlist: 'Sua lista de favoritos está vazia.',
     savedProperties: 'Imóveis salvos',
   },
+  currency: {
+    selectCurrency: 'Moeda de exibição',
+    displayNote: 'Os preços em {currency} são aproximados. O pagamento é sempre em USDC.',
+    rateAs: 'Taxa em {datetime}. Pagamento em USDC.',
+    rateStale: 'A taxa de câmbio pode estar desatualizada. Exibindo apenas o valor em USDC.',
+    settlementLabel: 'Valor de liquidação',
+    displayLabel: 'Valor aproximado de exibição',
+    rateSourceLabel: 'Fonte da taxa',
+    rateTimestampLabel: 'Data da taxa',
+    usdcOnly: 'Valor em USDC (moeda de liquidação)',
+    // TODO(i18n): translate
+    nightCount: '{count} noite',
+    nightCountPlural: '{count} noites',
+  },
 };
 
 export default pt;

@@ -28,6 +28,7 @@ import {
   DUAL_APPROVAL_REQUIRED,
   roleHasScope,
 } from '@/config/adminScopes.js';
+import { getJwtSecret } from '@/config/jwtSecret.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
 
 export interface AdminRequest extends Request {
@@ -53,7 +54,8 @@ export function requireAdminRole(
   }
 
   try {
-    const secret = process.env.ADMIN_JWT_SECRET || process.env.JWT_SECRET || 'secret';
+    // Fail closed: never verify admin tokens against a guessable default key.
+    const secret = process.env.ADMIN_JWT_SECRET || getJwtSecret();
     const decoded = jwt.verify(token, secret) as { userId: string; role?: string };
 
     const adminRoles = new Set(['admin', 'moderator', 'support', 'finance']);

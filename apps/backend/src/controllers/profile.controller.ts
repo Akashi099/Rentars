@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
+import { auditLogger } from '@/services/auditLogger.service.js';
 import {
   getProfile,
   getPublicProfile,
@@ -51,5 +52,16 @@ export async function updateStellarAddressHandler(
     res.status(400).json({ error: result.error });
     return;
   }
+
+  await auditLogger.log({
+    actorId: req.userId,
+    action: 'account.wallet_link',
+    resourceType: 'account',
+    resourceId: req.userId,
+    ip: req.ip,
+    success: true,
+    meta: { stellar_address },
+  });
+
   res.json(result.data);
 }

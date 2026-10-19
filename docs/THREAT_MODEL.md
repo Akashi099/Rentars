@@ -407,20 +407,44 @@ structuredLog({
 
 ## Security Controls Summary
 
+Test column lists automated tests that exist in the repository. Rows marked
+**none** are residual risks with no automated coverage yet; they are tracked in the
+register below.
+
 | Threat | Control Type | Implementation | Test |
 |--------|-------------|-----------------|------|
-| IDOR | Access control | User ownership verification in queries | `security-idor.test.ts` |
-| Privilege escalation | Authentication | JWT signature verification, DB role check | `security-privilege-escalation.test.ts` |
-| Replay attacks | Idempotency | Idempotency key caching | `security-replay.test.ts` |
-| CSRF | State protection | CSRF tokens (double-submit cookies) | `csrf-protection.test.ts` |
-| SSRF | Input validation | Allowlist of valid Stellar addresses | `security-ssrf.test.ts` |
-| SQL injection | Parameterization | Supabase PostgREST + Zod validation | `security-injection.test.ts` |
-| XSS | Output encoding | Frontend sanitization, CSP header | `security-xss.test.ts` |
-| File upload | Validation | Magic bytes, dimensions, SVG scan | `file-upload-validation.test.ts` |
-| Log leakage | Data minimization | Sanitized logs (no PII) | `security-log-leakage.test.ts` |
-| Wallet mismatch | Configuration validation | Network passphrase check | `security-wallet-network-mismatch.test.ts` |
-| DoS | Rate limiting | Tiered limits (IP, user, endpoint) | `security-rate-limiting.test.ts` |
-| Data breach | Encryption + access control | HTTPS, Supabase encryption, RLS | Monitoring |
+| IDOR (booking, profile, property/image, privacy records) | Access control | Ownership enforced in every query (`eq('owner_id')`, `eq('property_id')`, `eq('user_id')`) | `tests/unit/security.regression.test.ts` (cross-tenant block) |
+| JWT forgery / privilege escalation | Authentication | Signature verified with `JWT_SECRET` only; fails closed if unset (`config/jwtSecret.ts`); admin gate checks role after verification | `tests/unit/security.regression.test.ts` (authenticate, admin gate) |
+| Wallet replay / signature forgery | Single-use challenge | Challenge consumed atomically (`DELETE ... RETURNING`) before signature check; 256-bit random challenge; 5-minute expiry | `tests/unit/security.regression.test.ts` (wallet challenge) |
+| Deletion abuse / stranded escrow | Business rule + re-verification | Password re-verified; exact confirmation phrase; 409 while bookings are open; worker re-checks before anonymising | `tests/unit/privacy.lifecycle.test.ts` |
+| File upload (spoofed type, bombs, SVG, orphans) | Content validation | Magic bytes decide format; pixel budget; re-encode to WebP; no raw fallback; orphan cleanup | `tests/unit/propertyImage.upload-security.test.ts` |
+| CSRF | State protection | Double-submit cookies | `src/__tests__/csrf-protection.test.ts` (vitest; not in the CI unit suite) |
+| Wallet network mismatch | Client-side check | `signWithFreighter` compares wallet network before signing; server never accepts client-signed envelopes | `apps/web/src/lib/__tests__/freighter-utils.test.ts` (NETWORK_MISMATCH) |
+| Rate limiting / DoS | Tiered limits | Per-IP, per-user (`createUserRateLimiter`), per-endpoint | none (residual, see register) |
+| SSRF | Input validation | Storage paths derived from DB records and UUID-validated ids | none (residual, see register) |
+| SQL injection | Parameterization | PostgREST query builder plus Zod validation | none (residual, see register) |
+| XSS | Output encoding | Frontend sanitization, CSP header | none (residual, see register) |
+| Log leakage | Data minimization | Sensitive-key lists in analytics and tracing | none (residual, see register) |
+| Data breach | Encryption and access control | HTTPS, Supabase encryption at rest, RLS | Monitoring only |
+
+The former `src/__tests__/security-regression-suite.test.ts` only asserted that two
+literals differ, so it caught no regressions. It is superseded by
+`tests/unit/security.regression.test.ts`.
+
+## Unresolved Risks Register
+
+Owners are roles, not named people. Each owner must be assigned to a named person
+before the review date.
+
+| # | Risk | Severity | Owner (role) | Mitigation status | Review date |
+|---|------|----------|--------------|-------------------|-------------|
+| R1 | Compromised `JWT_SECRET` enables impersonation and admin access | Critical | Platform lead | Fallback removed; rotation process to be documented | 2026-11-19 |
+| R2 | Deletion does not yet anonymise reviews or message content authored by the user | High | Backend lead, with privacy/legal review | Documented in `SECURITY_DATA_LIFECYCLE.md`; not yet implemented | 2026-11-19 |
+| R3 | Export payloads hold a full personal-data copy for up to 7 days in the database | High | Backend lead | Payload cleared on expiry and deletion; encryption at rest of the column not verified | 2026-11-19 |
+| R4 | Wallet-only accounts (no password) cannot pass password re-verification, so they cannot delete their account | Medium | Product owner with backend lead | Fails closed (cannot delete); a re-auth method for wallet users is needed | 2026-11-19 |
+| R5 | Property images are served from a public bucket with no signed or expiring URLs | Medium | Platform lead | Accepted for listing photos; revisit if private property media is added | 2026-12-19 |
+| R6 | Rate limiting, SSRF, injection, XSS and log-leakage controls lack automated regression tests | High | Backend lead | Controls exist; tests not yet written | 2026-11-19 |
+| R7 | Migration filename validator fails on existing duplicate prefixes, so the CI job cannot pass | Medium | Backend lead | Duplicates must not be renamed (applied migrations); validator needs an allowlist | 2026-11-19 |
 
 ## Residual Risks & Monitoring
 
@@ -451,15 +475,17 @@ structuredLog({
 
 ## Security Testing
 
-All critical paths have automated regression tests in `apps/backend/src/__tests__/`:
+Regression tests that run in CI (`bun run test:unit`, which covers `tests/unit`):
 
 ```bash
-# Run all security tests
-bun test __tests__/security-*.test.ts
-
-# Run specific threat scenario
-bun test __tests__/security-idor.test.ts
+cd apps/backend
+bun test tests/unit/security.regression.test.ts            # forgery, replay, IDOR
+bun test tests/unit/privacy.lifecycle.test.ts              # export and deletion rules
+bun test tests/unit/propertyImage.upload-security.test.ts  # upload content checks
 ```
+
+Mutation check: restoring the `'secret'` fallback in `auth.middleware.ts` makes the
+"fails closed when JWT_SECRET is unset" test fail.
 
 ## Related Documentation
 

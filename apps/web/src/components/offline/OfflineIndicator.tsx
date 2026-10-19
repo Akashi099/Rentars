@@ -1,19 +1,31 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { AlertTriangle, Wifi, WifiOff } from 'lucide-react';
+import { AlertTriangle, Wifi, WifiOff, Clock } from 'lucide-react';
 
 interface OfflineIndicatorProps {
   isOnline: boolean;
   isStale?: boolean;
   isRetrying?: boolean;
+  cacheAge?: number | null;
   onRetry?: () => void;
+}
+
+function formatCacheAge(ageMs: number): string {
+  const seconds = Math.floor(ageMs / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+
+  if (hours > 0) return `${hours}h ago`;
+  if (minutes > 0) return `${minutes}m ago`;
+  return `${seconds}s ago`;
 }
 
 export function OfflineIndicator({
   isOnline,
   isStale,
   isRetrying,
+  cacheAge,
   onRetry,
 }: OfflineIndicatorProps) {
   const [showIndicator, setShowIndicator] = useState(false);
@@ -60,8 +72,17 @@ export function OfflineIndicator({
           >
             {isDegraded
               ? 'This information was last updated a while ago. Refresh to get the latest.'
-              : 'You can still view cached information, but changes cannot be saved.'}
+              : 'You can still view cached information, but bookings, payments, and updates are unavailable.'}
           </p>
+
+          {cacheAge !== null && cacheAge !== undefined && (
+            <p className={`text-xs mt-2 flex items-center gap-1 ${
+              isDegraded ? 'text-yellow-600' : 'text-red-600'
+            }`}>
+              <Clock size={12} />
+              <span>Data from {formatCacheAge(cacheAge)}</span>
+            </p>
+          )}
 
           {onRetry && (isOnline || isRetrying) && (
             <button

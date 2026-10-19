@@ -1,297 +1,93 @@
 # Automated Database Backup Restore Verification
 
-This document describes the automated backup restore drill procedure for the Rentars database, ensuring that production backups can be successfully restored with all schema, RLS policies, and extensions intact.
+A backup is only useful if it restores. This document describes the restore drill that proves the Rentars database can be recovered with its schema, extensions, RLS policies, and representative data intact. The drill is implemented in [`scripts/backup-restore-drill.sh`](../scripts/backup-restore-drill.sh) and runs in two places:
 
-## Overview
+- **CI** (`restore-drill` job in `.github/workflows/ci.yml`) on every push and pull request, against the canonical migrations and sanitized seed data in `tests/fixtures/restore-drill/`.
+- **Scheduled** (`.github/workflows/restore-drill.yml`) every Monday at 03:30 UTC, against the sanitized nonproduction database.
 
-The backup restore verification process:
-1. Exports a non-production sanitized database backup
-2. Restores it into an isolated verification database
-3. Validates critical tables, policies, and extensions
-4. Executes representative reads and writes
-5. Records recovery time and failure alerts
-6. Destroys the temporary verification environment
+## What the Drill Does
 
-## Restore Drill Procedure
+1. **Export** an encrypted backup (`pg_dump --format=custom`, encrypted with AES-256-CBC via `openssl`, PBKDF2, 600 000 iterations). The plaintext dump is deleted immediately after encryption. A SHA-256 manifest is written alongside the encrypted file. Alternatively, an existing backup can be supplied with `DRILL_SOURCE_BACKUP`.
+2. **Verify integrity.** The encrypted file's SHA-256 must match the manifest, the file must decrypt with `BACKUP_ENCRYPTION_KEY`, and `pg_restore --list` must read the archive table of contents. Any mismatch stops the drill: an incomplete or corrupt backup is reported as a failed check.
+3. **Restore** into a new, uniquely named database on the scratch instance using `pg_restore --exit-on-error`. The first SQL error fails the drill.
+4. **Assert**:
+   - Critical tables exist (`users`, `properties`, `bookings`, `payments`, `notifications`, `audit_logs`).
+   - Row counts match the source exactly, when the source is available (export mode).
+   - Required extensions are installed (`postgis`, `btree_gist` by default; override with `DRILL_REQUIRED_EXTENSIONS`).
+   - Row level security is enabled on the policy-bearing tables and at least one policy exists in `public`.
+   - No payment references a missing booking, and no booking references a missing property.
+   - A representative read succeeds, and a representative audit write is accepted inside a transaction that is then rolled back. The drill confirms the probe row did not survive.
+5. **Record** the results. The drill writes `restore-drill-<id>.json` (status, per-check results, backup SHA-256 and size, RTO, backup age) and `restore-drill-<id>.log` to `DRILL_REPORT_DIR`. Both are written even when the drill fails.
+6. **Destroy** the temporary database, whether the drill passed or failed, and delete all working files. The report is kept.
 
-### Prerequisites
+The exit status is `0` only when every check passes.
 
-- PostgreSQL client tools (`psql`, `pg_dump`, `pg_restore`)
-- Access to production backup storage (AWS S3, Supabase backups, or local)
-- A separate isolated PostgreSQL instance for verification
-- Database credentials with superuser or restore privileges
-- Notification system configured for alerts (email, Slack, PagerDuty)
+### Recovery metrics
 
-### Step 1: Backup Export
+| Metric | Definition in the report |
+|--------|--------------------------|
+| RTO (`recovery.rto_seconds`) | Seconds from the start of `pg_restore` until validation completes |
+| Backup age (`recovery.backup_age_seconds`) | Seconds between the moment the backup was taken and the moment the drill finished. This bounds the data-loss window (RPO) at the time of the drill. |
 
-Export a non-production sanitized backup:
+The RPO a production deployment can actually achieve is determined by how often backups run. Backup age reported by the drill shows whether the most recent backup is within that interval.
 
-```bash
-# For Supabase, use their backup download feature or:
-# For self-hosted PostgreSQL:
-BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="rentars_backup_${BACKUP_TIMESTAMP}.dump"
+## Configuration
 
-pg_dump \
-  --host=$PROD_DB_HOST \
-  --username=$PROD_DB_USER \
-  --password \
-  --format=custom \
-  --verbose \
-  --no-owner \
-  rentars > "$BACKUP_FILE"
+Required environment:
 
-# Encrypt the backup before storage
-openssl enc -aes-256-cbc -in "$BACKUP_FILE" -out "${BACKUP_FILE}.enc"
-```
+| Variable | Purpose |
+|----------|---------|
+| `BACKUP_ENCRYPTION_KEY` | Passphrase for the encrypted backup. Store it in the secret manager, never in the repository. |
+| `VERIFY_DB_HOST`, `VERIFY_DB_USER`, `VERIFY_DB_PASSWORD` | Scratch PostgreSQL instance. The user needs rights to create and drop databases and to create extensions. |
+| `PROD_DB_HOST`, `PROD_DB_USER`, `PROD_DB_PASSWORD` | Source database. Required unless `DRILL_SOURCE_BACKUP` is set. Use the sanitized nonproduction database. |
 
-### Step 2: Restore to Isolated Database
+Optional environment:
 
-```bash
-# Create isolated verification database
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -c "CREATE DATABASE rentars_verify;"
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PROD_DB_PORT`, `VERIFY_DB_PORT` | `5432` | Server ports |
+| `PROD_DB_NAME` | `rentars` | Source database name |
+| `DRILL_SOURCE_BACKUP` | unset | Reuse an encrypted backup instead of exporting; expects `<path>.sha256` beside it |
+| `DRILL_BACKUP_OUT` | unset | Keep a copy of the encrypted backup and manifest |
+| `DRILL_REPORT_DIR` | `restore-drill-reports` | Where the JSON report and log are written |
+| `DRILL_REQUIRED_EXTENSIONS` | `postgis btree_gist` | Extensions that must be installed after restore |
 
-# Record start time
-RESTORE_START=$(date +%s)
-
-# Restore from backup
-pg_restore \
-  --host=$VERIFY_DB_HOST \
-  --username=$VERIFY_DB_USER \
-  --password \
-  --dbname=rentars_verify \
-  --verbose \
-  --no-owner \
-  "$BACKUP_FILE"
-
-# Record end time and calculate recovery time
-RESTORE_END=$(date +%s)
-RECOVERY_TIME=$((RESTORE_END - RESTORE_START))
-echo "Recovery Time Objective (RTO): ${RECOVERY_TIME}s"
-```
-
-### Step 3: Validate Schema and Extensions
+Run locally:
 
 ```bash
-# Check critical extensions
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-  "SELECT extname FROM pg_extension WHERE extname IN ('uuid-ossp', 'pgcrypto', 'pgtrgm');"
-
-# Verify critical tables exist
-TABLES=(
-  "users" "properties" "bookings" "payments"
-  "notifications" "audit_logs" "messages"
-)
-
-for table in "${TABLES[@]}"; do
-  psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-    "SELECT COUNT(*) as row_count FROM $table;" \
-    || echo "ERROR: Table $table not found"
-done
+export BACKUP_ENCRYPTION_KEY="$(openssl rand -hex 32)"   # keep this key to decrypt the backup later
+export PROD_DB_HOST=... PROD_DB_USER=... PROD_DB_PASSWORD=...
+export VERIFY_DB_HOST=... VERIFY_DB_USER=... VERIFY_DB_PASSWORD=...
+bash scripts/backup-restore-drill.sh
 ```
 
-### Step 4: Validate RLS Policies
+The drill needs `psql`, `pg_dump`, `pg_restore`, `openssl`, and `sha256sum`. The dump and restore tools should be at least as new as the server.
 
-```bash
-# Check Row-Level Security policies
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-  "SELECT schemaname, tablename, policyname, permissive, roles, qual \
-   FROM pg_policies \
-   WHERE schemaname = 'public' \
-   ORDER BY tablename, policyname;"
+## Failure Behaviour
 
-# Verify critical policies are present
-REQUIRED_POLICIES=(
-  "users_auth_policy"
-  "properties_rls"
-  "bookings_rls_tenant"
-  "bookings_rls_host"
-)
+| Failure | Check that fails | Drill result |
+|---------|------------------|--------------|
+| Export cannot connect or dump | — (fatal) | Failed, no backup retained |
+| Backup truncated or altered | `backup_checksum` | Failed before any restore |
+| Wrong key or unreadable file | `backup_decrypt` | Failed before any restore |
+| Archive damaged | `archive_readable` | Failed before any restore |
+| Restore error | `restore` | Failed, temporary database dropped |
+| Missing table, extension, or RLS | `rows:*`, `extension:*`, `rls:*` | Failed after the restore completes |
+| Row count drift vs. source | `rows:*` | Failed |
+| Write probe leaves a row behind | `write_probe` | Failed |
 
-for policy in "${REQUIRED_POLICIES[@]}"; do
-  psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-    "SELECT COUNT(*) FROM pg_policies WHERE policyname = '$policy';" \
-    || echo "WARN: Policy $policy not found"
-done
-```
+A failed workflow run is the alert. Repository notification settings route it to the operations team. Recovery time above the target in the table below should be reviewed from the report even when the drill passes.
 
-### Step 5: Execute Representative Operations
+## Continuous Verification in CI
 
-```bash
-# Test representative read
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-  "SELECT id, name, email FROM users LIMIT 1;"
+The `restore-drill` job:
 
-# Test transaction
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify <<EOF
-BEGIN;
-INSERT INTO audit_logs (action, user_id, target_table, target_id, created_at)
-VALUES ('restore_test', null, 'test', 'test', NOW());
-ROLLBACK;
-EOF
-```
-
-### Step 6: Cleanup
-
-```bash
-# Drop verification database
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -c "DROP DATABASE IF EXISTS rentars_verify;"
-
-# Cleanup backup files
-rm -f "$BACKUP_FILE" "${BACKUP_FILE}.enc"
-```
-
-## Automated Restore Drill Script
-
-A shell script `scripts/backup-restore-drill.sh` automates the entire process:
-
-```bash
-#!/bin/bash
-set -e
-
-BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-DRILL_LOG="restore_drill_${BACKUP_TIMESTAMP}.log"
-ALERT_EMAIL="ops@rentars.app"
-
-# Capture all output
-exec &> >(tee -a "$DRILL_LOG")
-
-echo "=== Backup Restore Verification Drill ==="
-echo "Started at $(date)"
-
-# Step 1: Export backup
-echo "Step 1: Exporting backup..."
-pg_dump --host=$PROD_DB_HOST --username=$PROD_DB_USER --format=custom \
-  --no-owner rentars > "backup_${BACKUP_TIMESTAMP}.dump" 2>&1
-
-# Step 2: Restore
-echo "Step 2: Restoring to verification database..."
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -c "CREATE DATABASE rentars_verify;" 2>&1
-
-RESTORE_START=$(date +%s)
-pg_restore --host=$VERIFY_DB_HOST --username=$VERIFY_DB_USER \
-  --dbname=rentars_verify --no-owner "backup_${BACKUP_TIMESTAMP}.dump" 2>&1 || {
-  echo "CRITICAL: Restore failed"
-  mail -s "Restore Drill FAILED" "$ALERT_EMAIL" < "$DRILL_LOG"
-  exit 1
-}
-RESTORE_END=$(date +%s)
-RECOVERY_TIME=$((RESTORE_END - RESTORE_START))
-
-# Step 3: Validate
-echo "Step 3: Validating schema and policies..."
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-  "SELECT COUNT(*) as tables FROM information_schema.tables WHERE table_schema = 'public';" 2>&1
-
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -d rentars_verify -c \
-  "SELECT COUNT(*) as policies FROM pg_policies WHERE schemaname = 'public';" 2>&1
-
-# Step 4: Cleanup
-echo "Step 4: Cleanup..."
-psql -h $VERIFY_DB_HOST -U $VERIFY_DB_USER -c "DROP DATABASE rentars_verify;" 2>&1
-rm -f "backup_${BACKUP_TIMESTAMP}.dump"
-
-echo "=== Restore Drill Completed Successfully ==="
-echo "Recovery Time: ${RECOVERY_TIME}s"
-echo "Recovery Point Objective (RPO): Configuration-dependent (check backup schedule)"
-echo "Completed at $(date)"
-
-# Send success notification
-mail -s "Restore Drill PASSED - RTO: ${RECOVERY_TIME}s" "$ALERT_EMAIL" < "$DRILL_LOG"
-```
-
-## Scheduled Execution
-
-Configure the restore drill to run on a scheduled basis (weekly or monthly):
-
-### Cron Configuration
-
-```cron
-# Run backup restore drill every Sunday at 02:00 UTC
-0 2 * * 0 /home/rentars/scripts/backup-restore-drill.sh
-```
-
-### GitHub Actions Workflow
-
-Create `.github/workflows/backup-restore-drill.yml`:
-
-```yaml
-name: Backup Restore Verification Drill
-
-on:
-  schedule:
-    - cron: '0 2 * * 0'  # Weekly on Sunday 2 AM UTC
-  workflow_dispatch:
-
-jobs:
-  restore-drill:
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup PostgreSQL CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client
-      
-      - name: Run Restore Drill
-        env:
-          PROD_DB_HOST: ${{ secrets.PROD_DB_HOST }}
-          PROD_DB_USER: ${{ secrets.PROD_DB_USER }}
-          PROD_DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
-          VERIFY_DB_HOST: ${{ secrets.VERIFY_DB_HOST }}
-          VERIFY_DB_USER: ${{ secrets.VERIFY_DB_USER }}
-          VERIFY_DB_PASSWORD: ${{ secrets.VERIFY_DB_PASSWORD }}
-        run: bash scripts/backup-restore-drill.sh
-      
-      - name: Upload Drill Report
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: restore-drill-logs
-          path: restore_drill_*.log
-      
-      - name: Notify on Failure
-        if: failure()
-        uses: actions/github-script@v6
-        with:
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: 'Backup restore drill FAILED. Check workflow logs.'
-            })
-```
-
-## Acceptance Criteria Validation
-
-The restore drill proves:
-
-- ✅ Users table restored successfully with row count
-- ✅ Properties table restored successfully with row count
-- ✅ Bookings table restored successfully with row count
-- ✅ Payments table restored successfully with row count
-- ✅ Notifications table restored successfully with row count
-- ✅ Audit records restored successfully with row count
-- ✅ All critical RLS policies present and enabled
-- ✅ All required extensions (uuid-ossp, pgcrypto, pgtrgm) present
-- ✅ Representative read and write operations succeed
-- ✅ Recovery Time Objective (RTO) recorded and documented
-- ✅ Recovery Point Objective (RPO) based on backup frequency
-- ✅ Corrupt or incomplete backup detection via restore errors
-- ✅ Failure alerts sent to ops team on any restore failure
-
-## Alert Configuration
-
-Set up alerts for:
-
-- Restore drill execution begins
-- Restore drill completes (success/failure)
-- Recovery Time exceeds threshold (e.g., > 30 minutes)
-- Recovery Point Objective (RPO) exceeded (backup too old)
-- Corrupt backup detected during restore
+1. Starts the Supabase Postgres image used by the RLS tests.
+2. Applies `apps/backend/database/setup.sql` to a `rentars` database, so the drill restores the real schema and policies.
+3. Loads `tests/fixtures/restore-drill/sanitized-seed.sql` (synthetic `.example` identities only).
+4. Runs the drill with an ephemeral key generated per run.
+5. Truncates a copy of the encrypted backup to half its size and asserts that the drill rejects it.
+6. Uploads the reports as an artifact.
 
 ## Recovery Time Targets (RTO)
 
@@ -304,9 +100,7 @@ Set up alerts for:
 
 ## See Also
 
-- [`docs/RECOVERY_RUNBOOK.md`](./RECOVERY_RUNBOOK.md) — Full cross-component recovery runbook; this document is the database-only drill referenced by its §6.2.
-- [`scripts/recovery-drill.sh`](../scripts/recovery-drill.sh) — Multi-component drill (DB restore + cache rebuild + sync resume + booking lookup + reconciliation).
-- [DEPLOYMENT.md](../DEPLOYMENT.md) — Deployment procedures and rollback
-- [admin-runbooks.md](./admin-runbooks.md) — Operational runbooks
+- [DEPLOYMENT.md](../DEPLOYMENT.md): deployment procedures and rollback
+- [admin-runbooks.md](./admin-runbooks.md): operational runbooks
 - PostgreSQL [pg_dump documentation](https://www.postgresql.org/docs/current/app-pgdump.html)
 - PostgreSQL [pg_restore documentation](https://www.postgresql.org/docs/current/app-pgrestore.html)

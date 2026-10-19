@@ -5,6 +5,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { checkCoordinates, isRetryableGeocodingFailure } from '../utils/geolocationStatus.js';
 
 export interface GeocodingResult {
   latitude: number;
@@ -25,6 +26,13 @@ export interface GeocodingBatchResult {
 const CONFIDENCE_THRESHOLD = 0.7; // Flag for review if below this
 const RATE_LIMIT_MS = 500; // Delay between requests to avoid API throttling
 const BATCH_SIZE = 50; // Process in batches to manage memory
+const GEOCODE_MAX_ATTEMPTS = 3; // Transient geocoder failures are retried with backoff
+const GEOCODE_RETRY_BASE_MS = 1000;
+
+export interface GeocodingBatchOptions {
+  /** When true, geocode and report results without writing to the database. */
+  dryRun?: boolean;
+}
 
 /**
  * Normalize address components by removing extra whitespace and standardizing format.
@@ -47,45 +55,64 @@ function normalizeAddress(
  * Returns null if geocoding fails; clients should handle and retry.
  */
 async function geocodeAddress(address: string): Promise<GeocodingResult | null> {
-  try {
+  for (let attempt = 1; attempt <= GEOCODE_MAX_ATTEMPTS; attempt++) {
     const params = new URLSearchParams({
       q: address,
       format: 'json',
       limit: '1',
     });
 
-    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
-      headers: { 'User-Agent': 'Rentars/1.0' },
-    });
+    let failure: number | 'network';
+    try {
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+        headers: { 'User-Agent': 'Rentars/1.0' },
+      });
 
-    if (!response.ok) {
+      if (response.ok) {
+        return parseNominatimResponse(await response.json());
+      }
       console.error(`Nominatim API error: ${response.status}`);
-      return null;
+      failure = response.status;
+    } catch (error) {
+      console.error('Geocoding error:', error);
+      failure = 'network';
     }
 
-    const results = (await response.json()) as Array<{
-      lat: string;
-      lon: string;
-      display_name: string;
-      importance: number;
-    }>;
-
-    if (!results || results.length === 0) {
+    if (!isRetryableGeocodingFailure(failure) || attempt === GEOCODE_MAX_ATTEMPTS) {
       return null;
     }
-
-    const result = results[0];
-    return {
-      latitude: parseFloat(result.lat),
-      longitude: parseFloat(result.lon),
-      provider: 'nominatim',
-      confidence: result.importance ?? 0.5,
-      formattedAddress: result.display_name,
-    };
-  } catch (error) {
-    console.error('Geocoding error:', error);
-    return null;
+    await delay(GEOCODE_RETRY_BASE_MS * 2 ** (attempt - 1));
   }
+  return null;
+}
+
+/**
+ * Convert a Nominatim search response into a geocoding result. Returns null for
+ * empty or unparseable responses, and for coordinates that fail validation, so
+ * an invalid point is never written to a listing.
+ */
+function parseNominatimResponse(body: unknown): GeocodingResult | null {
+  const results = Array.isArray(body) ? (body as Array<{
+    lat: string;
+    lon: string;
+    display_name: string;
+    importance: number;
+  }>) : [];
+
+  if (results.length === 0) return null;
+
+  const result = results[0];
+  const latitude = parseFloat(result.lat);
+  const longitude = parseFloat(result.lon);
+  if (!checkCoordinates(latitude, longitude).valid) return null;
+
+  return {
+    latitude,
+    longitude,
+    provider: 'nominatim',
+    confidence: result.importance ?? 0.5,
+    formattedAddress: result.display_name,
+  };
 }
 
 /**
@@ -100,7 +127,10 @@ function delay(ms: number): Promise<void> {
  * Processes in batches with rate limiting.
  * Returns summary of results including error list.
  */
-export async function geocodePropertiesBatch(): Promise<ServiceResponse<GeocodingBatchResult>> {
+export async function geocodePropertiesBatch(
+  options: GeocodingBatchOptions = {},
+): Promise<ServiceResponse<GeocodingBatchResult>> {
+  const dryRun = options.dryRun === true;
   const result: GeocodingBatchResult = {
     totalProperties: 0,
     successCount: 0,
@@ -110,11 +140,12 @@ export async function geocodePropertiesBatch(): Promise<ServiceResponse<Geocodin
   };
 
   try {
-    // Fetch all properties that need geocoding
+    // Fetch all properties that need geocoding. Failed rows are included so a
+    // transient geocoder outage is retried on the next run.
     const { data: properties, error } = await supabase
       .from('properties')
       .select('id, address, city, country, latitude, longitude, geocoding_status')
-      .or('geocoding_status.eq.pending,latitude.is.null');
+      .or('geocoding_status.in.(pending,failed),latitude.is.null');
 
     if (error) {
       result.errors.push(`Failed to fetch properties: ${error.message}`);
@@ -153,8 +184,8 @@ export async function geocodePropertiesBatch(): Promise<ServiceResponse<Geocodin
           result.failureCount++;
           result.errors.push(`Property ${prop.id}: Geocoding failed for ${normalizedAddress}`);
 
-          // Update status to failed
-          await supabase
+          // Update status to failed so the next run retries this listing
+          if (!dryRun) await supabase
             .from('properties')
             .update({
               geocoding_status: 'failed',
@@ -169,6 +200,11 @@ export async function geocodePropertiesBatch(): Promise<ServiceResponse<Geocodin
         const requiresReview = geocoded.confidence < CONFIDENCE_THRESHOLD;
         if (requiresReview) {
           result.lowConfidenceCount++;
+        }
+
+        if (dryRun) {
+          result.successCount++;
+          continue;
         }
 
         // Update property with geocoded data
@@ -215,13 +251,9 @@ export async function validateGeolocation(
   reason?: string,
 ): Promise<ServiceResponse<null>> {
   try {
-    // Validate coordinates
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-      return { success: false, error: 'Invalid coordinates' };
-    }
-
-    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
-      return { success: false, error: 'Coordinates out of valid range' };
+    const check = checkCoordinates(latitude, longitude);
+    if (!check.valid) {
+      return { success: false, error: check.reason ?? 'Invalid coordinates' };
     }
 
     // Get current property to log correction
