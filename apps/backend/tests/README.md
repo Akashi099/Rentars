@@ -13,6 +13,7 @@ and what it protects against.
 | `bun run test:contract` | `tests/contract.test.ts` | OpenAPI schema + status-code contract |
 | `bun run test:property-based` | `tests/unit/property-based.test.ts` | Generative invariant tests |
 | `bun run test:concurrency` | `tests/integration/concurrency.test.ts` | Race-condition + availability correctness |
+| `bun run test:performance` | `tests/integration/booking-performance.test.ts` | Arrival-rate scenario, latency/error targets, saturation, DB lock + Redis telemetry |
 | `bun run test:journey` | `tests/integration/booking-journey.test.ts` | Full booking lifecycle E2E |
 | `bun run test:e2e` | `tests/integration/booking-e2e.test.ts` | Legacy booking lifecycle (mocked) |
 | `bun run test:rls` | `tests/rls/**` | Row Level Security (live Supabase) |
