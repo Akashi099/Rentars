@@ -48,6 +48,7 @@ export type AdminScope =
   // Refund / financial
   | 'admin:refunds:approve'    // HIGH-RISK: financial action, dual-approval required
   | 'admin:reconciliation:read'
+  | 'admin:reconciliation:write'  // retry / escalate reconciliation cases
   // Email delivery tracking (added: feature 1)
   | 'admin:email:read'
   // Notification monitoring (added: feature 2)
@@ -85,6 +86,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:ratelimits:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:reconciliation:write',
     'admin:email:read',
     'admin:notifications:read',
     'admin:abuse:read',
@@ -112,14 +114,15 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:ratelimits:read',
     'admin:audit:read',
     'admin:abuse:read',
+    'admin:reconciliation:read',  // read-only view for support investigation (#772)
   ],
   finance: [
     'admin:bookings:read',
     'admin:disputes:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:reconciliation:write', // retry / escalate / resolve (#772)
     'admin:audit:read',
-    'admin:support:read',
   ],
 };
 

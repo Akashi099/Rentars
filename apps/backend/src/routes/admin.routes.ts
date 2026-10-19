@@ -125,4 +125,11 @@ router.use('/email', emailAdminRoutes);
 // Mounted at /api/v1/admin/notifications/*
 router.use('/notifications', notificationMonitorRoutes);
 
+// ── Reconciliation operations (#772) ─────────────────────────────────────────
+// Scoped sub-router — read requires admin:reconciliation:read,
+//                     write requires admin:reconciliation:write
+// Mounted at /api/v1/admin/reconciliation/*
+import reconciliationRoutes from './reconciliation.routes.js';
+router.use('/reconciliation', reconciliationRoutes);
+
 export default router;

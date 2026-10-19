@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { PaymentErrorDisplay } from '@/components/payment/PaymentErrorDisplay';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 const POLL_INTERVAL_MS = 3_000;
@@ -26,6 +27,12 @@ interface PaymentStatusProps {
   status?: PaymentStatusValue;
   /** TX hash if already known */
   txHash?: string;
+  /**
+   * The last error thrown by the wallet or payment flow.
+   * When provided and status is 'failed' or 'timed_out', this component renders
+   * a PaymentErrorDisplay with classified messaging instead of the generic copy.
+   */
+  lastError?: unknown;
 }
 
 const STATE_CONFIG: Record<
@@ -85,6 +92,7 @@ export function PaymentStatus({
   onCancel,
   status: controlledStatus,
   txHash: initialTxHash,
+  lastError,
 }: PaymentStatusProps) {
   const [internalStatus, setInternalStatus] = useState<PaymentStatusValue>('idle');
   const [txHash, setTxHash] = useState<string | undefined>(initialTxHash);
@@ -137,6 +145,8 @@ export function PaymentStatus({
 
   const showRetry = status === 'failed' || status === 'timed_out';
   const showCancel = status === 'failed' || status === 'timed_out';
+  /** Whether to use the rich error display instead of generic copy */
+  const useErrorDisplay = (status === 'failed' || status === 'timed_out') && lastError != null;
 
   return (
     <div
@@ -153,8 +163,38 @@ export function PaymentStatus({
       {/* Status title */}
       <h2 className={`text-xl font-semibold ${config.color}`}>{config.title}</h2>
 
-      {/* Description */}
-      <p className="max-w-sm text-sm text-gray-600">{config.description}</p>
+      {/* For failed/timed_out: use PaymentErrorDisplay when a classified error is available */}
+      {useErrorDisplay ? (
+        <div className="w-full max-w-sm text-left">
+          <PaymentErrorDisplay
+            error={lastError}
+            currentPaymentStatus={status}
+            onRetry={onRetry}
+            onCancel={onCancel}
+          />
+        </div>
+      ) : (
+        <>
+          {/* Description */}
+          <p className="max-w-sm text-sm text-gray-600">{config.description}</p>
+
+          {/* Action buttons (fallback when no classified error) */}
+          {(showRetry || showCancel) && (
+            <div className="flex gap-3">
+              {showRetry && onRetry && (
+                <Button onClick={onRetry} variant="default">
+                  Retry Payment
+                </Button>
+              )}
+              {showCancel && onCancel && (
+                <Button onClick={onCancel} variant="outline">
+                  Cancel
+                </Button>
+              )}
+            </div>
+          )}
+        </>
+      )}
 
       {/* Delayed confirmation banner */}
       {status === 'submitted' && isDelayed && (
@@ -188,22 +228,6 @@ export function PaymentStatus({
         >
           View on Stellar Explorer ↗
         </a>
-      )}
-
-      {/* Action buttons */}
-      {(showRetry || showCancel) && (
-        <div className="flex gap-3">
-          {showRetry && onRetry && (
-            <Button onClick={onRetry} variant="default">
-              Retry Payment
-            </Button>
-          )}
-          {showCancel && onCancel && (
-            <Button onClick={onCancel} variant="outline">
-              Cancel
-            </Button>
-          )}
-        </div>
       )}
     </div>
   );

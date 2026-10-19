@@ -53,6 +53,16 @@ export const ErrorCode = {
   // Infrastructure
   REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
   INTERNAL_SERVER_ERROR: 'INTERNAL_SERVER_ERROR',
+
+  // Payment (wallet + escrow flow)
+  PAYMENT_USER_REJECTED: 'PAYMENT_USER_REJECTED',
+  PAYMENT_TIMEOUT: 'PAYMENT_TIMEOUT',
+  PAYMENT_NETWORK_MISMATCH: 'PAYMENT_NETWORK_MISMATCH',
+  PAYMENT_INSUFFICIENT_FUNDS: 'PAYMENT_INSUFFICIENT_FUNDS',
+  PAYMENT_TX_SUBMIT_FAILED: 'PAYMENT_TX_SUBMIT_FAILED',
+  PAYMENT_ALREADY_CONFIRMED: 'PAYMENT_ALREADY_CONFIRMED',
+  PAYMENT_CIRCUIT_OPEN: 'PAYMENT_CIRCUIT_OPEN',
+  PAYMENT_ATTEMPT_LIMIT_EXCEEDED: 'PAYMENT_ATTEMPT_LIMIT_EXCEEDED',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -104,6 +114,16 @@ const ERROR_MESSAGES: Record<ErrorCodeValue, string> = {
   // Infrastructure
   REQUEST_TIMEOUT: 'The request took too long. Please try again.',
   INTERNAL_SERVER_ERROR: 'Something went wrong on our end. Please try again later.',
+
+  // Payment (wallet + escrow flow)
+  PAYMENT_USER_REJECTED: 'Transaction declined in wallet. You can try again when ready.',
+  PAYMENT_TIMEOUT: 'Signing timed out. Your funds have not moved.',
+  PAYMENT_NETWORK_MISMATCH: 'Wrong network selected in Freighter. Please switch to the correct network and try again.',
+  PAYMENT_INSUFFICIENT_FUNDS: 'Insufficient USDC balance to complete this payment.',
+  PAYMENT_TX_SUBMIT_FAILED: 'The payment network is temporarily unavailable. Try again in a few minutes.',
+  PAYMENT_ALREADY_CONFIRMED: 'This payment has already been confirmed.',
+  PAYMENT_CIRCUIT_OPEN: 'Payments are temporarily paused due to network issues. Please try again later.',
+  PAYMENT_ATTEMPT_LIMIT_EXCEEDED: 'Too many payment attempts. Please wait a moment before trying again.',
 };
 
 /**

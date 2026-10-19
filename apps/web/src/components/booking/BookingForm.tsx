@@ -6,6 +6,7 @@ import { useTranslations } from '@/lib/i18n/useTranslations';
 import { useLocale } from '@/lib/i18n/useLocale';
 import { formatCurrency } from '@/lib/i18n/formatting';
 import { getErrorMessage, isApiError } from '@/lib/errors/errorCodes';
+import { PaymentErrorDisplay } from '@/components/payment/PaymentErrorDisplay';
 import { useCurrency } from '@/hooks/useCurrency';
 import { useFormErrorFocus } from '@/hooks/useFormErrorFocus';
 import { buildDescribedBy } from '@/components/ui/form-field';
@@ -21,6 +22,17 @@ interface BookingFormProps {
   maxStay?: number;
   onSubmit: (data: { checkIn: Date; checkOut: Date; guestCount: number; totalPrice: number }) => void;
   isLoading?: boolean;
+  /**
+   * A payment-flow error to display after the booking form is submitted and the
+   * wallet / payment step fails. When provided, PaymentErrorDisplay is rendered
+   * below the submit button with the correct classified messaging and actions.
+   */
+  paymentError?: unknown;
+  /** Latest server-side payment status — used by PaymentErrorDisplay to prevent
+   *  retry when the XDR is already submitted. */
+  currentPaymentStatus?: string;
+  /** Called when the user retries the payment from the error display. */
+  onRetryPayment?: () => void;
 }
 
 interface PriceQuote {
@@ -43,6 +55,9 @@ export default function BookingForm({
   maxStay,
   onSubmit,
   isLoading = false,
+  paymentError,
+  currentPaymentStatus,
+  onRetryPayment,
 }: BookingFormProps) {
   const [checkIn, setCheckIn] = useState('');
   const [checkOut, setCheckOut] = useState('');
@@ -498,6 +513,17 @@ export default function BookingForm({
       >
         {isLoading ? t('processing') : t('bookNow')}
       </button>
+
+      {/* ── Payment error display ────────────────────────────────────────── */}
+      {/* Shown after the wallet/payment step fails. Uses the shared taxonomy
+          to give the user a safe, actionable message without exposing internals. */}
+      {paymentError != null && (
+        <PaymentErrorDisplay
+          error={paymentError}
+          currentPaymentStatus={currentPaymentStatus}
+          onRetry={onRetryPayment}
+        />
+      )}
     </form>
   );
 }
