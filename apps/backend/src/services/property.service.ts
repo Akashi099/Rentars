@@ -10,6 +10,7 @@ import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
 import type { PaginatedResult } from '../types/pagination.js';
+import { buildSearchOrderClauses } from '../utils/searchSort.js';
 import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
@@ -439,6 +440,20 @@ export async function updateProperty(
     });
   }
 
+  // Re-run saved-search matching when a listing becomes available or changes in a
+  // way a saved search can match on. Delivery rows keep each (search, listing)
+  // pair to a single alert, so repeated edits do not resend.
+  const becameAvailable =
+    (before as Partial<Property>).status !== 'available' && updated.status === 'available';
+  const matchFieldChanged = SAVED_SEARCH_MATCH_FIELDS.some((field) => payload[field] !== undefined);
+  if (updated.status === 'available' && (becameAvailable || matchFieldChanged)) {
+    import('./savedSearch.service.js').then(({ notifyMatchingSavedSearches }) => {
+      notifyMatchingSavedSearches(updated).catch((err) =>
+        console.error('[updateProperty] notifyMatchingSavedSearches failed:', err),
+      );
+    });
+  }
+
   // Record a version snapshot when tracked fields changed.
   recordPropertyVersion(id, before, updated, changedBy, changeSource, changeNotes).catch((err) =>
     console.warn('[updateProperty] version record failed:', err),
@@ -446,6 +461,19 @@ export async function updateProperty(
 
   return { success: true, data: updated };
 }
+
+/** Listing fields a saved search can match on. */
+const SAVED_SEARCH_MATCH_FIELDS = [
+  'title',
+  'city',
+  'country',
+  'price_per_night',
+  'bedrooms',
+  'bathrooms',
+  'max_guests',
+  'amenities',
+  'property_type',
+] as const satisfies readonly (keyof Property)[];
 
 /**
  * Soft-delete a property record by setting `deleted_at` to the current
@@ -865,26 +893,10 @@ export async function advancedSearch(
   const countQuery = buildQuery(true);
   let dataQuery = buildQuery(false);
 
-  // Sorting
+  // Sorting (ends with `id` so pages are stable when sort keys tie)
   const sortBy = filters.sortBy || 'newest';
-  switch (sortBy) {
-    case 'price_asc':
-      dataQuery = dataQuery.order('price_per_night', { ascending: true });
-      break;
-    case 'price_desc':
-      dataQuery = dataQuery.order('price_per_night', { ascending: false });
-      break;
-    case 'rating':
-      dataQuery = dataQuery
-        .order('average_rating', { ascending: false, nullsFirst: false })
-        .order('review_count', { ascending: false, nullsFirst: false });
-      break;
-    case 'relevance':
-    case 'distance':
-    case 'newest':
-    default:
-      dataQuery = dataQuery.order('created_at', { ascending: false });
-      break;
+  for (const clause of buildSearchOrderClauses(sortBy)) {
+    dataQuery = dataQuery.order(clause.column, clause.options);
   }
 
   // Pagination
