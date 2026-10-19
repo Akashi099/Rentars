@@ -15,11 +15,19 @@ production).
 | `00021` | `00021_add_booking_reminders.sql`, `00021_add_flag_reason_to_reviews.sql`, `00021_add_rls_wishlists_notifications.sql`, `00021_create_funnel_events.sql` |
 | `00028` | `00028_add_property_type_and_bathrooms.sql`, `00028_add_role_to_users.sql`, `00028_booking_lifecycle_disputed_complete.sql`, `00028_create_audit_and_payments.sql`, `00028_create_booking_status_history.sql` |
 | `00032` | `00032_add_cancellation_refund_fields.sql`, `00032_add_soft_delete_to_properties.sql`, `00032_add_thumbnail_url_to_property_images.sql`, `00032_create_idempotency_keys_table.sql` |
+| `00059` | `00059_create_data_exports_table.sql`, `00059_create_probe_results_table.sql`, `00059_enhance_audit_logs_table.sql`, `00059_enhance_saved_searches.sql`, `00059_search_infrastructure_validation.sql` |
+| `00060` | `00060_add_property_draft_status.sql`, `00060_create_account_deletions_table.sql`, `00060_geocoding_status_tracking.sql` |
+| `00061` | `00061_enhance_reports_and_moderation.sql`, `00061_search_performance_tracking.sql` |
+| `00062` | `00062_add_guest_count_to_booking_modifications.sql`, `00062_add_legal_holds.sql`, `00062_add_quiet_hours_to_notification_preferences.sql`, `00062_booking_date_exclusion_constraint.sql`, `00062_booking_expiry_and_timeout.sql`, `00062_booking_lifecycle_state_machine.sql`, `00062_booking_modifications_snapshot.sql` |
 
 > **Note:** `00012_add_booking_dispute_status.sql` was previously a duplicate of
 > `00012_create_property_images_table.sql`. It has been renamed to
 > `00035_add_booking_dispute_status.sql` (the next unused prefix at the time of
 > resolution). The SQL contents are unchanged.
+>
+> **Note:** The files with prefixes `00059`–`00062` were applied to deployed
+> environments before this document was updated and **must not be renamed**. Their
+> canonical application order within each prefix group is listed below.
 
 ### Canonical application order for shared prefixes
 
@@ -64,6 +72,33 @@ Document this in your migration runner configuration.
 00032_create_idempotency_keys_table.sql      ← apply fourth (new table)
 ```
 
+The groups below were added when prefixes 00059–00062 were applied to deployed
+environments before the naming convention was enforced. They follow the same rule:
+files are applied alphabetically within the prefix group.
+
+```
+00059_create_data_exports_table.sql          ← apply first  (new table)
+00059_create_probe_results_table.sql         ← apply second (new table)
+00059_enhance_audit_logs_table.sql           ← apply third  (column additions)
+00059_enhance_saved_searches.sql             ← apply fourth (column additions)
+00059_search_infrastructure_validation.sql   ← apply fifth  (validation helpers)
+
+00060_add_property_draft_status.sql          ← apply first  (enum/column addition)
+00060_create_account_deletions_table.sql     ← apply second (new table)
+00060_geocoding_status_tracking.sql          ← apply third  (column additions)
+
+00061_enhance_reports_and_moderation.sql     ← apply first  (column additions)
+00061_search_performance_tracking.sql        ← apply second (new table/indexes)
+
+00062_add_guest_count_to_booking_modifications.sql ← apply first  (column addition)
+00062_add_legal_holds.sql                          ← apply second (new table + RLS)
+00062_add_quiet_hours_to_notification_preferences.sql ← apply third (column addition)
+00062_booking_date_exclusion_constraint.sql        ← apply fourth (constraint)
+00062_booking_expiry_and_timeout.sql               ← apply fifth  (column additions)
+00062_booking_lifecycle_state_machine.sql          ← apply sixth  (trigger/function)
+00062_booking_modifications_snapshot.sql           ← apply seventh (new table)
+```
+
 ---
 
 ## Forward-looking convention (all new migrations)
@@ -71,24 +106,21 @@ Document this in your migration runner configuration.
 ### Rule 1 — Strictly incrementing 5-digit prefix
 
 Every new migration file **must** use the next available prefix after the highest
-existing one. As of writing this document the highest prefix is `00035`
-(`00035_add_booking_dispute_status.sql`); the next prefix to use is `00036`.
+existing one. As of writing this document the highest prefix is `00064`
+(`00064_property_versions.sql`); the next prefix to use is `00065`.
 
 Format:
 ```
 NNNNN_short_description_of_change.sql
 ```
 
-- `NNNNN` — zero-padded 5-digit integer, e.g. `00059`, `00060`
+- `NNNNN` — zero-padded 5-digit integer, e.g. `00065`, `00066`
 - `short_description` — snake_case, no spaces, no special characters, ≤ 50 chars
-
-The highest existing prefix is `00058` (`00058_add_deleted_user_status.sql`); the next
-prefix to use is `00059`.
 
 Examples:
 ```
-00059_add_host_verification_timestamps.sql
-00060_create_property_availability_cache.sql
+00065_add_host_verification_timestamps.sql
+00066_create_property_availability_cache.sql
 ```
 
 ### Rule 2 — One logical change per migration
@@ -138,7 +170,7 @@ Additional helpers:
 
 ```bash
 # Apply a single migration
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/00059_my_new_migration.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/00065_my_new_migration.sql
 
 # Validate migration filenames (detects duplicates and out-of-order prefixes)
 bun run validate:migrations
