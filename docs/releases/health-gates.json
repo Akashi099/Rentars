@@ -1,0 +1,66 @@
+{
+  "policy_version": "1",
+  "description": "Rollout health gates. Thresholds mirror DEPLOYMENT.md section 7.6. scripts/release-health-gate.ts evaluates a metrics snapshot against this file.",
+  "window": "1m",
+  "ownership": {
+    "pause": {
+      "decided_by": "on-call engineer",
+      "resumes_when": "recovery condition of the breached gate holds for its recovery windows, then the on-call engineer re-runs the gate in resume mode"
+    },
+    "rollback": {
+      "decided_by": "release manager",
+      "approval": "two approvers for production, as in DEPLOYMENT.md section 7.9",
+      "notify": ["ops", "finance (transaction and contract gates)"]
+    }
+  },
+  "gates": [
+    {
+      "name": "error_rate",
+      "metric": "http 5xx responses / total responses",
+      "threshold": 0.05,
+      "consecutive_windows": 2,
+      "action": "pause",
+      "recovery": { "threshold": 0.02, "windows": 5 }
+    },
+    {
+      "name": "latency_p99_ms",
+      "metric": "request latency p99 in milliseconds",
+      "threshold": 1000,
+      "consecutive_windows": 2,
+      "action": "pause",
+      "recovery": { "threshold": 500, "windows": 5 }
+    },
+    {
+      "name": "transaction_failure_ratio",
+      "metric": "failed booking or payment transactions / total transactions",
+      "threshold": 0.02,
+      "consecutive_windows": 2,
+      "action": "rollback",
+      "recovery": null
+    },
+    {
+      "name": "db_pool_usage_ratio",
+      "metric": "active connections / max connections",
+      "threshold": 0.9,
+      "consecutive_windows": 1,
+      "action": "pause",
+      "recovery": { "threshold": 0.7, "windows": 5 }
+    },
+    {
+      "name": "redis_evictions_per_second",
+      "metric": "Redis evicted keys per second",
+      "threshold": 10,
+      "consecutive_windows": 1,
+      "action": "pause",
+      "recovery": { "threshold": 1, "windows": 5 }
+    },
+    {
+      "name": "contract_invocation_failure_ratio",
+      "metric": "failed Stellar contract invocations / total invocations",
+      "threshold": 0.01,
+      "consecutive_windows": 2,
+      "action": "rollback",
+      "recovery": null
+    }
+  ]
+}

@@ -29,7 +29,11 @@ import {
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice } from './pricing.service.js';
-import { bookingAuthorizationService } from './bookingAuthorization.service.js';
+import {
+  bookingAuthorizationService,
+  type BookingActor,
+} from './bookingAuthorization.service.js';
+import { auditLogger } from './auditLogger.service.js';
 
 // ─── State machine ────────────────────────────────────────────────────────────
 
@@ -1260,16 +1264,27 @@ export class BookingService {
   // ── Update / Delete ────────────────────────────────────────────────────────
 
   /**
-   * Update mutable fields of an existing booking.
+   * Update mutable fields of an existing booking. Admin only, and audited.
    *
    * @param id - UUID of the booking
    * @param payload - Partial booking fields to update
+   * @param actor - Authenticated caller; checked against the booking authorization matrix
    * @returns ServiceResponse with the updated booking
    * @throws Does not throw; errors are returned in the ServiceResponse
    */
-  async updateBooking(id: string, payload: Partial<Booking>): Promise<ServiceResponse<Booking>> {
+  async updateBooking(
+    id: string,
+    payload: Partial<Booking>,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<Booking>> {
     if (!id) {
       return { success: false, error: 'Booking ID is required' };
+    }
+
+    const decision = await bookingAuthorizationService.authorize('update', id, actor);
+    if (!decision.allowed) {
+      await this.auditBookingChange('booking.modify', id, actor, false, decision.reason);
+      return { success: false, error: decision.reason, statusCode: decision.status };
     }
 
     if (Object.keys(payload).length === 0) {
@@ -1284,30 +1299,101 @@ export class BookingService {
       .single();
 
     if (error) {
+      await this.auditBookingChange('booking.modify', id, actor, false, 'database update failed');
       return { success: false, error: error.message };
     }
 
+    await this.auditBookingChange('booking.modify', id, actor, true);
     return { success: true, data: data as Booking };
   }
 
   /**
-   * Permanently delete a booking record.
+   * Permanently delete a booking record. Admin only, and audited.
    *
    * @param id - UUID of the booking to delete
+   * @param actor - Authenticated caller; checked against the booking authorization matrix
    * @returns ServiceResponse with no data on success
    */
-  async deleteBooking(id: string): Promise<ServiceResponse<void>> {
+  async deleteBooking(id: string, actor: BookingActor): Promise<ServiceResponse<void>> {
     if (!id) {
       return { success: false, error: 'Booking ID is required' };
+    }
+
+    const decision = await bookingAuthorizationService.authorize('delete', id, actor);
+    if (!decision.allowed) {
+      await this.auditBookingChange('booking.delete', id, actor, false, decision.reason);
+      return { success: false, error: decision.reason, statusCode: decision.status };
     }
 
     const { error } = await supabase.from('bookings').delete().eq('id', id);
 
     if (error) {
+      await this.auditBookingChange('booking.delete', id, actor, false, 'database delete failed');
       return { success: false, error: error.message };
     }
 
+    await this.auditBookingChange('booking.delete', id, actor, true);
     return { success: true };
+  }
+
+  /**
+   * Fetch a booking on behalf of an authenticated caller. Non-participants
+   * without a read role receive 404.
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor - Authenticated caller
+   */
+  async getBookingForActor(bookingId: string, actor: BookingActor): Promise<ServiceResponse<Booking>> {
+    const decision = await bookingAuthorizationService.authorize('read', bookingId, actor);
+    if (!decision.allowed) {
+      return { success: false, error: decision.reason, statusCode: decision.status };
+    }
+
+    return this.getBookingById(bookingId);
+  }
+
+  /**
+   * Fetch a booking's status history on behalf of an authenticated caller.
+   *
+   * @param bookingId - UUID of the booking
+   * @param actor - Authenticated caller
+   */
+  async getBookingStatusHistoryForActor(
+    bookingId: string,
+    actor: BookingActor,
+  ): Promise<ServiceResponse<BookingStatusHistory[]>> {
+    const decision = await bookingAuthorizationService.authorize(
+      'read_status_history',
+      bookingId,
+      actor,
+    );
+    if (!decision.allowed) {
+      return { success: false, error: decision.reason, statusCode: decision.status };
+    }
+
+    return this.getBookingStatusHistory(bookingId);
+  }
+
+  /**
+   * Record a booking change or a denied attempt. Never throws; the audit logger
+   * is best-effort. Error text is limited to our own reasons, not database messages.
+   */
+  private async auditBookingChange(
+    action: 'booking.modify' | 'booking.delete',
+    bookingId: string,
+    actor: BookingActor,
+    success: boolean,
+    error?: string,
+  ): Promise<void> {
+    await auditLogger.log({
+      actorId: actor.id,
+      action,
+      resourceType: 'booking',
+      resourceId: bookingId,
+      success,
+      error,
+      meta: { actor_role: actor.role ?? null },
+    });
   }
 
   // ── Dispute ────────────────────────────────────────────────────────────────

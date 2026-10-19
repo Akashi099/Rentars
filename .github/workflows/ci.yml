@@ -56,6 +56,9 @@ jobs:
       - name: Verify generate-release-manifest runs cleanly
         run: bun run scripts/generate-release-manifest.ts --version 0.0.0-ci
 
+      - name: Test release health gate (#737)
+        run: bun test scripts/release-health-gate.test.ts
+
   # ─── Job 1: Validate migration filenames ────────────────────────────────────
   validate-migrations:
     name: Validate Migration Filenames
@@ -500,3 +503,83 @@ jobs:
             apps/backend/database/README.md
             apps/backend/database/MIGRATIONS_NAMING.md
           fail: true
+
+  # ─── Job 9: Backup restore drill (#736) ─────────────────────────────────────
+  # Applies the restore fixture schema and sanitized seed data, then runs the
+  # restore drill: encrypted export, checksum, isolated restore, and schema, RLS,
+  # row-count and write-probe assertions. A truncated copy of the same backup must
+  # be rejected. The scheduled workflow in restore-drill.yml runs the same script
+  # against nonproduction infrastructure.
+  restore-drill:
+    name: Backup Restore Drill
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGPASSWORD: postgres
+      PROD_DB_HOST: 127.0.0.1
+      PROD_DB_USER: postgres
+      PROD_DB_PASSWORD: postgres
+      PROD_DB_NAME: rentars
+      VERIFY_DB_HOST: 127.0.0.1
+      VERIFY_DB_USER: postgres
+      VERIFY_DB_PASSWORD: postgres
+      DRILL_REPORT_DIR: restore-drill-reports
+      DRILL_BACKUP_OUT: restore-drill-backups
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source database and apply schema subset
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE rentars;'
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/schema.sql
+
+      - name: Load sanitized seed data
+        run: |
+          set -euo pipefail
+          psql -h 127.0.0.1 -U postgres -d rentars -v ON_ERROR_STOP=1 \
+            -f tests/fixtures/restore-drill/sanitized-seed.sql
+
+      - name: Generate ephemeral backup key
+        run: echo "BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
+      - name: Run restore drill
+        run: bash scripts/backup-restore-drill.sh
+
+      - name: Reject a truncated backup
+        run: |
+          set -euo pipefail
+          src="$(ls restore-drill-backups/*.dump.enc)"
+          truncated="restore-drill-backups/truncated.dump.enc"
+          size="$(stat -c %s "$src")"
+          head -c "$((size / 2))" "$src" > "$truncated"
+          cp "$src.sha256" "$truncated.sha256"
+          if DRILL_SOURCE_BACKUP="$truncated" bash scripts/backup-restore-drill.sh; then
+            echo "::error::restore drill accepted a truncated backup"
+            exit 1
+          fi
+          echo "Truncated backup rejected as expected."
+
+      - name: Upload drill reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-reports
+          path: restore-drill-reports/
+          retention-days: 14

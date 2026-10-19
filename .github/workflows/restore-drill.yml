@@ -1,0 +1,47 @@
+name: Backup Restore Drill
+
+# Scheduled proof that the nonproduction backup restores with its schema,
+# extensions, RLS policies and representative data intact (#736).
+# The source must be the sanitized nonproduction database; the scratch database
+# is a separate instance that the drill creates and drops its own database on.
+
+on:
+  schedule:
+    - cron: '30 3 * * 1' # Mondays 03:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  restore-drill:
+    name: Restore drill (scheduled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: restore-drill
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run restore drill
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          PROD_DB_HOST: ${{ secrets.DRILL_SOURCE_DB_HOST }}
+          PROD_DB_PORT: ${{ secrets.DRILL_SOURCE_DB_PORT }}
+          PROD_DB_NAME: ${{ secrets.DRILL_SOURCE_DB_NAME }}
+          PROD_DB_USER: ${{ secrets.DRILL_SOURCE_DB_USER }}
+          PROD_DB_PASSWORD: ${{ secrets.DRILL_SOURCE_DB_PASSWORD }}
+          VERIFY_DB_HOST: ${{ secrets.DRILL_SCRATCH_DB_HOST }}
+          VERIFY_DB_PORT: ${{ secrets.DRILL_SCRATCH_DB_PORT }}
+          VERIFY_DB_USER: ${{ secrets.DRILL_SCRATCH_DB_USER }}
+          VERIFY_DB_PASSWORD: ${{ secrets.DRILL_SCRATCH_DB_PASSWORD }}
+          DRILL_REPORT_DIR: restore-drill-reports
+        run: bash scripts/backup-restore-drill.sh
+
+      - name: Upload drill reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-reports-${{ github.run_id }}
+          path: restore-drill-reports/
+          retention-days: 90

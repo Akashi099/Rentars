@@ -13,7 +13,7 @@ import {
 } from '@/validators/auth.validator.js';
 import { authRateLimiter } from '@/middleware/rateLimiter.js';
 import { captchaMiddleware } from '@/middleware/captcha.middleware.js';
-import { authMiddleware } from '@/middleware/auth.middleware.js';
+import { authenticate } from '@/middleware/auth.middleware.js';
 
 const router = Router();
 
@@ -30,7 +30,7 @@ router.post('/refresh', authRateLimiter, refreshAccessToken);
 router.post('/logout', logout);
 
 // POST /api/v1/auth/logout-all-devices — revoke all refresh tokens for user
-router.post('/logout-all-devices', authMiddleware, logoutAllDevices);
+router.post('/logout-all-devices', authenticate, logoutAllDevices);
 
 // POST /api/v1/auth/verify-email — confirm email address with token
 router.post('/verify-email', validateBody(verifyEmailSchema), verifyEmailHandler);
