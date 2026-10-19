@@ -242,34 +242,33 @@ All triggers execute `update_updated_at_column()` `BEFORE UPDATE` for each row.
 
 ## Migrations
 
-### Run all backend migrations
+### Authoritative migration command
 
-From `apps/backend/database`:
+`setup.sql` is the single authoritative source of truth for the database schema.
+It applies all migrations in the correct order (see `MIGRATIONS_NAMING.md` for the
+canonical ordering of files with shared prefixes).
 
 ```bash
-psql -U postgres -d rentars -f setup.sql
+# Apply the full schema from scratch — aborts immediately on any SQL error
+cd apps/backend/database
+PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f setup.sql
 ```
 
-`setup.sql` applies:
-1. `00001_initial_schema.sql`
-2. `00002_add_booking_blockchain_fields.sql`
-3. `00003_triggers.sql`
-4. `00004_create_wallet_auth_tables.sql`
-5. `00005_create_profile_table.sql`
-6. `00006_add_atomic_functions.sql`
-7. `00007_add_payment_constraints.sql`
-8. `00008_create_blockchain_logs.sql`
+This is the **same command CI uses**. Running it locally reproduces the exact CI schema.
 
-### Additional migrations in repository
+> **Do not** apply migrations piecemeal by hand unless you are adding a single new
+> file. Always use `setup.sql` for a fresh database. See `MIGRATIONS_NAMING.md` for
+> the naming convention and how to add new migrations.
 
-Run manually as needed:
+### Validate migration filenames
 
 ```bash
-psql -U postgres -d rentars -f apps/backend/database/migrations/00009_create_reviews_table.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00010_create_wishlists_table.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00011_create_notifications_table.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00020_add_missing_indexes.sql
-psql -U postgres -d rentars -f apps/backend/database/migrations/00021_add_rls_wishlists_notifications.sql
+# Detects duplicate prefixes and out-of-order files
+cd apps/backend
+bun run validate:migrations
+
+# Report only (no failing exit code)
+bun run validate:migrations --dry-run
 ```
 
 ### Seed local data

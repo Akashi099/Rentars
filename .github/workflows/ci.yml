@@ -265,8 +265,17 @@ jobs:
             -v ON_ERROR_STOP=1 \
             -f setup.sql
           MIGRATION_COUNT=$(grep -c '^\\i' setup.sql)
+          MIGRATION_FILES_TOTAL=$(find migrations -name '*.sql' | wc -l)
           echo "MIGRATION_COUNT=$MIGRATION_COUNT" >> "$GITHUB_ENV"
-          echo "Applied $MIGRATION_COUNT migration file(s) successfully."
+          echo "MIGRATION_FILES_TOTAL=$MIGRATION_FILES_TOTAL" >> "$GITHUB_ENV"
+          echo "Applied $MIGRATION_COUNT migration include(s) from setup.sql (${MIGRATION_FILES_TOTAL} total SQL files in migrations/)."
+          # Fail if setup.sql does not reference all migration files.
+          # This catches the case where new migration files were committed but
+          # not added to setup.sql (which would allow CI to pass with a broken schema).
+          if [[ "$MIGRATION_COUNT" -ne "$MIGRATION_FILES_TOTAL" ]]; then
+            echo "::error::setup.sql references $MIGRATION_COUNT migration files but migrations/ contains $MIGRATION_FILES_TOTAL. Add the missing files to setup.sql."
+            exit 1
+          fi
 
       - name: Install backend dependencies
         working-directory: apps/backend
@@ -310,7 +319,9 @@ jobs:
             echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
-            echo "| Migration files applied | ${MIGRATION_COUNT:-unknown} |"
+            echo "| Migration includes in setup.sql | ${MIGRATION_COUNT:-unknown} |"
+            echo "| Total migration files in migrations/ | ${MIGRATION_FILES_TOTAL:-unknown} |"
+            echo "| Authoritative migration command | \`psql … -v ON_ERROR_STOP=1 -f setup.sql\` |"
             echo "| Authoritative migration directory | \`apps/backend/database/migrations\` |"
             echo "| RLS tests passing | ${RLS_PASS:-unknown} |"
             echo ""
@@ -351,7 +362,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             apps/contracts/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('apps/contracts/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('apps/contracts/**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -379,6 +390,9 @@ jobs:
           {
             echo "## Contract Build Summary"
             echo ""
+            echo "Commit: \`${{ github.sha }}\`"
+            echo "Compiler target: \`wasm32-unknown-unknown\`"
+            echo ""
             echo "| Contract | SHA-256 |"
             echo "|----------|---------|"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -392,7 +406,9 @@ jobs:
             fi
           done
 
-          # Verify that each workspace member produced a WASM artifact
+          # Verify that each workspace member produced a WASM artifact.
+          # Cargo converts hyphens in package names to underscores in artifact filenames.
+          # Package names: booking, property-listing, rentars-rental-contract, rentars-review-contract
           expected=(booking property_listing rentars_rental_contract rentars_review_contract)
           for name in "${expected[@]}"; do
             artifact="$WASM_DIR/${name}.wasm"
@@ -465,8 +481,11 @@ jobs:
   #
   # Local reproduction:
   #   cd apps/web
-  #   yarn playwright test --project=chromium          # single browser
-  #   yarn playwright test                             # full matrix
+  #   yarn install
+  #   yarn playwright install --with-deps chromium
+  #   NEXT_PUBLIC_API_URL=http://localhost:3000 yarn build
+  #   CI=true PORT=3001 yarn playwright test --project=chromium   # single browser
+  #   CI=true PORT=3001 yarn playwright test                       # full matrix
   frontend-e2e:
     name: Frontend E2E — ${{ matrix.project }}
     runs-on: ubuntu-latest
