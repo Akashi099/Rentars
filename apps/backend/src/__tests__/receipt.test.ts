@@ -12,21 +12,27 @@ import { generateReceiptPdf, fetchReceiptData, calcNights, type ReceiptData } fr
 import { pdfStr } from '../utils/pdf.js';
 
 // ─── Supabase mock ────────────────────────────────────────────────────────────
+// fetchReceiptData queries:
+//   1. bookings (single)
+//   2. profiles + users (maybeSingle, in parallel)
+//   3. payments (maybeSingle) — for stellar_tx_hash audit reference
 
-const mockSingle = vi.fn();
-const mockEq     = vi.fn();
+const mockSingle      = vi.fn();
+const mockMaybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+const mockEq          = vi.fn();
 
 const mockFrom = vi.fn(() => ({
   select: vi.fn(() => ({ eq: mockEq })),
 }));
 
-mockEq.mockImplementation(() => ({ single: mockSingle }));
+mockEq.mockImplementation(() => ({ single: mockSingle, maybeSingle: mockMaybeSingle }));
 
 vi.mock('../config/supabase.js', () => ({
   supabase: { from: mockFrom },
 }));
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
+// total_price = subtotal * (1 + 0.05) = 400 * 1.05 = 420 (5 % platform fee)
 
 const BOOKING_ROW = {
   id:           'booking-001',
@@ -35,7 +41,7 @@ const BOOKING_ROW = {
   check_in:     '2027-08-01',
   check_out:    '2027-08-05',
   guest_count:  2,
-  total_price:  440,
+  total_price:  420,
   status:       'Confirmed',
   escrow_id:    'escrow-xyz',
   on_chain_id:  42,
@@ -58,8 +64,8 @@ const RECEIPT_DATA: ReceiptData = {
   nights:          4,
   pricePerNight:   100,
   subtotal:        400,
-  platformFee:     40,
-  total:           440,
+  platformFee:     20,
+  total:           420,
   guestCount:      2,
   status:          'Confirmed',
   escrowId:        'escrow-xyz',
@@ -92,13 +98,26 @@ describe('fetchReceiptData', () => {
     expect(result.data?.nights).toBe(4);
   });
 
-  it('computes platform fee as 10% of subtotal', async () => {
+  it('derives the breakdown from the settled total using the 5% platform fee', async () => {
     mockSingle.mockResolvedValueOnce({ data: BOOKING_ROW, error: null });
     const result = await fetchReceiptData('booking-001');
     expect(result.success).toBe(true);
-    // subtotal = 100 * 4 = 400; fee = 40
+    // total = 420; fee = 420 * 0.05 / 1.05 = 20; subtotal = 400
     expect(result.data?.subtotal).toBe(400);
-    expect(result.data?.platformFee).toBe(40);
+    expect(result.data?.platformFee).toBe(20);
+    expect(result.data?.total).toBe(420);
+  });
+
+  it('includes stellar_tx_hash as audit reference when a payment exists', async () => {
+    mockSingle.mockResolvedValueOnce({ data: BOOKING_ROW, error: null });
+    // Queue: profiles (null), users (null), then payments (with tx hash)
+    mockMaybeSingle
+      .mockResolvedValueOnce({ data: null, error: null })                                   // profiles
+      .mockResolvedValueOnce({ data: null, error: null })                                   // users
+      .mockResolvedValueOnce({ data: { stellar_tx_hash: 'abc123txhash' }, error: null });   // payments
+    const result = await fetchReceiptData('booking-001');
+    expect(result.success).toBe(true);
+    expect(result.data?.txHash).toBe('abc123txhash');
   });
 
   it('populates escrow and on-chain ids from the booking row', async () => {
@@ -152,12 +171,12 @@ describe('generateReceiptPdf', () => {
 
   it('embeds the total price', () => {
     const buf = generateReceiptPdf(RECEIPT_DATA);
-    expect(buf.toString('latin1')).toContain('440.00 USDC');
+    expect(buf.toString('latin1')).toContain('420.00 USDC');
   });
 
   it('embeds the platform fee', () => {
     const buf = generateReceiptPdf(RECEIPT_DATA);
-    expect(buf.toString('latin1')).toContain('40.00 USDC');
+    expect(buf.toString('latin1')).toContain('20.00 USDC');
   });
 
   it('embeds the escrow ID', () => {
@@ -178,14 +197,31 @@ describe('generateReceiptPdf', () => {
     expect(buf.toString('latin1')).toContain('booking-001');
   });
 
+  it('embeds the settlement tx hash when present', () => {
+    const data: ReceiptData = { ...RECEIPT_DATA, txHash: 'stellar-tx-abc123' };
+    const text = generateReceiptPdf(data).toString('latin1');
+    expect(text).toContain('stellar-tx-abc123');
+  });
+
+  it('does not emit a blockchain section when all chain fields are absent', () => {
+    const data: ReceiptData = {
+      ...RECEIPT_DATA,
+      escrowId: undefined,
+      onChainId: undefined,
+      txHash: undefined,
+    };
+    const text = generateReceiptPdf(data).toString('latin1');
+    expect(text).not.toContain('Blockchain Reference');
+  });
+
   it('handles single-night stays', () => {
     const data: ReceiptData = {
       ...RECEIPT_DATA,
       nights: 1,
       checkOut: '2027-08-02',
       subtotal: 100,
-      platformFee: 10,
-      total: 110,
+      platformFee: 5,
+      total: 105,
     };
     const text = generateReceiptPdf(data).toString('latin1');
     expect(text).toContain('1 night');
