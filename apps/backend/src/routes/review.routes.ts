@@ -12,6 +12,8 @@ import {
   listPendingReviews,
   approveReviewHandler,
   rejectReviewHandler,
+  getReviewResponseHistory,
+  moderateHostResponseHandler,
 } from '../controllers/review.controller.js';
 import { validateBody } from '../validators/booking.validator.js';
 import { createReviewSchema, flagReviewSchema } from '../validators/review.validator.js';
@@ -31,8 +33,14 @@ router.get('/user/:id', validatePagination, getUserReviews);
 // GET /api/reviews/user/:id/average
 router.get('/user/:id/average', getUserAverageRating);
 
-// POST /api/reviews/:id/response — host replies to a review
+// POST /api/reviews/:id/response — host creates or edits their response
 router.post('/:id/response', authenticate, respondToReview);
+
+// GET /api/reviews/:id/response/history — admin: full edit history
+router.get('/:id/response/history', authenticate, requireRole('admin'), getReviewResponseHistory);
+
+// PATCH /api/reviews/:id/response/moderate — admin/moderator: approve, reject, or remove
+router.patch('/:id/response/moderate', authenticate, requireRole('admin'), moderateHostResponseHandler);
 
 // POST /api/reviews/:id/flag — report a review for moderation
 router.post('/:id/flag', authenticate, validateBody(flagReviewSchema), reportReview);
