@@ -78,6 +78,11 @@ export type AuditAction =
   | 'account.enable_2fa'
   | 'account.wallet_link'
   | 'account.wallet_unlink'
+  // Privacy (data subject rights)
+  | 'privacy.data_export_requested'
+  | 'privacy.account_deletion_requested'
+  | 'privacy.account_deletion_cancelled'
+  | 'privacy.account_deletion_completed'
   // Admin
   | 'admin.user_suspend'
   | 'admin.user_activate'

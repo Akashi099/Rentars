@@ -478,6 +478,40 @@ jobs:
             apps/web/test-results/
           retention-days: 14
 
+  # ─── Job 7b: Search rollout upgrade test (#747) ─────────────────────────────
+  # Applies migration 00067 to a database that already holds listings, backfills in
+  # batches, and asserts search and nearby search work and that the migration is
+  # idempotent. Self-contained, so it does not depend on setup.sql.
+  search-rollout-upgrade:
+    name: Search Rollout Upgrade Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: supabase/postgres:15.6.1.117
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run upgrade test for migration 00067
+        working-directory: apps/backend/tests/db
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: ./run-search-rollout.sh
+
   # ─── Job 8: Documentation link check ────────────────────────────────────────
   # Verifies that all relative file paths referenced in Markdown docs exist in
   # the repository. Broken links (e.g. after a file rename) fail this job.
