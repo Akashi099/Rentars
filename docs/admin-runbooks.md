@@ -355,3 +355,11 @@ UPDATE users SET role = 'tenant' WHERE id = '<USER_ID>';
 ```
 
 New privileged API requests are blocked immediately. Existing tokens expire within 15 minutes. For immediate revocation, follow Runbook 6.
+
+---
+
+## See Also
+
+- [`docs/RECOVERY_RUNBOOK.md`](./RECOVERY_RUNBOOK.md) — Cross-component recovery runbook (DB, storage, Redis, contracts, RPC, email, frontend) with owners, RTO/RPO targets, and the monthly nonproduction drill. Runbook 6 above is the JWT-secret-rotation step referenced from the recovery runbook's §3 dual-approval table.
+- [`docs/backup-restore-verification.md`](./backup-restore-verification.md) — Database-only restore drill detail.
+- [`docs/INCIDENT_REVIEW_TEMPLATE.md`](./INCIDENT_REVIEW_TEMPLATE.md) — Post-incident review template used by the recovery drill retrospective.
