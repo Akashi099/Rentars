@@ -14,7 +14,6 @@ import {
 } from './config.js';
 import { getSorobanServer } from './soroban.js';
 import { BlockchainError } from './errors.js';
-import { simulateOrThrow, type SimulationResult } from './simulation.js';
 
 const FEE_ESTIMATION_PERCENTILE = 90;
 const MAX_FEE_CEILING_MULTIPLIER = 10;

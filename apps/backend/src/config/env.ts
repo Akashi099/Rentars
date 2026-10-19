@@ -327,6 +327,29 @@ const envSchema = z.object({
       if (!Number.isInteger(n) || n < 1) throw new Error('RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS must be a positive integer');
       return n;
     }),
+}).superRefine((value, ctx) => {
+  // Production must name its browser origins explicitly. The development default
+  // (localhost) must never become the production allowlist by omission.
+  if (value.NODE_ENV !== 'production') return;
+
+  if (!process.env.CORS_ORIGIN?.trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CORS_ORIGIN'],
+      message: 'CORS_ORIGIN must be set explicitly in production',
+    });
+    return;
+  }
+
+  for (const origin of value.CORS_ORIGIN) {
+    if (!origin.startsWith('https://')) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CORS_ORIGIN'],
+        message: `Production CORS origin must use https:// (got '${origin}')`,
+      });
+    }
+  }
 });
 
 // ── Type export ───────────────────────────────────────────────────────────────

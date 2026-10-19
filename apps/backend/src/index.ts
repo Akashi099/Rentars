@@ -40,6 +40,8 @@ import { tracingMiddleware } from './middleware/tracing.middleware.js';
 
 // ── Core middleware ───────────────────────────────────────────────────────────
 import { rateLimiter } from './middleware/rateLimiter.js';
+import { sessionRevocationGuard } from './middleware/sessionRevocation.middleware.js';
+import { parseTrustProxy } from './utils/trustProxy.js';
 import { timeoutMiddleware } from './middleware/timeout.middleware.js';
 
 // ── Routes & services ─────────────────────────────────────────────────────────
@@ -66,6 +68,10 @@ if (configErrors.length > 0) {
 }
 
 export const app = express();
+
+// Resolve req.ip from X-Forwarded-For only for the hops in TRUST_PROXY. Without
+// this, every client behind a reverse proxy shares one rate-limit bucket.
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
 
 // ── 1. Security headers (must be first — applies to every response) ───────────
 app.use(securityMiddleware);
@@ -95,6 +101,9 @@ app.use(csrfMiddleware);
 
 // ── 8. Rate limiting ──────────────────────────────────────────────────────────
 app.use(rateLimiter);
+
+// ── 8b. Session revocation guard (rejects tokens issued before a password reset / logout-all) ──
+app.use(sessionRevocationGuard);
 
 // ── 9. Request timeout ────────────────────────────────────────────────────────
 app.use(timeoutMiddleware);
