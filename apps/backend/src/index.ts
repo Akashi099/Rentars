@@ -48,6 +48,7 @@ import { timeoutMiddleware } from './middleware/timeout.middleware.js';
 import routes from './routes/index.js';
 import { setupOpenApiRoutes } from './config/swagger.js';
 import { validateBlockchainConfig } from './blockchain/config.js';
+import { validateContractRegistry } from './blockchain/contractRegistry.js';
 import { startSyncScheduler } from './services/cleanup-schedular.js';
 import { startRateRefreshLoop } from './services/exchangeRate.service.js';
 import { startProbeScheduler, stopProbeScheduler } from './services/probe-scheduler.js';
@@ -61,6 +62,21 @@ if (configErrors.length > 0) {
   structuredLog({
     level: 'error',
     message: 'Blockchain configuration validation failed',
+    timestamp: new Date().toISOString(),
+    details: errorDetails,
+  });
+  process.exit(1);
+}
+
+// ── Validate contract registry (IDs, ABI versions, WASM hashes) ──────────────
+const registryErrors = validateContractRegistry();
+if (registryErrors.length > 0) {
+  const errorDetails = registryErrors
+    .map((err) => `  - ${err.contract}.${err.field}: ${err.message}`)
+    .join('\n');
+  structuredLog({
+    level: 'error',
+    message: 'Contract registry validation failed — unknown or incompatible contract configuration detected before serving traffic',
     timestamp: new Date().toISOString(),
     details: errorDetails,
   });
