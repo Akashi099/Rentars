@@ -96,7 +96,16 @@ export type AuditAction =
   | 'admin.session_revoke'
   | 'admin.settings_change'
   | 'admin.role_grant'
-  | 'admin.role_revoke';
+  | 'admin.role_revoke'
+  // Reconciliation (restricted operations view)
+  | 'reconciliation.retry'
+  | 'reconciliation.escalate'
+  | 'reconciliation.resolve'
+  | 'reconciliation.note'
+  // Provider circuit breakers
+  | 'circuit_breaker.reset'
+  | 'circuit_breaker.open'
+  | 'circuit_breaker.close';
 
 export type ResourceType =
   | 'user'
@@ -107,7 +116,9 @@ export type ResourceType =
   | 'auth'
   | 'admin'
   | 'account'
-  | 'session';
+  | 'session'
+  | 'reconciliation'
+  | 'circuit_breaker';
 
 export interface AuditLogEntry {
   actorId?: string;
@@ -120,6 +131,31 @@ export interface AuditLogEntry {
   success?: boolean;
   error?: string;
   meta?: Record<string, unknown>;
+}
+
+/**
+ * Context required for every manual operator action. A reason is mandatory so
+ * the append-only audit trail explains why a financial or provider operation
+ * was triggered.
+ */
+export interface ManualActionContext {
+  actorId: string;
+  reason: string;
+  correlationId?: string;
+  ip?: string;
+}
+
+/**
+ * Details of a reconciliation case a manual action applies to.
+ */
+export interface ReconciliationActionTarget {
+  caseId: string;
+  /** Optional transaction/provider reference the case relates to. */
+  transactionRef?: string;
+  /** Optional booking the mismatch affects. */
+  bookingId?: string;
+  /** Provider whose state is being reconciled, if applicable. */
+  provider?: string;
 }
 
 /**
@@ -284,6 +320,104 @@ class AuditLogger {
     );
 
     return entries;
+  }
+
+  /**
+   * Record a manual reconciliation action (retry, escalate, resolve, note).
+   *
+   * Every manual action is audited with the operator, mandatory reason,
+   * affected case/transaction, correlation id, and outcome. Never throws —
+   * auditing must not break the operator flow, but failures are surfaced to
+   * stdout so they can be alerted on.
+   */
+  async logReconciliationAction(
+    action: Extract<AuditAction, `reconciliation.${string}`>,
+    context: ManualActionContext,
+    target: ReconciliationActionTarget,
+    outcome: { success: boolean; error?: string; meta?: Record<string, unknown> } = { success: true },
+  ): Promise<void> {
+    await this.logManualAction(action, 'reconciliation', context, target.caseId, {
+      ...outcome,
+      meta: {
+        reason: context.reason,
+        case_id: target.caseId,
+        transaction_ref: target.transactionRef,
+        booking_id: target.bookingId,
+        provider: target.provider,
+        ...outcome.meta,
+      },
+    });
+  }
+
+  /**
+   * Record a manual provider circuit-breaker operation (reset/open/close).
+   *
+   * Restricted to authorized operators; the audit entry captures who reset the
+   * circuit, why, and whether the operation succeeded.
+   */
+  async logCircuitBreakerAction(
+    action: Extract<AuditAction, `circuit_breaker.${string}`>,
+    context: ManualActionContext,
+    target: { provider: string; circuitKey?: string; previousState?: string; newState?: string },
+    outcome: { success: boolean; error?: string; meta?: Record<string, unknown> } = { success: true },
+  ): Promise<void> {
+    await this.logManualAction(action, 'circuit_breaker', context, target.provider, {
+      ...outcome,
+      meta: {
+        reason: context.reason,
+        provider: target.provider,
+        circuit_key: target.circuitKey,
+        previous_state: target.previousState,
+        new_state: target.newState,
+        ...outcome.meta,
+      },
+    });
+  }
+
+  /**
+   * Shared writer for manual operator actions. Enforces a non-empty reason and
+   * delegates to log() so sanitization and persistence behave identically.
+   */
+  private async logManualAction(
+    action: AuditAction,
+    resourceType: ResourceType,
+    context: ManualActionContext,
+    resourceId: string,
+    outcome: { success: boolean; error?: string; meta?: Record<string, unknown> },
+  ): Promise<void> {
+    const reason = context.reason?.trim();
+    if (!reason) {
+      // Refuse to silently record an unexplained manual action.
+      console.error(
+        JSON.stringify({
+          audit: true,
+          error: 'manual_action_missing_reason',
+          action,
+          resource_type: resourceType,
+          resource_id: resourceId,
+          actor_id: context.actorId ?? null,
+        }),
+      );
+      throw new Error('A reason is required for manual reconciliation actions');
+    }
+
+    try {
+      await this.log({
+        actorId: context.actorId,
+        action,
+        resourceType,
+        resourceId,
+        ip: context.ip,
+        correlationId: context.correlationId,
+        success: outcome.success,
+        error: outcome.error,
+        meta: { ...outcome.meta, reason },
+      });
+    } catch (err) {
+      // log() already swallows persistence errors; this guards against
+      // unexpected failures so operator flows are never interrupted.
+      console.error('[AuditLogger] Failed to record manual action:', err);
+    }
   }
 }
 

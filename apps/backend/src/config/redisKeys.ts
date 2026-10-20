@@ -30,7 +30,7 @@ export const REDIS_MAX_VALUE_BYTES = Number(process.env.REDIS_MAX_VALUE_BYTES ??
 /** Hard ceiling for any TTL (7 days). Prevents unbounded/never-expiring keys. */
 export const REDIS_MAX_TTL_SECONDS = Number(process.env.REDIS_MAX_TTL_SECONDS ?? 604_800);
 
-export type RedisDomain = 'cache' | 'ratelimit' | 'queue' | 'session' | 'temp';
+export type RedisDomain = 'cache' | 'ratelimit' | 'queue' | 'session' | 'temp' | 'payment';
 
 /**
  * Build a fully-namespaced Redis key.
@@ -74,4 +74,50 @@ export function assertValueSize(serialized: string): void {
   if (size > REDIS_MAX_VALUE_BYTES) {
     throw new Error(`redis: value size ${size}B exceeds limit ${REDIS_MAX_VALUE_BYTES}B`);
   }
+}
+
+/**
+ * Payment attempt limiting & provider circuit breaker keys.
+ *
+ * Attempt counters are keyed by actor and by booking/idempotency key so that
+ * repeated failures cannot keep generating provider calls. Circuit state is
+ * stored per provider with failure counts and opened-at timestamps so operators
+ * can inspect and (with an audit trail) reset it.
+ *
+ * All keys live under the `payment` domain and MUST be given a TTL.
+ */
+
+/** Attempt counter for an actor (user/device) within a rolling window. */
+export function paymentAttemptActorKey(actorId: string | number): string {
+  return redisKey('payment', 'attempt', 'actor', actorId);
+}
+
+/** Attempt counter for a booking. */
+export function paymentAttemptBookingKey(bookingId: string | number): string {
+  return redisKey('payment', 'attempt', 'booking', bookingId);
+}
+
+/** Attempt counter for an idempotency key (prevents duplicate provider calls). */
+export function paymentAttemptIdempotencyKey(idempotencyKey: string): string {
+  return redisKey('payment', 'attempt', 'idem', idempotencyKey);
+}
+
+/** Circuit breaker state record for a payment provider. */
+export function paymentCircuitStateKey(provider: string): string {
+  return redisKey('payment', 'circuit', 'state', provider);
+}
+
+/** Failure counter for a payment provider (feeds the circuit threshold). */
+export function paymentCircuitFailureKey(provider: string): string {
+  return redisKey('payment', 'circuit', 'failures', provider);
+}
+
+/** Timestamp (ms) at which the circuit for a provider was opened. */
+export function paymentCircuitOpenedAtKey(provider: string): string {
+  return redisKey('payment', 'circuit', 'openedAt', provider);
+}
+
+/** Queue backpressure gauge for deferred payment requests. */
+export function paymentBackpressureKey(): string {
+  return redisKey('payment', 'backpressure');
 }

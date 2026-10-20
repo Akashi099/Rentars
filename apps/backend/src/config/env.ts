@@ -71,6 +71,37 @@ const envSchema = z.object({
   TRUSTLESS_WORK_API_URL: z.string().url().optional(),
   TRUSTLESS_WORK_API_KEY: z.string().optional(),
 
+  // ── Stellar testnet certification suite ───────────────────────────────────
+  // Set to "true" to enable the payment-flow certification suite.  When
+  // enabled, the suite refuses to run against mainnet or with production
+  // secrets (see superRefine below).
+  STELLAR_CERTIFICATION_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
+  // Contract IDs used by the certification suite.  These must point at
+  // testnet deployments; they are kept separate from the production contract
+  // IDs above so certification can never touch live contracts.
+  CERTIFICATION_PROPERTY_LISTING_CONTRACT_ID: z.string().optional(),
+  CERTIFICATION_BOOKING_CONTRACT_ID: z.string().optional(),
+  CERTIFICATION_ESCROW_CONTRACT_ID: z.string().optional(),
+
+  // Disposable testnet account used to fund certification runs.
+  // Secret key is only ever read by the certification suite, never by the
+  // application runtime.
+  CERTIFICATION_FUNDING_SOURCE_SECRET: z.string().optional(),
+
+  // Prefix applied to every booking/transaction memo created by the suite so
+  // runs can be identified and cleaned up deterministically.
+  CERTIFICATION_RUN_TAG_PREFIX: z
+    .string()
+    .default('cert')
+    .refine(
+      (v) => /^[a-zA-Z0-9_-]{1,16}$/.test(v),
+      'CERTIFICATION_RUN_TAG_PREFIX must be 1–16 chars of [a-zA-Z0-9_-]',
+    ),
+
   // ── Geocoding ─────────────────────────────────────────────────────────────
   GEOCODING_API_KEY: z.string().optional(),
   // hCaptcha bot protection (set HCAPTCHA_ENABLED=false to bypass in dev)
@@ -354,6 +385,73 @@ const envSchema = z.object({
         message: `Production CORS origin must use https:// (got '${origin}')`,
       });
     }
+  }
+}).superRefine((value, ctx) => {
+  // The certification suite must never run against mainnet or with
+  // production secrets.  Fail fast at startup rather than mid-run.
+  if (!value.STELLAR_CERTIFICATION_ENABLED) return;
+
+  if (value.STELLAR_NETWORK !== 'testnet') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STELLAR_NETWORK'],
+      message: 'STELLAR_NETWORK must be "testnet" when STELLAR_CERTIFICATION_ENABLED is true',
+    });
+  }
+
+  if (value.NODE_ENV === 'production') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['NODE_ENV'],
+      message: 'STELLAR_CERTIFICATION_ENABLED must not be used with NODE_ENV=production',
+    });
+  }
+
+  if (!value.CERTIFICATION_FUNDING_SOURCE_SECRET) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CERTIFICATION_FUNDING_SOURCE_SECRET'],
+      message: 'CERTIFICATION_FUNDING_SOURCE_SECRET is required when STELLAR_CERTIFICATION_ENABLED is true',
+    });
+  }
+
+  if (!value.CERTIFICATION_BOOKING_CONTRACT_ID) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CERTIFICATION_BOOKING_CONTRACT_ID'],
+      message: 'CERTIFICATION_BOOKING_CONTRACT_ID is required when STELLAR_CERTIFICATION_ENABLED is true',
+    });
+  }
+
+  if (!value.CERTIFICATION_ESCROW_CONTRACT_ID) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CERTIFICATION_ESCROW_CONTRACT_ID'],
+      message: 'CERTIFICATION_ESCROW_CONTRACT_ID is required when STELLAR_CERTIFICATION_ENABLED is true',
+    });
+  }
+
+  // Certification contracts must not alias the production contract IDs.
+  if (
+    value.BOOKING_CONTRACT_ID &&
+    value.CERTIFICATION_BOOKING_CONTRACT_ID === value.BOOKING_CONTRACT_ID
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CERTIFICATION_BOOKING_CONTRACT_ID'],
+      message: 'CERTIFICATION_BOOKING_CONTRACT_ID must differ from BOOKING_CONTRACT_ID',
+    });
+  }
+
+  if (
+    value.PROPERTY_LISTING_CONTRACT_ID &&
+    value.CERTIFICATION_PROPERTY_LISTING_CONTRACT_ID === value.PROPERTY_LISTING_CONTRACT_ID
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['CERTIFICATION_PROPERTY_LISTING_CONTRACT_ID'],
+      message: 'CERTIFICATION_PROPERTY_LISTING_CONTRACT_ID must differ from PROPERTY_LISTING_CONTRACT_ID',
+    });
   }
 });
 

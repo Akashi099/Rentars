@@ -17,9 +17,18 @@
 
 import { Horizon, Transaction } from '@stellar/stellar-sdk';
 import { updatePaymentStatus, getPaymentStatus } from './payment.service.js';
+import {
+  CircuitOpenError,
+  AttemptLimitError,
+  withCircuitBreaker,
+  recordAttempt,
+  getRetryGuidance,
+} from './payment-circuit-breaker.service.js';
 
 const CONFIRMATION_TIMEOUT_MS = 60_000; // 60 seconds max wait
 const POLL_INTERVAL_MS = 3_000;         // poll every 3 seconds
+
+const PROVIDER = 'stellar-horizon';
 
 function getHorizonServer(): Horizon.Server {
   const network = process.env.STELLAR_NETWORK ?? 'testnet';
@@ -38,7 +47,10 @@ export interface SubmitResult {
  * Submit a signed transaction XDR to Stellar Horizon.
  * Returns the transaction hash on success. Throws on failure.
  */
-export async function submitTransaction(signedXdr: string): Promise<SubmitResult> {
+export async function submitTransaction(
+  signedXdr: string,
+  context?: { actorId?: string; bookingId?: string; idempotencyKey?: string },
+): Promise<SubmitResult> {
   const server = getHorizonServer();
   const passphrase =
     (process.env.STELLAR_NETWORK ?? 'testnet') === 'mainnet'
@@ -46,7 +58,14 @@ export async function submitTransaction(signedXdr: string): Promise<SubmitResult
       : 'Test SDF Network ; September 2015';
 
   const tx = new Transaction(signedXdr, passphrase);
-  const response = await server.submitTransaction(tx);
+
+  // Attempt limits are enforced per actor/booking/idempotency key so repeated
+  // failures cannot generate unbounded provider calls.
+  if (context) {
+    recordAttempt(PROVIDER, context);
+  }
+
+  const response = await withCircuitBreaker(PROVIDER, () => server.submitTransaction(tx));
   return { txHash: response.hash };
 }
 
@@ -65,7 +84,9 @@ export async function confirmTransaction(
 
   while (Date.now() < deadline) {
     try {
-      const tx = await server.transactions().transaction(txHash).call();
+      const tx = await withCircuitBreaker(PROVIDER, () =>
+        server.transactions().transaction(txHash).call(),
+      );
       if (tx.successful) {
         await updatePaymentStatus(paymentId, txHash, 'confirmed');
         return 'confirmed';
@@ -74,6 +95,12 @@ export async function confirmTransaction(
       await updatePaymentStatus(paymentId, txHash, 'failed');
       return 'timed_out';
     } catch (err: unknown) {
+      if (err instanceof CircuitOpenError) {
+        // Provider is unavailable: do not mark the payment failed. Leave it in
+        // its current state so reconciliation can pick it up once the circuit
+        // closes again. Surface truthful retry guidance to the caller.
+        throw new CircuitOpenError(err.provider, err.retryAfterMs, getRetryGuidance(err.provider));
+      }
       const isNotFound =
         err instanceof Error &&
         (err.message.includes('404') || err.message.includes('not found'));
@@ -110,12 +137,24 @@ export async function retryTransaction(
   let txHash: string;
 
   if (payment.stellar_tx_hash) {
-    // Already submitted — re-poll to avoid double-spend
+    // Already submitted — re-poll to avoid double-spend. In-flight
+    // transactions continue reconciliation even while the circuit is open.
     txHash = payment.stellar_tx_hash;
   } else {
     if (!signedXdr) throw new Error('signedXdr required for payments that were never submitted');
-    const result = await submitTransaction(signedXdr);
-    txHash = result.txHash;
+    try {
+      const result = await submitTransaction(signedXdr, {
+        bookingId: payment.booking_id,
+        idempotencyKey: payment.idempotency_key ?? undefined,
+      });
+      txHash = result.txHash;
+    } catch (err: unknown) {
+      if (err instanceof CircuitOpenError || err instanceof AttemptLimitError) {
+        // Truthful deferred/rejected response with retry guidance.
+        throw err;
+      }
+      throw err;
+    }
     await updatePaymentStatus(paymentId, txHash, 'submitted');
   }
 

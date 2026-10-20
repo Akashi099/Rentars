@@ -5,6 +5,11 @@ import { redisClient } from '@/config/redis.js';
 import { loggingService } from '@/services/logging.service.js';
 import { rateLimitStore } from '@/services/rateLimitStore.service.js';
 import { rateLimitMetrics } from '@/services/rateLimitMetrics.service.js';
+import {
+  paymentAttemptLimiter,
+  type PaymentAttemptLimitResult,
+} from '@/services/paymentAttemptLimiter.service.js';
+import { paymentCircuitBreaker } from '@/services/paymentCircuitBreaker.service.js';
 
 export interface AuthRequest extends Request {
   userId?: string;
@@ -291,6 +296,128 @@ export function createUserRateLimiter({
         );
       });
   };
+}
+
+/**
+ * Payment attempt limiter middleware.
+ *
+ * Enforces per-actor and per-booking attempt limits (counted by idempotency
+ * key) and consults the provider circuit breaker before any provider call is
+ * made. When a limit is hit or a circuit is open, the request is rejected with
+ * a truthful 429/503 response and retry guidance instead of generating further
+ * provider traffic. In-flight transactions are unaffected and continue to be
+ * reconciled by the payment worker.
+ *
+ * Backpressure signals are exposed via response headers:
+ *   - `X-Payment-Backpressure`  : "none" | "elevated" | "saturated"
+ *   - `X-Payment-Queue-Depth`   : current queued payment attempts
+ *   - `X-Payment-Circuit-State` : "closed" | "open" | "half-open" (per provider)
+ */
+export function paymentAttemptRateLimiter(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): void {
+  const actorId = req.user?.id ?? req.userId ?? req.ip ?? 'unknown';
+  const bookingId =
+    (req.body?.bookingId as string | undefined) ??
+    (req.params?.bookingId as string | undefined) ??
+    (req.params?.id as string | undefined);
+  const idempotencyKey =
+    (req.headers['idempotency-key'] as string | undefined) ??
+    (req.body?.idempotencyKey as string | undefined);
+  const provider = (req.body?.provider as string | undefined) ?? 'default';
+
+  const circuit = paymentCircuitBreaker.getState(provider);
+  const backpressure = paymentAttemptLimiter.getBackpressure();
+
+  res.setHeader('X-Payment-Backpressure', backpressure.level);
+  res.setHeader('X-Payment-Queue-Depth', String(backpressure.queueDepth));
+  res.setHeader('X-Payment-Circuit-State', circuit.state);
+
+  // Open circuit: do not generate provider calls. Defer with retry guidance.
+  if (circuit.state === 'open') {
+    const retryAfter = Math.max(1, Math.ceil((circuit.retryAfterMs ?? 0) / 1000));
+    res.setHeader('Retry-After', String(retryAfter));
+
+    loggingService.logBlockchainOperation(
+      'payment_circuit_open',
+      { provider, route: req.path, method: req.method, retryAfter },
+      undefined,
+      'Payment provider circuit is open; request deferred.',
+    );
+
+    res.status(503).json({
+      error: {
+        code: 'PAYMENT_PROVIDER_UNAVAILABLE',
+        message:
+          'The payment provider is temporarily unavailable. Your request was not processed; please retry later.',
+        details: {
+          provider,
+          circuitState: circuit.state,
+          retryAfter,
+        },
+      },
+    });
+    return;
+  }
+
+  paymentAttemptLimiter
+    .consume({ actorId, bookingId, idempotencyKey })
+    .then((result: PaymentAttemptLimitResult) => {
+      if (!result.allowed) {
+        const retryAfter = Math.max(1, Math.ceil(result.msBeforeNext / 1000));
+        res.setHeader('Retry-After', String(retryAfter));
+        res.setHeader('X-RateLimit-Remaining', '0');
+
+        loggingService.logBlockchainOperation(
+          'payment_attempt_limit_exceeded',
+          {
+            scope: result.scope,
+            route: req.path,
+            method: req.method,
+            retryAfter,
+          },
+          undefined,
+          'Payment attempt limit exceeded; request rejected.',
+        );
+
+        res.status(429).json({
+          error: {
+            code: 'PAYMENT_ATTEMPT_LIMIT_EXCEEDED',
+            message:
+              'Too many payment attempts for this booking. Please wait before retrying.',
+            details: {
+              scope: result.scope,
+              retryAfter,
+            },
+          },
+        });
+        return;
+      }
+
+      res.setHeader('X-RateLimit-Remaining', String(result.remainingPoints));
+      next();
+    })
+    .catch((err: unknown) => {
+      // Fail closed on limiter infrastructure errors to avoid provider storms.
+      loggingService.logBlockchainOperation(
+        'payment_attempt_limiter_error',
+        { route: req.path, method: req.method },
+        undefined,
+        err instanceof Error ? err.message : 'Payment attempt limiter error',
+      );
+
+      res.setHeader('Retry-After', '5');
+      res.status(503).json({
+        error: {
+          code: 'PAYMENT_LIMITER_UNAVAILABLE',
+          message:
+            'Payment processing is temporarily unavailable. Please retry shortly.',
+          details: { retryAfter: 5 },
+        },
+      });
+    });
 }
 
 // Backward compatibility export

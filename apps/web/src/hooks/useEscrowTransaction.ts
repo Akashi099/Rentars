@@ -8,6 +8,15 @@ import {
   buildEscrowFundingTransaction,
   buildEscrowReleaseTransaction,
 } from '@/lib/stellar-transactions';
+import {
+  PaymentErrorCategory,
+  PaymentErrorInfo,
+  PaymentAction,
+  PaymentTxPhase,
+  classifyPaymentError,
+  getAllowedActions,
+  isResubmissionSafe,
+} from '@/lib/payment-errors';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 const DEFAULT_SIGNING_TIMEOUT = 60000; // 60 seconds
@@ -18,6 +27,11 @@ export type EscrowTxStatus = 'idle' | 'waiting_signature' | 'submitting' | 'succ
 export interface EscrowTransactionResult {
   txHash: string;
   explorerUrl: string;
+}
+
+export interface EscrowTransactionError extends PaymentErrorInfo {
+  /** Raw error for logging; never render directly to users. */
+  cause?: unknown;
 }
 
 async function submitXdrToHorizon(xdr: string, network: 'testnet' | 'mainnet') {
@@ -36,7 +50,11 @@ async function submitXdrToHorizon(xdr: string, network: 'testnet' | 'mainnet') {
 export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet') {
   const [status, setStatus] = useState<EscrowTxStatus>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [errorInfo, setErrorInfo] = useState<EscrowTransactionError | null>(null);
   const [canRetry, setCanRetry] = useState(false);
+  const [allowedActions, setAllowedActions] = useState<PaymentAction[]>([]);
+  const [txPhase, setTxPhase] = useState<PaymentTxPhase>('unsigned');
+  const [idempotencyKey, setIdempotencyKey] = useState<string | null>(null);
 
   const submit = useCallback(
     async (params: {
@@ -58,7 +76,17 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
 
       setStatus('idle');
       setError(null);
+      setErrorInfo(null);
       setCanRetry(false);
+      setAllowedActions([]);
+      setTxPhase('unsigned');
+
+      // Retain idempotency context across retries so a retried payment is
+      // never duplicated server-side.
+      const requestKey = `${type}:${escrowId}:${String(amount ?? '0')}`;
+      setIdempotencyKey(requestKey);
+
+      let phase: PaymentTxPhase = 'unsigned';
 
       try {
         const { xdr } =
@@ -77,11 +105,21 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
 
         // Sign via Freighter with timeout
         setStatus('waiting_signature');
+        phase = 'signing';
+        setTxPhase(phase);
         const signedXdr = await signWithFreighter(xdr, network, { timeout: signingTimeout });
+
+        // Once signed, the transaction must never be resubmitted blindly.
+        phase = 'signed';
+        setTxPhase(phase);
 
         // Submit to Stellar network
         setStatus('submitting');
+        phase = 'submitted';
+        setTxPhase(phase);
         const txHash = await submitXdrToHorizon(signedXdr, network);
+        phase = 'confirmed';
+        setTxPhase(phase);
 
         // Notify backend
         if (type === 'fund') {
@@ -105,30 +143,22 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
         }
 
         setStatus('success');
+        setTxPhase('confirmed');
         return {
           txHash,
           explorerUrl: getExplorerUrl(txHash, network),
         };
       } catch (err) {
-        const isFreighterError = err instanceof FreighterError;
-        
-        if (isFreighterError && err.code === 'TIMEOUT') {
-          setStatus('timeout');
-          setError('Signing request timed out. Please check your wallet and try again.');
-          setCanRetry(true);
-        } else if (isFreighterError && err.code === 'USER_REJECTED') {
-          setStatus('error');
-          setError('Transaction was rejected. You can try again when ready.');
-          setCanRetry(true);
-        } else if (isFreighterError && err.code === 'NETWORK_MISMATCH') {
-          setStatus('error');
-          setError(err.message);
-          setCanRetry(false);
-        } else {
-          setStatus('error');
-          setError(err instanceof Error ? err.message : 'Failed to submit transaction');
-          setCanRetry(true);
-        }
+        const info = classifyPaymentError(err, phase);
+        const actions = getAllowedActions(info.category, phase);
+        const retrySafe = isResubmissionSafe(phase) && actions.includes('retry');
+
+        setStatus(info.category === PaymentErrorCategory.TIMEOUT ? 'timeout' : 'error');
+        setError(info.message);
+        setErrorInfo({ ...info, cause: err });
+        setAllowedActions(actions);
+        setCanRetry(retrySafe);
+        setTxPhase(phase);
 
         throw err;
       }
@@ -139,14 +169,23 @@ export function useEscrowTransaction(network: 'testnet' | 'mainnet' = 'testnet')
   const reset = useCallback(() => {
     setStatus('idle');
     setError(null);
+    setErrorInfo(null);
     setCanRetry(false);
+    setAllowedActions([]);
+    setTxPhase('unsigned');
+    setIdempotencyKey(null);
   }, []);
 
-  return { 
-    submit, 
-    status, 
-    error, 
+  return {
+    submit,
+    status,
+    error,
+    errorCategory: errorInfo?.category ?? null,
+    errorInfo,
     canRetry,
+    allowedActions,
+    txPhase,
+    idempotencyKey,
     reset,
     isSubmitting: status === 'waiting_signature' || status === 'submitting',
   };

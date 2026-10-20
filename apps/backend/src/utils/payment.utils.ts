@@ -236,6 +236,258 @@ export function reconcileAmounts(
   };
 }
 
+// ─── Payment error taxonomy (#771) ───────────────────────────────────────────
+
+/**
+ * Stable, internal error categories for payment failures.
+ *
+ * Each category maps to a distinct user-facing message and a distinct set of
+ * safe next actions.  Never surface raw provider/RPC errors to users — map
+ * them through this taxonomy first.
+ */
+export const PAYMENT_ERROR_CATEGORIES = [
+  'wallet_rejected',
+  'insufficient_funds',
+  'rpc_failure',
+  'provider_timeout',
+  'contract_rejection',
+  'quote_invalid',
+  'amount_mismatch',
+  'unknown',
+] as const;
+
+export type PaymentErrorCategory = (typeof PAYMENT_ERROR_CATEGORIES)[number];
+
+/**
+ * Transaction lifecycle status as observed by the backend.
+ *
+ * `signed` and `submitted` are terminal for resubmission purposes: a signed
+ * transaction must never be re-signed or re-submitted (it may already be
+ * in-flight on-chain), so only status-checking actions are safe.
+ */
+export const PAYMENT_TRANSACTION_STATUSES = [
+  'draft',
+  'quoted',
+  'signed',
+  'submitted',
+  'pending_confirmation',
+  'confirmed',
+  'failed',
+  'under_review',
+] as const;
+
+export type PaymentTransactionStatus = (typeof PAYMENT_TRANSACTION_STATUSES)[number];
+
+/** Actions the UI may offer for a failed payment. */
+export const PAYMENT_RECOVERY_ACTIONS = [
+  'retry',
+  'change_wallet',
+  'cancel',
+  'contact_support',
+  'check_status',
+] as const;
+
+export type PaymentRecoveryAction = (typeof PAYMENT_RECOVERY_ACTIONS)[number];
+
+export interface PaymentErrorDescriptor {
+  category: PaymentErrorCategory;
+  /** Safe, user-facing message. Never contains secrets, XDRs, or stack traces. */
+  message: string;
+  /** Whether the user may safely attempt the payment again. */
+  recoverable: boolean;
+  /** Actions safe to offer for this category, before status filtering. */
+  suggestedActions: PaymentRecoveryAction[];
+}
+
+const PAYMENT_ERROR_DESCRIPTORS: Record<PaymentErrorCategory, PaymentErrorDescriptor> = {
+  wallet_rejected: {
+    category: 'wallet_rejected',
+    message:
+      'The payment was cancelled in your wallet. No funds were moved. You can try again when ready.',
+    recoverable: true,
+    suggestedActions: ['retry', 'change_wallet', 'cancel'],
+  },
+  insufficient_funds: {
+    category: 'insufficient_funds',
+    message:
+      'Your wallet does not have enough USDC to complete this payment. Add funds or switch wallets, then try again.',
+    recoverable: true,
+    suggestedActions: ['retry', 'change_wallet', 'cancel'],
+  },
+  rpc_failure: {
+    category: 'rpc_failure',
+    message:
+      'We could not reach the payment network. Your payment was not confirmed. Please retry in a moment.',
+    recoverable: true,
+    suggestedActions: ['retry', 'check_status', 'contact_support'],
+  },
+  provider_timeout: {
+    category: 'provider_timeout',
+    message:
+      'The payment provider took too long to respond. Your payment status is unknown — check the status before retrying.',
+    recoverable: true,
+    suggestedActions: ['check_status', 'contact_support'],
+  },
+  contract_rejection: {
+    category: 'contract_rejection',
+    message:
+      'The payment contract rejected this transaction. No funds were moved. Please review the details and try again.',
+    recoverable: true,
+    suggestedActions: ['retry', 'change_wallet', 'contact_support'],
+  },
+  quote_invalid: {
+    category: 'quote_invalid',
+    message:
+      'This payment quote has expired or is no longer valid. Please request a new quote to continue.',
+    recoverable: true,
+    suggestedActions: ['retry', 'cancel'],
+  },
+  amount_mismatch: {
+    category: 'amount_mismatch',
+    message:
+      'The settled amount did not match the quoted amount. Your payment is under review and no booking has been marked paid.',
+    recoverable: false,
+    suggestedActions: ['contact_support'],
+  },
+  unknown: {
+    category: 'unknown',
+    message:
+      'Something went wrong while processing your payment. Please check the payment status before trying again.',
+    recoverable: false,
+    suggestedActions: ['check_status', 'contact_support'],
+  },
+};
+
+/**
+ * Return the safe user-facing descriptor for a payment error category.
+ * Unknown categories fall back to the `unknown` descriptor.
+ */
+export function getPaymentErrorDescriptor(
+  category: PaymentErrorCategory | string,
+): PaymentErrorDescriptor {
+  const key = category as PaymentErrorCategory;
+  const descriptor = PAYMENT_ERROR_DESCRIPTORS[key] ?? PAYMENT_ERROR_DESCRIPTORS.unknown;
+  // Return a copy so callers cannot mutate the shared table.
+  return { ...descriptor, suggestedActions: [...descriptor.suggestedActions] };
+}
+
+/**
+ * Compute the actions that are safe to offer for a given error category and
+ * transaction status.
+ *
+ * Safety rules:
+ *  - `signed` / `submitted` / `pending_confirmation` transactions may already
+ *    be in-flight on-chain, so `retry` and `change_wallet` are never offered
+ *    (prevents duplicate payments).
+ *  - `confirmed` transactions are never retried.
+ *  - `retry` is only offered when the error is recoverable.
+ */
+export function getAllowedRecoveryActions(
+  category: PaymentErrorCategory | string,
+  status: PaymentTransactionStatus,
+): PaymentRecoveryAction[] {
+  const descriptor = getPaymentErrorDescriptor(category);
+  const inFlight =
+    status === 'signed' || status === 'submitted' || status === 'pending_confirmation';
+
+  return descriptor.suggestedActions.filter((action) => {
+    if (action === 'retry') {
+      return descriptor.recoverable && !inFlight && status !== 'confirmed';
+    }
+    if (action === 'change_wallet') {
+      return !inFlight && status !== 'confirmed';
+    }
+    if (action === 'cancel') {
+      return status !== 'confirmed';
+    }
+    return true;
+  });
+}
+
+/**
+ * Whether a payment may be resubmitted for the given transaction status.
+ * Signed/submitted transactions must never be resubmitted — they may already
+ * be on-chain, and resubmission risks a duplicate payment.
+ */
+export function canResubmitPayment(status: PaymentTransactionStatus): boolean {
+  return status === 'draft' || status === 'quoted' || status === 'failed';
+}
+
+// ─── Error text sanitization ─────────────────────────────────────────────────
+
+const SECRET_PATTERNS: RegExp[] = [
+  // Stellar secret seeds (S... 56 chars)
+  /\bS[A-Z2-7]{55}\b/g,
+  // Transaction / envelope XDR (base64 blobs, typically long)
+  /\b[A-Za-z0-9+/]{80,}={0,2}\b/g,
+  // Hex-encoded hashes / signatures (64+ hex chars)
+  /\b[0-9a-fA-F]{64,}\b/g,
+  // Bearer tokens / API keys in headers
+  /\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi,
+  // key=value style secrets
+  /\b(secret|private[_-]?key|api[_-]?key|token|password)\s*[:=]\s*\S+/gi,
+];
+
+/**
+ * Sanitize arbitrary error text so it is safe to show to users or log.
+ *
+ * Removes Stellar secret seeds, XDR blobs, long hex signatures, bearer tokens,
+ * and key=value secrets.  Truncates the result to a bounded length.
+ */
+export function sanitizePaymentErrorText(raw: unknown, maxLength = 300): string {
+  let text: string;
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (raw instanceof Error) {
+    text = raw.message;
+  } else {
+    text = String(raw ?? '');
+  }
+
+  for (const pattern of SECRET_PATTERNS) {
+    text = text.replace(pattern, '[redacted]');
+  }
+
+  text = text.replace(/\s+/g, ' ').trim();
+
+  if (text.length > maxLength) {
+    text = `${text.slice(0, maxLength - 1)}…`;
+  }
+  return text;
+}
+
+/**
+ * Build a complete, safe recovery payload for a failed payment.
+ *
+ * Combines the category descriptor, status-filtered actions, and a sanitized
+ * diagnostic string.  The raw error is never returned to the client.
+ */
+export function buildPaymentFailureResponse(
+  category: PaymentErrorCategory | string,
+  status: PaymentTransactionStatus,
+  rawError?: unknown,
+): {
+  category: PaymentErrorCategory;
+  message: string;
+  recoverable: boolean;
+  allowedActions: PaymentRecoveryAction[];
+  canResubmit: boolean;
+  diagnostic?: string;
+} {
+  const descriptor = getPaymentErrorDescriptor(category);
+  const diagnostic =
+    rawError === undefined ? undefined : sanitizePaymentErrorText(rawError);
+
+  return {
+    category: descriptor.category,
+    message: descriptor.message,
+    recoverable: descriptor.recoverable,
+    allowedActions: getAllowedRecoveryActions(descriptor.category, status),
+    canResubmit: descriptor.recoverable && canResubmitPayment(status),
+    ...(diagnostic ? { diagnostic } : {}),
+  };
+}
+
 // ─── Validation helper for service layer ─────────────────────────────────────
 
 export interface AmountValidationError {

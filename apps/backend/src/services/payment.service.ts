@@ -40,6 +40,20 @@ import { createHash } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
 import type { ServiceResponse } from './index.js';
+import {
+  type PaymentErrorCategory,
+  type PaymentErrorContext,
+  type PaymentNextAction,
+  type PaymentErrorResponse,
+  classifyPaymentError,
+  buildPaymentErrorResponse,
+  isResubmissionBlocked,
+} from './paymentErrorTaxonomy.js';
+import {
+  checkCircuitBreaker,
+  recordProviderOutcome,
+  recordPaymentAttempt,
+} from './paymentCircuitBreaker.service.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -123,6 +137,37 @@ export interface TransitionResult {
   replayed: boolean;
 }
 
+/**
+ * Structured failure returned by payment operations. Carries the error
+ * category, a user-safe message, the current transaction status, the
+ * preserved idempotency context, and the set of next actions that are safe
+ * for the current transaction status.
+ */
+export interface PaymentFailure {
+  category: PaymentErrorCategory;
+  /** User-safe message — never contains secrets or implies premature success. */
+  message: string;
+  /** Current canonical transaction status at the time of failure. */
+  transactionStatus: PaymentStatus | null;
+  /** Preserved idempotency context so retries never duplicate a payment. */
+  idempotency: {
+    paymentId: string;
+    bookingId: string | null;
+    eventHash: string | null;
+    /** True when a signed transaction already exists and must not be resubmitted. */
+    signedTransactionExists: boolean;
+    stellarTxHash: string | null;
+  };
+  /** Only actions that are safe for the current transaction status. */
+  allowedActions: PaymentNextAction[];
+  /** Whether the caller may safely retry the same operation. */
+  retryable: boolean;
+}
+
+export type PaymentOperationResult<T> =
+  | { success: true; data: T }
+  | { success: false; failure: PaymentFailure };
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -147,6 +192,53 @@ export function isAllowedTransition(from: PaymentStatus, to: PaymentStatus): boo
  */
 export function mapProviderStatus(raw: string): PaymentStatus {
   return PROVIDER_STATUS_MAP[raw] ?? 'under_review';
+}
+
+/**
+ * Returns true when the payment has already had a signed transaction
+ * submitted (or is otherwise past the point where resubmission is safe).
+ */
+export function hasSignedTransaction(payment: Payment): boolean {
+  return (
+    payment.status === 'submitted' ||
+    payment.status === 'confirmed' ||
+    payment.status === 'refunded' ||
+    (payment.stellar_tx_hash !== null && payment.stellar_tx_hash !== '')
+  );
+}
+
+/**
+ * Build a structured PaymentFailure from an error and the current payment
+ * (if known). Preserves idempotency context and computes safe next actions.
+ */
+export function buildPaymentFailure(
+  error: unknown,
+  payment: Payment | null,
+  eventHash?: string | null,
+): PaymentFailure {
+  const context: PaymentErrorContext = {
+    transactionStatus: payment?.status ?? null,
+    signedTransactionExists: payment ? hasSignedTransaction(payment) : false,
+    providerStatus: null,
+  };
+
+  const classified = classifyPaymentError(error, context);
+  const response: PaymentErrorResponse = buildPaymentErrorResponse(classified, context);
+
+  return {
+    category: response.category,
+    message: response.message,
+    transactionStatus: payment?.status ?? null,
+    idempotency: {
+      paymentId: payment?.id ?? '',
+      bookingId: payment?.booking_id ?? null,
+      eventHash: eventHash ?? payment?.last_event_hash ?? null,
+      signedTransactionExists: context.signedTransactionExists,
+      stellarTxHash: payment?.stellar_tx_hash ?? null,
+    },
+    allowedActions: response.allowedActions,
+    retryable: response.retryable,
+  };
 }
 
 // ─── Service functions ────────────────────────────────────────────────────────
@@ -237,6 +329,33 @@ export async function transitionPaymentStatus(
     };
   }
 
+  // ── Refuse resubmission of an already-signed transaction ──────────────────
+  // A signed transaction must never be resubmitted; doing so risks a
+  // duplicate payment. Quarantine for reconciliation instead.
+  if (newStatus === 'submitted' && isResubmissionBlocked(payment.status, hasSignedTransaction(payment))) {
+    const failure = buildPaymentFailure(
+      { category: 'already_signed' as PaymentErrorCategory },
+      payment,
+      eventHash,
+    );
+    await auditLogger.log({
+      actorId,
+      action: 'payment.failed',
+      resourceType: 'payment',
+      resourceId: paymentId,
+      meta: {
+        reason: 'resubmission_blocked',
+        fromStatus: payment.status,
+        toStatus: newStatus,
+        stellarTxHash: payment.stellar_tx_hash,
+      },
+    });
+    return {
+      success: false,
+      error: failure.message,
+    };
+  }
+
   // ── Validate transition ────────────────────────────────────────────────────
   let targetStatus: PaymentStatus = newStatus;
   let quarantineReason: string | undefined;
@@ -273,10 +392,16 @@ export async function transitionPaymentStatus(
     .single();
 
   if (error || !data) {
-    // Version conflict — another process transitioned first
+    // Version conflict — another process transitioned first. Preserve
+    // idempotency context so the caller can safely retry.
+    const failure = buildPaymentFailure(
+      { category: 'conflict' as PaymentErrorCategory },
+      payment,
+      eventHash,
+    );
     return {
       success: false,
-      error: `Concurrent payment transition conflict for ${paymentId}: ${error?.message ?? 'version mismatch'}`,
+      error: failure.message,
     };
   }
 
@@ -339,6 +464,114 @@ export async function updatePaymentStatus(
   }
 
   return result.data.payment;
+}
+
+/**
+ * Submit a signed transaction for a payment, enforcing attempt limits and
+ * provider circuit breakers before any provider call is made.
+ *
+ * The caller supplies an idempotency key (typically the payment's event hash
+ * or quote hash) and the actor performing the submission. Attempts are
+ * counted per actor + booking + idempotency key so repeated failures stop
+ * generating provider calls.
+ *
+ * @returns A structured result; on failure the PaymentFailure carries safe
+ *          next actions and preserved idempotency context.
+ */
+export async function submitSignedTransaction(params: {
+  paymentId: string;
+  actorId: string;
+  idempotencyKey: string;
+  /** Provider call that performs the actual submission. */
+  submit: () => Promise<{ txHash: string }>;
+}): Promise<PaymentOperationResult<TransitionResult>> {
+  const { paymentId, actorId, idempotencyKey, submit } = params;
+
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    return {
+      success: false,
+      failure: buildPaymentFailure({ category: 'not_found' as PaymentErrorCategory }, null, idempotencyKey),
+    };
+  }
+
+  // Refuse to resubmit an already-signed transaction.
+  if (hasSignedTransaction(payment)) {
+    return {
+      success: false,
+      failure: buildPaymentFailure(
+        { category: 'already_signed' as PaymentErrorCategory },
+        payment,
+        idempotencyKey,
+      ),
+    };
+  }
+
+  // ── Circuit breaker check before any provider call ────────────────────────
+  const circuit = await checkCircuitBreaker('stellar');
+  if (!circuit.closed) {
+    return {
+      success: false,
+      failure: buildPaymentFailure(
+        { category: 'provider_unavailable' as PaymentErrorCategory },
+        payment,
+        idempotencyKey,
+      ),
+    };
+  }
+
+  // ── Attempt limit check ───────────────────────────────────────────────────
+  const attempt = await recordPaymentAttempt({
+    actorId,
+    bookingId: payment.booking_id,
+    idempotencyKey,
+  });
+  if (!attempt.allowed) {
+    return {
+      success: false,
+      failure: buildPaymentFailure(
+        { category: 'rate_limited' as PaymentErrorCategory },
+        payment,
+        idempotencyKey,
+      ),
+    };
+  }
+
+  // ── Provider call ─────────────────────────────────────────────────────────
+  let txHash: string;
+  try {
+    const result = await submit();
+    txHash = result.txHash;
+    await recordProviderOutcome('stellar', { success: true });
+  } catch (err) {
+    await recordProviderOutcome('stellar', { success: false, error: err });
+    return {
+      success: false,
+      failure: buildPaymentFailure(err, payment, idempotencyKey),
+    };
+  }
+
+  // ── Persist the submitted transition ──────────────────────────────────────
+  const transition = await transitionPaymentStatus(
+    paymentId,
+    'submitted',
+    { txHash, idempotencyKey, _source: 'submit_signed_transaction' },
+    txHash,
+    actorId,
+  );
+
+  if (!transition.success || !transition.data) {
+    return {
+      success: false,
+      failure: buildPaymentFailure(
+        { category: 'internal' as PaymentErrorCategory },
+        payment,
+        idempotencyKey,
+      ),
+    };
+  }
+
+  return { success: true, data: transition.data };
 }
 
 /**

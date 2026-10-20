@@ -16,6 +16,11 @@ import {
   confirmTransaction,
   retryTransaction,
 } from '@/services/stellar.service.js';
+import {
+  classifyPaymentError,
+  buildPaymentErrorPayload,
+  type PaymentErrorContext,
+} from '@/services/payment-error.service.js';
 
 const submitSchema = z.object({
   bookingId: z.string().uuid('bookingId must be a valid UUID'),
@@ -57,13 +62,24 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     txHash = result.txHash;
     await updatePaymentStatus(payment.id, txHash, 'submitted');
   } catch (err) {
-    await updatePaymentStatus(payment.id, null, 'failed');
-    res.status(502).json({
-      error: {
-        code: 'TX_SUBMIT_FAILED',
-        message: err instanceof Error ? err.message : 'Transaction submission failed',
-      },
-    });
+    // The signed XDR may or may not have reached the network. We never mark the
+    // payment as definitively failed here unless the error category is terminal,
+    // and we never echo the signed XDR or raw provider error back to the client.
+    const context: PaymentErrorContext = {
+      paymentId: payment.id,
+      idempotencyKey: payment.id,
+      transactionStatus: 'submission_unknown',
+      hasSignedXdr: true,
+      hasTxHash: false,
+    };
+    const category = classifyPaymentError(err);
+    const terminal = category === 'wallet_rejected' || category === 'contract_rejected';
+
+    await updatePaymentStatus(payment.id, null, terminal ? 'failed' : 'pending');
+
+    res.status(terminal ? 422 : 502).json(
+      buildPaymentErrorPayload(category, context),
+    );
     return;
   }
 
@@ -103,6 +119,10 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     txHash: payment.stellar_tx_hash,
     amountUsdc: payment.amount_usdc,
     updatedAt: payment.updated_at,
+    // Idempotency context so the client can safely resume polling / retry
+    // without resubmitting an already-signed transaction.
+    idempotencyKey: payment.id,
+    transactionStatus: payment.stellar_tx_hash ? 'submitted' : 'not_submitted',
   });
 }
 
@@ -136,13 +156,22 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
 
   try {
     const result = await retryTransaction(id, parsed.data.signedXdr);
-    res.json({ paymentId: id, txHash: result.txHash, status: result.status });
-  } catch (err) {
-    res.status(422).json({
-      error: {
-        code: 'RETRY_FAILED',
-        message: err instanceof Error ? err.message : 'Retry failed',
-      },
+    res.json({
+      paymentId: id,
+      txHash: result.txHash,
+      status: result.status,
+      idempotencyKey: id,
+      transactionStatus: result.txHash ? 'submitted' : 'not_submitted',
     });
+  } catch (err) {
+    const context: PaymentErrorContext = {
+      paymentId: id,
+      idempotencyKey: id,
+      transactionStatus: payment.stellar_tx_hash ? 'submitted' : 'not_submitted',
+      hasSignedXdr: Boolean(parsed.data.signedXdr),
+      hasTxHash: Boolean(payment.stellar_tx_hash),
+    };
+    const category = classifyPaymentError(err);
+    res.status(422).json(buildPaymentErrorPayload(category, context));
   }
 }

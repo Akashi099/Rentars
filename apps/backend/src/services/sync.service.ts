@@ -16,6 +16,11 @@ import {
   PROPERTY_LISTING_CONTRACT_ID,
   STELLAR_RPC_URL,
 } from '@/blockchain/config.js';
+import {
+  assertCertificationEnvironment,
+  createCertificationRun,
+  type CertificationRun,
+} from './certification.service.js';
 import { BookingClient } from '@/blockchain/bookingClient.js';
 import { PropertyListingClient } from '@/blockchain/propertyListingClient.js';
 import { getTransactionStatus } from '@/blockchain/transactionUtils.js';
@@ -514,4 +519,117 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
+}
+
+// ─── #773 Testnet certification harness ──────────────────────────────────────
+
+/**
+ * Reconcile a single booking by ID as part of a certification run.
+ *
+ * Unlike {@link reconcileAllPendingEscrows}, this targets one booking so the
+ * certification suite can assert on the exact sync event produced.  The run id
+ * is attached to every blockchain log entry so certification transactions can
+ * be traced and cleaned up deterministically.
+ *
+ * @param run - Certification run context (carries the unique run id)
+ * @param bookingId - Supabase booking row id
+ * @returns ServiceResponse with the resulting sync status and log reference
+ */
+export async function reconcileBookingForCertification(
+  run: CertificationRun,
+  bookingId: string,
+): Promise<ServiceResponse<{ status: SyncStatus; syncEventId: string | null }>> {
+  assertCertificationEnvironment();
+
+  const { data: booking, error } = await supabase
+    .from('bookings')
+    .select('*')
+    .eq('id', bookingId)
+    .single();
+
+  if (error || !booking) {
+    return { success: false, error: error?.message ?? `Booking ${bookingId} not found` };
+  }
+
+  try {
+    await reconcilePendingEscrow(
+      booking as BookingDBRow & { escrow_hash?: string; reconcile_attempts?: number },
+    );
+
+    const { data: logRow } = await supabase
+      .from('blockchain_logs')
+      .insert({
+        booking_id: bookingId,
+        tx_hash: (booking as { escrow_hash?: string }).escrow_hash,
+        log_type: 'reconciliation',
+        message: `Certification reconcile run ${run.runId}`,
+        attempt: (booking as { reconcile_attempts?: number }).reconcile_attempts ?? 0,
+        certification_run_id: run.runId,
+        created_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+
+    return {
+      success: true,
+      data: {
+        status: 'success',
+        syncEventId: (logRow as { id?: string } | null)?.id ?? null,
+      },
+    };
+  } catch (err) {
+    const message = (err as Error).message;
+    await writeSyncLog({
+      entity_type: 'booking',
+      entity_id: bookingId,
+      status: 'failed',
+      error_message: `[cert:${run.runId}] ${message}`,
+    });
+    return { success: false, error: message };
+  }
+}
+
+/**
+ * Run the full reconciliation certification pass for a set of bookings.
+ *
+ * Each booking is reconciled individually and its sync event reference is
+ * captured so failures can be reported against the exact booking, transaction,
+ * and sync event.  The run id tags every log entry for deterministic cleanup.
+ *
+ * @param run - Certification run context
+ * @param bookingIds - Booking row ids to reconcile
+ * @returns ServiceResponse with per-booking results
+ */
+export async function certifyReconciliation(
+  run: CertificationRun,
+  bookingIds: string[],
+): Promise<ServiceResponse<Array<{ bookingId: string; status: SyncStatus; syncEventId: string | null; error?: string }>>> {
+  assertCertificationEnvironment();
+
+  const results: Array<{ bookingId: string; status: SyncStatus; syncEventId: string | null; error?: string }> = [];
+
+  for (const bookingId of bookingIds) {
+    const result = await reconcileBookingForCertification(run, bookingId);
+    if (result.success) {
+      results.push({ bookingId, ...result.data });
+    } else {
+      results.push({ bookingId, status: 'failed', syncEventId: null, error: result.error });
+    }
+  }
+
+  const anyFailed = results.some((r) => r.status === 'failed');
+  return anyFailed
+    ? { success: false, error: 'One or more bookings failed reconciliation certification', data: results }
+    : { success: true, data: results };
+}
+
+/**
+ * Convenience entry point used by the certification suite: provisions a run
+ * context and reconciles the supplied bookings under it.
+ */
+export async function runReconciliationCertification(
+  bookingIds: string[],
+): Promise<ServiceResponse<Array<{ bookingId: string; status: SyncStatus; syncEventId: string | null; error?: string }>>> {
+  const run = createCertificationRun();
+  return certifyReconciliation(run, bookingIds);
 }

@@ -51,6 +51,8 @@ import {
 } from '@/controllers/admin.controller.js';
 import emailAdminRoutes from './emailAdmin.routes.js';
 import notificationMonitorRoutes from './notificationMonitor.routes.js';
+import reconciliationAdminRoutes from './reconciliationAdmin.routes.js';
+import paymentCircuitAdminRoutes from './paymentCircuitAdmin.routes.js';
 
 const router = Router();
 
@@ -124,5 +126,20 @@ router.use('/email', emailAdminRoutes);
 // Scoped sub-router — all routes inside require admin:notifications:read
 // Mounted at /api/v1/admin/notifications/*
 router.use('/notifications', notificationMonitorRoutes);
+
+// ── Reconciliation operations ─────────────────────────────────────────────────
+// Scoped sub-router — read routes require admin:reconciliation:read,
+// manual intervention routes require admin:reconciliation:write (HIGH-RISK,
+// dual approval) and a mandatory reason. Secret payloads and unnecessary PII
+// are stripped by the controller before serialization.
+// Mounted at /api/v1/admin/reconciliation/*
+router.use('/reconciliation', reconciliationAdminRoutes);
+
+// ── Payment circuit breakers ──────────────────────────────────────────────────
+// Scoped sub-router — inspection requires admin:payments:read, manual reset
+// requires admin:payments:operate (HIGH-RISK, dual approval) and a mandatory
+// reason. Every action is audited.
+// Mounted at /api/v1/admin/payments/circuits/*
+router.use('/payments/circuits', paymentCircuitAdminRoutes);
 
 export default router;

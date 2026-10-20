@@ -71,3 +71,54 @@ export interface BookingWithProperty extends Booking {
     owner_id?: string;
   };
 }
+
+// ─── Payment error taxonomy ──────────────────────────────────────────────────
+
+/**
+ * Internal payment error categories. Each maps to a distinct user-facing
+ * message and a distinct set of safe recovery actions.
+ */
+export type PaymentErrorCategory =
+  | 'wallet_rejected'
+  | 'insufficient_funds'
+  | 'rpc_failure'
+  | 'provider_timeout'
+  | 'contract_rejection'
+  | 'unknown';
+
+/**
+ * Transaction status at the time the error occurred. Used to decide which
+ * recovery actions are safe — e.g. a signed transaction must never be
+ * resubmitted.
+ */
+export type PaymentTransactionStatus =
+  | 'unsigned'
+  | 'signed'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed';
+
+/** Actions the UI may offer for a recoverable payment failure. */
+export type PaymentRecoveryAction =
+  | 'retry'
+  | 'change_wallet'
+  | 'cancel'
+  | 'contact_support';
+
+/**
+ * Recoverable payment failure state. `message` is safe for display and never
+ * contains secrets or implies success. `idempotencyKey` preserves context so
+ * a retry cannot duplicate a payment.
+ */
+export interface PaymentErrorState {
+  category: PaymentErrorCategory;
+  /** Safe, user-facing message. */
+  message: string;
+  /** Actions that are safe for the current transaction status. */
+  allowedActions: PaymentRecoveryAction[];
+  transactionStatus: PaymentTransactionStatus;
+  /** Idempotency context retained across retries. */
+  idempotencyKey?: string;
+  /** Whether the failure can be recovered without support intervention. */
+  recoverable: boolean;
+}

@@ -2,6 +2,8 @@ import type { NextFunction, Request, Response } from 'express';
 import { env } from '@/config/env.js';
 import { isDomainError, ValidationError } from '@/types/errors.js';
 import type { DomainError } from '@/types/errors.js';
+import { isPaymentError } from '@/types/payment-errors.js';
+import type { PaymentError } from '@/types/payment-errors.js';
 import { structuredLog, type RequestWithId } from './logging.middleware.js';
 import { incCounter, httpErrorsTotal } from './metrics.middleware.js';
 
@@ -20,6 +22,19 @@ interface ErrorResponse {
     code: string;
     message: string;
     details?: Record<string, unknown>;
+    requestId?: string;
+  };
+}
+
+interface PaymentErrorResponse {
+  error: {
+    code: string;
+    category: string;
+    message: string;
+    retryable: boolean;
+    allowedActions: string[];
+    status: string;
+    idempotencyKey?: string;
     requestId?: string;
   };
 }
@@ -176,6 +191,52 @@ export function errorMiddleware(
       requestId,
     };
     res.status(400).json(response);
+    return;
+  }
+
+  // ── Payment errors ────────────────────────────────────────────────────────
+  // Payment failures carry a shared taxonomy (category, safe user message,
+  // allowed next actions, transaction status). Serialize only the safe,
+  // user-facing fields; full internal details are logged server-side only.
+  if (isPaymentError(err)) {
+    const paymentErr = err as PaymentError;
+    const statusCode = paymentErr.httpStatus;
+    logAndCount(req, statusCode, paymentErr.code, err);
+
+    // Log the full internal context (category, status, idempotency key,
+    // underlying cause) server-side only — never returned to the client.
+    structuredLog({
+      level: statusCode >= 500 ? 'error' : 'warn',
+      message: `Payment error: ${paymentErr.code}`,
+      timestamp: new Date().toISOString(),
+      requestId,
+      method: req.method,
+      path: req.path,
+      status: statusCode,
+      errorCode: paymentErr.code,
+      paymentCategory: paymentErr.category,
+      paymentStatus: paymentErr.status,
+      retryable: paymentErr.retryable,
+      allowedActions: paymentErr.allowedActions,
+      idempotencyKey: paymentErr.idempotencyKey,
+      ...(paymentErr.cause instanceof Error && { cause: paymentErr.cause.message }),
+    });
+
+    const response: PaymentErrorResponse = {
+      error: {
+        code: paymentErr.code,
+        category: paymentErr.category,
+        message: paymentErr.userMessage,
+        retryable: paymentErr.retryable,
+        allowedActions: paymentErr.allowedActions,
+        status: paymentErr.status,
+        requestId,
+      },
+    };
+    if (paymentErr.idempotencyKey) {
+      response.error.idempotencyKey = paymentErr.idempotencyKey;
+    }
+    res.status(statusCode).json(response);
     return;
   }
 

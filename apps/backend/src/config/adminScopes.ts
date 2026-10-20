@@ -47,7 +47,12 @@ export type AdminScope =
   | 'admin:ratelimits:read'
   // Refund / financial
   | 'admin:refunds:approve'    // HIGH-RISK: financial action, dual-approval required
+  // Reconciliation operations (issue 048)
   | 'admin:reconciliation:read'
+  | 'admin:reconciliation:write' // HIGH-RISK: manual intervention on mismatches
+  // Provider circuit breakers (issue 050)
+  | 'admin:circuit_breaker:read'
+  | 'admin:circuit_breaker:reset' // HIGH-RISK: re-enables provider traffic
   // Email delivery tracking (added: feature 1)
   | 'admin:email:read'
   // Notification monitoring (added: feature 2)
@@ -61,6 +66,8 @@ export const DUAL_APPROVAL_REQUIRED = new Set<AdminScope>([
   'admin:disputes:resolve',
   'admin:refunds:approve',
   'admin:users:suspend',
+  'admin:reconciliation:write',
+  'admin:circuit_breaker:reset',
 ]);
 
 // ── Role → Scope mapping ──────────────────────────────────────────────────────
@@ -85,6 +92,9 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:ratelimits:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:reconciliation:write',
+    'admin:circuit_breaker:read',
+    'admin:circuit_breaker:reset',
     'admin:email:read',
     'admin:notifications:read',
     'admin:abuse:read',
@@ -118,6 +128,9 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:disputes:read',
     'admin:refunds:approve',
     'admin:reconciliation:read',
+    'admin:reconciliation:write',
+    'admin:circuit_breaker:read',
+    'admin:circuit_breaker:reset',
     'admin:audit:read',
     'admin:support:read',
   ],

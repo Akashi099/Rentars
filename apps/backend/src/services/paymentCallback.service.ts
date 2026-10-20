@@ -29,6 +29,10 @@ import {
   hashEventPayload,
   getPaymentByBookingId,
 } from './payment.service.js';
+import {
+  classifyPaymentError,
+  type PaymentErrorCategory,
+} from './paymentError.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -82,6 +86,18 @@ export interface CallbackVerificationResult {
   httpStatus: number;
   /** Safe message to surface to the provider (no internals). */
   message: string;
+  /**
+   * Shared error taxonomy category for non-acknowledged outcomes.
+   * Undefined for acknowledged / replayed events.
+   */
+  errorCategory?: PaymentErrorCategory;
+  /**
+   * Idempotency context retained for recoverable outcomes so callers can
+   * safely retry or reconcile without duplicating a payment.
+   */
+  idempotencyKey?: string;
+  /** Whether the provider may safely resend this event. */
+  retryable?: boolean;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -125,13 +141,16 @@ async function isReplay(eventId: string): Promise<boolean> {
 
 /**
  * Persist an event ID to the replay ledger.
+ *
+ * Idempotent: a duplicate insert (unique constraint on event_id) is treated
+ * as success so concurrent deliveries of the same event cannot double-process.
  */
 async function recordEvent(
   eventId: string,
   bookingId: string,
   eventHash: string,
 ): Promise<void> {
-  await supabase
+  const { error } = await supabase
     .from('payment_callback_events')
     .insert({
       event_id: eventId,
@@ -139,7 +158,51 @@ async function recordEvent(
       event_hash: eventHash,
       created_at: new Date().toISOString(),
     })
-    .select(); // fire-and-forget but await to avoid unhandled rejections
+    .select();
+
+  if (error && !isUniqueViolation(error)) {
+    // Non-fatal: the ledger is a defence-in-depth layer; log without secrets.
+    console.error(`[Callback] Failed to record event ledger entry for bookingId=${bookingId}`);
+  }
+}
+
+/**
+ * Detect a Postgres unique-constraint violation (code 23505) without
+ * depending on driver-specific error shapes.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === '23505';
+}
+
+/**
+ * Build a stable idempotency key for a callback event. Derived from the
+ * provider event ID and booking so retries map to the same logical payment.
+ */
+function buildIdempotencyKey(eventId: string, bookingId: string): string {
+  return `cb:${bookingId}:${eventId}`;
+}
+
+/**
+ * Build a non-acknowledged result carrying taxonomy + idempotency context.
+ */
+function failureResult(
+  status: CallbackVerificationStatus,
+  httpStatus: number,
+  message: string,
+  category: PaymentErrorCategory,
+  idempotencyKey?: string,
+  retryable = false,
+): CallbackVerificationResult {
+  return {
+    status,
+    httpStatus,
+    message,
+    errorCategory: category,
+    idempotencyKey,
+    retryable,
+  };
 }
 
 // ─── Main verifier ────────────────────────────────────────────────────────────
@@ -166,43 +229,51 @@ export async function verifyAndProcessCallback(
 
   // ── 1. Signature presence ────────────────────────────────────────────────
   if (!signatureHeader) {
-    return {
-      status: 'invalid_signature',
-      httpStatus: 401,
-      message: 'Missing signature header',
-    };
+    return failureResult(
+      'invalid_signature',
+      401,
+      'Missing signature header',
+      classifyPaymentError('invalid_signature'),
+    );
   }
 
   // ── 2. HMAC signature verification (constant time) ───────────────────────
   const expected = computeHmac(rawBody, webhookSecret);
   if (!safeCompare(signatureHeader, expected)) {
-    return {
-      status: 'invalid_signature',
-      httpStatus: 401,
-      message: 'Signature verification failed',
-    };
+    return failureResult(
+      'invalid_signature',
+      401,
+      'Signature verification failed',
+      classifyPaymentError('invalid_signature'),
+    );
   }
 
   // ── 3. Payload schema validation ─────────────────────────────────────────
   const parseResult = callbackBodySchema.safeParse(parsedBody);
   if (!parseResult.success) {
-    return {
-      status: 'invalid_payload',
-      httpStatus: 400,
-      message: 'Malformed callback payload',
-    };
+    return failureResult(
+      'invalid_payload',
+      400,
+      'Malformed callback payload',
+      classifyPaymentError('invalid_payload'),
+    );
   }
 
   const body = parseResult.data;
+  const idempotencyKey = buildIdempotencyKey(body.eventId, body.bookingId);
 
   // ── 4. Clock skew check ───────────────────────────────────────────────────
   const eventAge = Date.now() - new Date(body.timestamp).getTime();
   if (Math.abs(eventAge) > MAX_CLOCK_SKEW_MS) {
-    return {
-      status: 'invalid_timestamp',
-      httpStatus: 400,
-      message: 'Event timestamp outside acceptable window',
-    };
+    // Stale events are not retryable — the provider must emit a fresh event.
+    return failureResult(
+      'invalid_timestamp',
+      400,
+      'Event timestamp outside acceptable window',
+      classifyPaymentError('invalid_timestamp'),
+      idempotencyKey,
+      false,
+    );
   }
 
   // ── 5. Provider account identity check ───────────────────────────────────
@@ -211,11 +282,14 @@ export async function verifyAndProcessCallback(
     console.error(
       `[Callback] Provider account mismatch: got=${body.providerAccountId} expected=${expectedProviderId}`,
     );
-    return {
-      status: 'mismatch',
-      httpStatus: 422,
-      message: 'Provider account identity mismatch',
-    };
+    return failureResult(
+      'mismatch',
+      422,
+      'Provider account identity mismatch',
+      classifyPaymentError('provider_mismatch'),
+      idempotencyKey,
+      false,
+    );
   }
 
   // ── 6. Replay detection ───────────────────────────────────────────────────
@@ -226,6 +300,8 @@ export async function verifyAndProcessCallback(
       status: 'replayed',
       httpStatus: 200,
       message: 'Event already processed',
+      idempotencyKey,
+      retryable: false,
     };
   }
 
@@ -235,11 +311,14 @@ export async function verifyAndProcessCallback(
   if (!payment) {
     // Booking not found — could be a test event or mis-routed webhook
     console.warn(`[Callback] No payment found for bookingId=${body.bookingId}`);
-    return {
-      status: 'mismatch',
-      httpStatus: 422,
-      message: 'Booking not found',
-    };
+    return failureResult(
+      'mismatch',
+      422,
+      'Booking not found',
+      classifyPaymentError('booking_not_found'),
+      idempotencyKey,
+      false,
+    );
   }
 
   const incomingStroops = BigInt(body.amountStroops);
@@ -257,11 +336,14 @@ export async function verifyAndProcessCallback(
     );
     // Record in replay ledger to avoid re-processing
     await recordEvent(body.eventId, body.bookingId, eventHash);
-    return {
-      status: 'mismatch',
-      httpStatus: 422,
-      message: 'Amount mismatch — payment under review',
-    };
+    return failureResult(
+      'mismatch',
+      422,
+      'Amount mismatch — payment under review',
+      classifyPaymentError('amount_mismatch'),
+      idempotencyKey,
+      false,
+    );
   }
 
   // ── 8. Map provider status and apply transition ───────────────────────────
@@ -280,12 +362,18 @@ export async function verifyAndProcessCallback(
   if (!transitionResult.success) {
     console.error(`[Callback] Transition failed for payment=${payment.id}:`, transitionResult.error);
     // Still return 200 to the provider (we received it fine; our internal
-    // state diverged, which is a separate alert path).
-    return {
-      status: 'quarantined',
-      httpStatus: 200,
-      message: 'Event received; payment under review',
-    };
+    // state diverged, which is a separate alert path). Classify the failure
+    // so downstream recovery UX can distinguish timeout vs confirmed failure.
+    const category = classifyPaymentError(transitionResult.error);
+    return failureResult(
+      'quarantined',
+      200,
+      'Event received; payment under review',
+      category,
+      idempotencyKey,
+      // Only transient categories are safe to retry; confirmed failures are not.
+      category === 'provider_timeout' || category === 'rpc_failure',
+    );
   }
 
   const { replayed } = transitionResult.data!;
@@ -294,6 +382,8 @@ export async function verifyAndProcessCallback(
     status: replayed ? 'replayed' : 'acknowledged',
     httpStatus: 200,
     message: replayed ? 'Event already processed' : 'Event acknowledged',
+    idempotencyKey,
+    retryable: false,
   };
 }
 
@@ -306,12 +396,17 @@ export async function verifyAndProcessCallback(
 export function buildCallbackResponse(result: CallbackVerificationResult): {
   status: string;
   message: string;
+  errorCategory?: PaymentErrorCategory;
+  retryable?: boolean;
 } {
+  const acknowledged = result.status === 'acknowledged' || result.status === 'replayed';
   return {
-    status: result.status === 'acknowledged' || result.status === 'replayed'
-      ? result.status
-      : 'error',
+    status: acknowledged ? result.status : 'error',
     message: result.message,
+    // Only expose taxonomy/retry hints for non-acknowledged outcomes.
+    ...(acknowledged
+      ? {}
+      : { errorCategory: result.errorCategory, retryable: result.retryable ?? false }),
   };
 }
 

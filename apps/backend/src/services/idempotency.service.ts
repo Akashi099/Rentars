@@ -51,6 +51,47 @@ export interface IdempotencyRecord {
   created_at: string;
 }
 
+/**
+ * Lifecycle of a payment transaction tied to an idempotency key.
+ *
+ * - `pending`   — key claimed, no signed transaction yet.
+ * - `signed`    — a transaction XDR has been built and signed; it MUST NOT be
+ *                 rebuilt or re-signed on retry (would change the hash).
+ * - `submitted` — the signed XDR was handed to the provider; outcome unknown.
+ * - `confirmed` — the provider confirmed the transaction on-chain.
+ * - `failed`    — the provider returned a deterministic failure.
+ */
+export type PaymentTransactionStatus = 'pending' | 'signed' | 'submitted' | 'confirmed' | 'failed';
+
+/** Attempt metadata retained alongside the payment idempotency context. */
+export interface PaymentAttemptMetadata {
+  /** Monotonic attempt counter for this (actor, booking, key). */
+  attempt_count: number;
+  /** ISO timestamp of the most recent attempt. */
+  last_attempt_at: string;
+  /** Last error category observed, if any (see payment error taxonomy). */
+  last_error_category?: string;
+  /** Provider name used for the most recent attempt. */
+  provider?: string;
+}
+
+/** Full payment idempotency context persisted for a booking/actor pair. */
+export interface PaymentIdempotencyContext {
+  id: string;
+  key: string;
+  user_id: string;
+  booking_id: string | null;
+  request_hash: string;
+  /** SHA-256 hex digest of the signed transaction XDR envelope. */
+  signed_xdr_hash: string | null;
+  /** The signed XDR itself, retained so retries reuse the exact same envelope. */
+  signed_xdr: string | null;
+  transaction_status: PaymentTransactionStatus;
+  attempt_metadata: PaymentAttemptMetadata;
+  created_at: string;
+  updated_at: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -218,6 +259,180 @@ export async function store(
   }
 
   return { success: true, data: data as IdempotencyRecord };
+}
+
+// ─── Payment idempotency context ──────────────────────────────────────────────
+
+/**
+ * Compute the SHA-256 hex digest of a signed transaction XDR envelope.
+ *
+ * The hash is used to detect whether a retry is presenting the same signed
+ * transaction (safe to reconcile) or a different one (must be rejected).
+ */
+export function hashSignedXdr(signedXdr: string): string {
+  return createHash('sha256').update(signedXdr).digest('hex');
+}
+
+/**
+ * Persist (or refresh) the payment idempotency context for a key.
+ *
+ * The context records the signed XDR hash, transaction status and attempt
+ * metadata so that retries can reuse the same key and never resubmit a signed
+ * transaction that has already been submitted.
+ */
+export async function storePaymentContext(
+  userId: string,
+  key: string,
+  context: {
+    bookingId?: string | null;
+    requestHash: string;
+    signedXdr?: string | null;
+    transactionStatus: PaymentTransactionStatus;
+    attemptMetadata: PaymentAttemptMetadata;
+  },
+): Promise<ServiceResponse<PaymentIdempotencyContext>> {
+  const signedXdr = context.signedXdr ?? null;
+  const signedXdrHash = signedXdr ? hashSignedXdr(signedXdr) : null;
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from('idempotency_keys')
+    .upsert(
+      {
+        key,
+        user_id: userId,
+        booking_id: context.bookingId ?? null,
+        request_hash: context.requestHash,
+        signed_xdr: signedXdr,
+        signed_xdr_hash: signedXdrHash,
+        transaction_status: context.transactionStatus,
+        attempt_metadata: context.attemptMetadata,
+        updated_at: now,
+      },
+      { onConflict: 'user_id,key' },
+    )
+    .select()
+    .single();
+
+  if (error) {
+    return { success: false, error: `Payment context store failed: ${error.message}` };
+  }
+
+  return { success: true, data: data as PaymentIdempotencyContext };
+}
+
+/**
+ * Retrieve the payment idempotency context for `(userId, key)`.
+ *
+ * @returns The context, `null` when none exists, or an error message.
+ */
+export async function getPaymentContext(
+  userId: string,
+  key: string,
+): Promise<ServiceResponse<PaymentIdempotencyContext | null>> {
+  const { data, error } = await supabase
+    .from('idempotency_keys')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('key', key)
+    .maybeSingle();
+
+  if (error) {
+    return { success: false, error: `Payment context lookup failed: ${error.message}` };
+  }
+
+  return { success: true, data: (data as PaymentIdempotencyContext | null) ?? null };
+}
+
+/**
+ * Query payment idempotency contexts by booking and/or actor.
+ *
+ * At least one of `bookingId` or `userId` must be supplied.  Results are
+ * ordered newest-first so callers can inspect the latest attempt.
+ */
+export async function queryPaymentContexts(filter: {
+  bookingId?: string;
+  userId?: string;
+  limit?: number;
+}): Promise<ServiceResponse<PaymentIdempotencyContext[]>> {
+  if (!filter.bookingId && !filter.userId) {
+    return { success: false, error: 'queryPaymentContexts requires bookingId or userId' };
+  }
+
+  let query = supabase
+    .from('idempotency_keys')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(filter.limit ?? 50);
+
+  if (filter.bookingId) query = query.eq('booking_id', filter.bookingId);
+  if (filter.userId) query = query.eq('user_id', filter.userId);
+
+  const { data, error } = await query;
+
+  if (error) {
+    return { success: false, error: `Payment context query failed: ${error.message}` };
+  }
+
+  return { success: true, data: (data ?? []) as PaymentIdempotencyContext[] };
+}
+
+/**
+ * Mark a signed transaction as submitted.
+ *
+ * This is the guard that prevents resubmission of a signed transaction: once
+ * a record is in `submitted`, `confirmed` or `failed`, callers must reconcile
+ * rather than re-submit.  The signed XDR hash is verified against the stored
+ * value so a mismatched envelope is rejected.
+ *
+ * @returns The updated context, or an error when the transition is unsafe.
+ */
+export async function markSignedTransactionSubmitted(
+  userId: string,
+  key: string,
+  signedXdr: string,
+): Promise<ServiceResponse<PaymentIdempotencyContext>> {
+  const lookupResult = await getPaymentContext(userId, key);
+  if (!lookupResult.success) return lookupResult;
+  if (!lookupResult.data) {
+    return { success: false, error: 'Payment context not found for key' };
+  }
+
+  const existing = lookupResult.data;
+  const incomingHash = hashSignedXdr(signedXdr);
+
+  if (existing.signed_xdr_hash && existing.signed_xdr_hash !== incomingHash) {
+    return {
+      success: false,
+      error: 'Signed transaction hash mismatch: refusing to resubmit a different envelope',
+    };
+  }
+
+  if (existing.transaction_status === 'submitted' || existing.transaction_status === 'confirmed') {
+    return {
+      success: false,
+      error: `Transaction already ${existing.transaction_status}: reconcile instead of resubmitting`,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from('idempotency_keys')
+    .update({
+      signed_xdr: existing.signed_xdr ?? signedXdr,
+      signed_xdr_hash: existing.signed_xdr_hash ?? incomingHash,
+      transaction_status: 'submitted',
+      updated_at: now,
+    })
+    .eq('id', existing.id)
+    .select()
+    .single();
+
+  if (error) {
+    return { success: false, error: `Mark submitted failed: ${error.message}` };
+  }
+
+  return { success: true, data: data as PaymentIdempotencyContext };
 }
 
 /**

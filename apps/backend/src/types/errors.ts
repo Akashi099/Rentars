@@ -21,7 +21,19 @@
 
 // ─── Re-exports ────────────────────────────────────────────────────────────
 import { BookingError } from '../errors/booking.errors.js';
+import { PaymentError } from '../errors/payment.errors.js';
 export { BookingError } from '../errors/booking.errors.js';
+export {
+  PaymentErrorCategory,
+  PaymentNextAction,
+  PaymentTransactionStatus,
+  PaymentIdempotencyContext,
+  mapToPaymentError,
+  sanitizePaymentMessage,
+  getAllowedPaymentActions,
+  isResubmissionSafe,
+} from '../errors/payment.errors.js';
+export { PaymentError } from '../errors/payment.errors.js';
 
 // ─── Escrow ─────────────────────────────────────────────────────────────────
 
@@ -131,7 +143,13 @@ export class ValidationError extends Error {
   }
 }
 
-export type DomainError = BookingError | EscrowError | PropertyError | AuthError | ValidationError;
+export type DomainError =
+  | BookingError
+  | EscrowError
+  | PropertyError
+  | AuthError
+  | ValidationError
+  | PaymentError;
 
 export function isDomainError(error: unknown): error is DomainError {
   return (
@@ -139,6 +157,7 @@ export function isDomainError(error: unknown): error is DomainError {
     error instanceof EscrowError ||
     error instanceof PropertyError ||
     error instanceof AuthError ||
-    error instanceof ValidationError
+    error instanceof ValidationError ||
+    error instanceof PaymentError
   );
 }

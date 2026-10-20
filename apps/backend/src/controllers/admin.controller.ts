@@ -629,6 +629,408 @@ export async function getAuditLogsHandler(req: AdminRequest, res: Response): Pro
   res.json({ data: result.data, meta: { limit } });
 }
 
+// ─── Reconciliation operations ───────────────────────────────────────────────
+
+/**
+ * Fields exposed for reconciliation records.  Secret payloads (provider
+ * credentials, raw webhook bodies, card data) and unnecessary personal
+ * information are deliberately excluded from this projection.
+ */
+const RECONCILIATION_SAFE_FIELDS =
+  'id, status, mismatch_type, booking_id, transaction_reference, provider, ' +
+  'provider_reference, amount, currency, age_hours, created_at, updated_at, ' +
+  'last_retry_at, retry_count, escalated_at, resolved_at, resolution_note';
+
+const RECONCILIATION_STATUSES = [
+  'open',
+  'investigating',
+  'retrying',
+  'escalated',
+  'resolved',
+  'ignored',
+] as const;
+
+const reconciliationListSchema = z.object({
+  status: z.enum(RECONCILIATION_STATUSES).optional(),
+  /** Only return records at least this many hours old. */
+  min_age_hours: z.coerce.number().int().min(0).max(24 * 365).optional(),
+  /** Only return records at most this many hours old. */
+  max_age_hours: z.coerce.number().int().min(0).max(24 * 365).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+/**
+ * GET /api/v1/admin/reconciliation
+ *
+ * Paginated, filtered listing of reconciliation records.  Records are scoped
+ * by status and age; secret payloads and unnecessary personal information are
+ * never returned.
+ *
+ * Scope required: admin:reconciliation:read
+ */
+export async function listReconciliationRecords(req: AdminRequest, res: Response): Promise<void> {
+  const parsed = reconciliationListSchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { status, min_age_hours, max_age_hours, page, limit } = parsed.data;
+
+  if (
+    min_age_hours !== undefined &&
+    max_age_hours !== undefined &&
+    max_age_hours < min_age_hours
+  ) {
+    res.status(400).json({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'max_age_hours must be greater than or equal to min_age_hours',
+      },
+    });
+    return;
+  }
+
+  const offset = (page - 1) * limit;
+
+  let query = supabase
+    .from('reconciliation_records')
+    .select(RECONCILIATION_SAFE_FIELDS, { count: 'exact' })
+    .order('created_at', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (status) {
+    query = query.eq('status', status);
+  }
+  if (min_age_hours !== undefined) {
+    query = query.gte('age_hours', min_age_hours);
+  }
+  if (max_age_hours !== undefined) {
+    query = query.lte('age_hours', max_age_hours);
+  }
+
+  const { data, error, count } = await query;
+
+  if (error) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
+    return;
+  }
+
+  res.json({
+    data: data ?? [],
+    meta: {
+      page,
+      limit,
+      total: count ?? 0,
+      filters: {
+        status: status ?? null,
+        min_age_hours: min_age_hours ?? null,
+        max_age_hours: max_age_hours ?? null,
+      },
+    },
+  });
+}
+
+/**
+ * GET /api/v1/admin/reconciliation/:id
+ *
+ * Returns a single sanitized reconciliation record together with links to the
+ * related audit entries so operators can understand the full history.
+ *
+ * Scope required: admin:reconciliation:read
+ */
+export async function getReconciliationRecord(req: AdminRequest, res: Response): Promise<void> {
+  const { id } = req.params;
+
+  if (!z.string().uuid().safeParse(id).success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: { id: ['id must be a valid UUID'] } },
+    });
+    return;
+  }
+
+  const { data: record, error } = await supabase
+    .from('reconciliation_records')
+    .select(RECONCILIATION_SAFE_FIELDS)
+    .eq('id', id)
+    .single();
+
+  if (error || !record) {
+    res.status(404).json({
+      error: { code: 'RECONCILIATION_NOT_FOUND', message: 'Reconciliation record not found.' },
+    });
+    return;
+  }
+
+  const auditResult = await listAuditLogs({
+    targetType: 'reconciliation',
+    targetId: id,
+    limit: 50,
+  });
+
+  res.json({
+    data: {
+      record,
+      // Links only — full audit entries are fetched via /admin/audit-logs
+      audit_links: (auditResult.success ? auditResult.data : []).map((entry) => ({
+        id: (entry as { id: string }).id,
+        action: (entry as { action: string }).action,
+        timestamp: (entry as { timestamp: string }).timestamp,
+        href: `/api/v1/admin/audit-logs?targetType=reconciliation&targetId=${id}`,
+      })),
+      transaction_reference: (record as { transaction_reference: string | null })
+        .transaction_reference,
+    },
+  });
+}
+
+const reconciliationActionSchema = z.object({
+  reason: z.string().min(10, 'reason must be at least 10 characters').max(2000),
+  /** Client-supplied idempotency key; repeated calls with the same key are no-ops. */
+  idempotency_key: z.string().min(8).max(128),
+});
+
+type ReconciliationAction = 'retry' | 'escalate' | 'resolve';
+
+/**
+ * Applies a manual reconciliation action idempotently and writes an audit entry.
+ *
+ * Idempotency: the (record id, action, idempotency_key) tuple is recorded in
+ * `reconciliation_actions`.  If the same key was already processed for this
+ * record and action, the stored result is returned without side effects.
+ */
+async function applyReconciliationAction(
+  req: AdminRequest,
+  res: Response,
+  action: ReconciliationAction,
+): Promise<void> {
+  const { id } = req.params;
+
+  if (!z.string().uuid().safeParse(id).success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: { id: ['id must be a valid UUID'] } },
+    });
+    return;
+  }
+
+  const parsed = reconciliationActionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason, idempotency_key } = parsed.data;
+
+  // Idempotency check — return the previously recorded outcome if present.
+  const { data: existing, error: existingError } = await supabase
+    .from('reconciliation_actions')
+    .select('id, action, result_status, created_at')
+    .eq('reconciliation_id', id)
+    .eq('action', action)
+    .eq('idempotency_key', idempotency_key)
+    .maybeSingle();
+
+  if (existingError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: existingError.message } });
+    return;
+  }
+
+  if (existing) {
+    res.json({
+      message: 'Action already applied (idempotent replay).',
+      data: existing,
+      meta: { idempotent_replay: true },
+    });
+    return;
+  }
+
+  const { data: record, error: fetchError } = await supabase
+    .from('reconciliation_records')
+    .select('id, status, retry_count')
+    .eq('id', id)
+    .single();
+
+  if (fetchError || !record) {
+    res.status(404).json({
+      error: { code: 'RECONCILIATION_NOT_FOUND', message: 'Reconciliation record not found.' },
+    });
+    return;
+  }
+
+  const currentStatus = (record as { status: string }).status;
+  if (currentStatus === 'resolved' && action !== 'resolve') {
+    res.status(409).json({
+      error: {
+        code: 'ALREADY_RESOLVED',
+        message: 'Record is already resolved; no further action is required.',
+      },
+    });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const update: Record<string, unknown> = { updated_at: now };
+
+  if (action === 'retry') {
+    update.status = 'retrying';
+    update.last_retry_at = now;
+    update.retry_count = ((record as { retry_count: number | null }).retry_count ?? 0) + 1;
+  } else if (action === 'escalate') {
+    update.status = 'escalated';
+    update.escalated_at = now;
+  } else {
+    update.status = 'resolved';
+    update.resolved_at = now;
+    update.resolution_note = reason;
+  }
+
+  const { error: updateError } = await supabase
+    .from('reconciliation_records')
+    .update(update)
+    .eq('id', id);
+
+  if (updateError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: updateError.message } });
+    return;
+  }
+
+  const { data: actionRow, error: actionError } = await supabase
+    .from('reconciliation_actions')
+    .insert({
+      reconciliation_id: id,
+      action,
+      reason,
+      idempotency_key,
+      actor_id: req.adminId,
+      result_status: update.status,
+    })
+    .select('id, action, result_status, created_at')
+    .single();
+
+  if (actionError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: actionError.message } });
+    return;
+  }
+
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: `admin.reconciliation_${action}`,
+    resourceType: 'reconciliation',
+    resourceId: id,
+    ip: req.ip,
+    meta: { reason, idempotency_key, result_status: update.status },
+  });
+
+  res.json({
+    message: `Reconciliation action '${action}' applied.`,
+    data: actionRow,
+    meta: { idempotent_replay: false },
+  });
+}
+
+/**
+ * POST /api/v1/admin/reconciliation/:id/retry
+ * Safe retry of a reconciliation record.  Requires a reason; idempotent.
+ * Scope required: admin:reconciliation:write
+ */
+export async function retryReconciliation(req: AdminRequest, res: Response): Promise<void> {
+  await applyReconciliationAction(req, res, 'retry');
+}
+
+/**
+ * POST /api/v1/admin/reconciliation/:id/escalate
+ * Escalate a reconciliation record.  Requires a reason; idempotent.
+ * Scope required: admin:reconciliation:write
+ */
+export async function escalateReconciliation(req: AdminRequest, res: Response): Promise<void> {
+  await applyReconciliationAction(req, res, 'escalate');
+}
+
+/**
+ * POST /api/v1/admin/reconciliation/:id/resolve
+ * Resolve a reconciliation record.  Requires a reason; idempotent.
+ * Scope required: admin:reconciliation:write
+ */
+export async function resolveReconciliation(req: AdminRequest, res: Response): Promise<void> {
+  await applyReconciliationAction(req, res, 'resolve');
+}
+
+// ─── Provider circuit breakers ───────────────────────────────────────────────
+
+import { circuitBreakerRegistry } from '@/services/circuitBreaker.service.js';
+
+/**
+ * GET /api/v1/admin/circuit-breakers
+ *
+ * Inspect the current state of all provider circuit breakers.
+ * Scope required: admin:circuit_breakers:read
+ */
+export async function listCircuitBreakers(req: AdminRequest, res: Response): Promise<void> {
+  const states = circuitBreakerRegistry.snapshot();
+  res.json({
+    data: states,
+    meta: {
+      open_count: states.filter((s) => s.state === 'open').length,
+      half_open_count: states.filter((s) => s.state === 'half_open').length,
+    },
+  });
+}
+
+const resetCircuitBreakerSchema = z.object({
+  reason: z.string().min(10, 'reason must be at least 10 characters').max(2000),
+});
+
+/**
+ * POST /api/v1/admin/circuit-breakers/:provider/reset
+ *
+ * Manually reset a provider circuit breaker.  Restricted to admins and
+ * audited with the operator-supplied reason.
+ * Scope required: admin:circuit_breakers:reset
+ */
+export async function resetCircuitBreaker(req: AdminRequest, res: Response): Promise<void> {
+  const { provider } = req.params;
+
+  const parsed = resetCircuitBreakerSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason } = parsed.data;
+
+  const previous = circuitBreakerRegistry.get(provider);
+  if (!previous) {
+    res.status(404).json({
+      error: { code: 'CIRCUIT_NOT_FOUND', message: `No circuit breaker registered for '${provider}'.` },
+    });
+    return;
+  }
+
+  circuitBreakerRegistry.reset(provider);
+
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: 'admin.circuit_breaker_reset',
+    resourceType: 'circuit_breaker',
+    resourceId: provider,
+    ip: req.ip,
+    meta: { reason, previous_state: previous.state },
+  });
+
+  res.json({
+    message: `Circuit breaker for '${provider}' reset.`,
+    data: circuitBreakerRegistry.get(provider),
+    meta: { previous_state: previous.state },
+  });
+}
+
 // ─── Refund approval ─────────────────────────────────────────────────────────
 
 const approveRefundSchema = z.object({
