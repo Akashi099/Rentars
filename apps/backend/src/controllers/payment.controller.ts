@@ -16,11 +16,15 @@ import {
   confirmTransaction,
   retryTransaction,
 } from '@/services/stellar.service.js';
+import { isNetworkMatch } from '@/controllers/network.controller.js';
 
 const submitSchema = z.object({
   bookingId: z.string().uuid('bookingId must be a valid UUID'),
   signedXdr: z.string().min(1, 'signedXdr is required'),
   amountUsdc: z.number().positive('amountUsdc must be positive'),
+  /** Client MUST include the network it signed on so the backend can reject
+   *  cross-network submissions before broadcast. */
+  network: z.enum(['testnet', 'mainnet']).optional(),
   metadata: z.record(z.unknown()).optional(),
 });
 
@@ -44,8 +48,21 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     return;
   }
 
-  const { bookingId, signedXdr, amountUsdc, metadata } = parsed.data;
+  const { bookingId, signedXdr, amountUsdc, network, metadata } = parsed.data;
   const tenantId = req.userId!;
+
+  // Reject cross-network submissions before touching any blockchain resource.
+  // The `network` field is optional for backwards compatibility, but when
+  // provided it MUST match the backend's configured network.
+  if (network !== undefined && !isNetworkMatch(network)) {
+    res.status(409).json({
+      error: {
+        code: 'NETWORK_MISMATCH',
+        message: `Transaction was signed on '${network}' but the server is configured for '${process.env.STELLAR_NETWORK ?? 'testnet'}'. Switch your wallet to the correct network and try again.`,
+      },
+    });
+    return;
+  }
 
   // 1. Create payment intent in 'pending' state
   const payment = await createPaymentIntent({ bookingId, tenantId, amountUsdc, metadata });
