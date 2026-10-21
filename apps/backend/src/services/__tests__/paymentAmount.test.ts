@@ -10,7 +10,11 @@
  *  - buildAmountBreakdown() output shape
  */
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { Account, Asset, Keypair, Networks, Operation, TransactionBuilder } from '@stellar/stellar-sdk';
+import { validateSignedPaymentTransaction } from '@/services/stellar.service.js';
+
+afterEach(() => vi.unstubAllEnvs());
 import {
   usdcToStroops,
   stroopsToUsdc,
@@ -82,6 +86,12 @@ describe('stroopsToUsdc', () => {
   it('converts large amount without overflow', () => {
     const result = stroopsToUsdc(1_000_000n * STROOPS_PER_USDC);
     expect(result).toBe('1000000.00');
+  });
+
+  it('preserves sub-cent precision in display strings', () => {
+    expect(stroopsToUsdc(1n)).toBe('0.0000001');
+    expect(stroopsToUsdc(1_000n)).toBe('0.0001');
+    expect(stroopsToUsdc(9_999_999n)).toBe('0.9999999');
   });
 });
 
@@ -213,6 +223,52 @@ describe('buildAmountBreakdown', () => {
     expect(breakdown).toHaveProperty('amountStroops');
     expect(breakdown).toHaveProperty('amountDisplay');
     expect(breakdown).toHaveProperty('currency');
+  });
+
+  describe('validateSignedPaymentTransaction', () => {
+    const issuer = Keypair.random().publicKey();
+
+    function buildXdr(amount: string, assetIssuer = issuer): string {
+      const source = Keypair.random().publicKey();
+      const destination = Keypair.random().publicKey();
+      return new TransactionBuilder(new Account(source, '1'), {
+        fee: '100',
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(Operation.payment({
+          destination,
+          asset: new Asset('USDC', assetIssuer),
+          amount,
+        }))
+        .setTimeout(30)
+        .build()
+        .toXDR();
+    }
+
+    it('accepts a USDC payment whose signed operation matches the quote', () => {
+      vi.stubEnv('STELLAR_NETWORK', 'testnet');
+      vi.stubEnv('STELLAR_USDC_ISSUER', issuer);
+
+      expect(() => validateSignedPaymentTransaction(buildXdr('12.34'), 123_400_000n)).not.toThrow();
+    });
+
+    it('rejects an operation with a different amount', () => {
+      vi.stubEnv('STELLAR_NETWORK', 'testnet');
+      vi.stubEnv('STELLAR_USDC_ISSUER', issuer);
+
+      expect(() => validateSignedPaymentTransaction(buildXdr('12.33'), 123_400_000n))
+        .toThrow('Payment transaction amount does not match the signed quote');
+    });
+
+    it('rejects a USDC-like asset from an unconfigured issuer', () => {
+      vi.stubEnv('STELLAR_NETWORK', 'testnet');
+      vi.stubEnv('STELLAR_USDC_ISSUER', issuer);
+
+      expect(() => validateSignedPaymentTransaction(
+        buildXdr('12.34', Keypair.random().publicKey()),
+        123_400_000n,
+      )).toThrow('Payment transaction asset does not match configured USDC');
+    });
   });
 
   it('amountStroops is a string (BigInt serialisation)', () => {

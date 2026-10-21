@@ -393,6 +393,7 @@ export async function getPropertyQuote(
   propertyId: string,
   start: string,
   end: string,
+  guestCount?: number,
 ): Promise<ServiceResponse<PriceQuote>> {
   // Validate dates
   const checkInDate = new Date(start);
@@ -409,7 +410,7 @@ export async function getPropertyQuote(
   // Fetch property details
   const { data: property, error: propError } = await supabase
     .from('properties')
-    .select('base_price_per_night, updated_at, status, draft_status, deleted_at, moderation_state')
+    .select('base_price_per_night, updated_at, status, draft_status, deleted_at, moderation_state, max_guests')
     .eq('id', propertyId)
     .single();
 
@@ -425,6 +426,7 @@ export async function getPropertyQuote(
     draft_status: string | null;
     deleted_at: string | null;
     moderation_state: string | null;
+    max_guests: number | null;
   };
   if (
     listing.deleted_at ||
@@ -433,6 +435,20 @@ export async function getPropertyQuote(
     listing.moderation_state === 'hidden'
   ) {
     return { success: false, error: 'Property not found' };
+  }
+
+  // Enforce occupancy limit at quote time so the token binds an eligible guest count.
+  if (
+    guestCount !== undefined &&
+    listing.max_guests !== null &&
+    listing.max_guests !== undefined &&
+    guestCount > listing.max_guests
+  ) {
+    return {
+      success: false,
+      error: `Guest count (${guestCount}) exceeds property capacity (${listing.max_guests})`,
+      statusCode: 400,
+    };
   }
 
   const baseRate = listing.base_price_per_night;
@@ -495,14 +511,15 @@ export async function getPropertyQuote(
   const quoteVersion = Buffer.from(`${propertyId}:${propertyUpdatedAt}`).toString('base64');
   const expiresAt = new Date(Date.now() + QUOTE_TTL_MS).toISOString();
 
-  // Bind the total to its exact inputs so booking can verify it has not drifted.
+  // Bind the total to its exact inputs (including occupancy) so booking can verify nothing drifted.
   const quoteToken = signQuoteToken({
     pid: propertyId,
-    ci: checkInDate.toISOString(),
-    co: checkOutDate.toISOString(),
+    ci:  checkInDate.toISOString(),
+    co:  checkOutDate.toISOString(),
     tot: total,
     ver: propertyUpdatedAt,
     exp: expiresAt,
+    ...(guestCount !== undefined ? { gc: guestCount } : {}),
   });
 
   return {
@@ -537,6 +554,8 @@ export interface QuotedTotalInput {
   quoteToken?: string;
   /** Clock override for tests. Defaults to now. */
   now?: number;
+  /** Guest count the booking will use; checked against token gc when a token is supplied. */
+  guestCount?: number;
 }
 
 /**
@@ -613,6 +632,20 @@ export async function assertQuotedTotal(
         conflict: true,
         code: 'PRICE_CHANGED',
         details: { quote },
+      };
+    }
+
+    // Guest count must match what the token was issued for.
+    if (
+      input.guestCount !== undefined &&
+      claims.gc !== undefined &&
+      claims.gc !== input.guestCount
+    ) {
+      return {
+        success: false,
+        error: 'Quote was issued for a different guest count; request a new quote',
+        statusCode: 400,
+        code: 'QUOTE_MISMATCH',
       };
     }
   }

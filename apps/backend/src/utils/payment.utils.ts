@@ -32,8 +32,8 @@ export const STROOPS_PER_USDC = 10_000_000n;
 /** Maximum accepted USDC amount per payment: 1_000_000 USDC. */
 export const MAX_USDC_AMOUNT = 1_000_000n * STROOPS_PER_USDC;
 
-/** Minimum accepted USDC amount: 0.01 USDC. */
-export const MIN_USDC_AMOUNT = 1_000n; // 0.0001 USDC actually; practical min
+/** Minimum accepted USDC amount: 0.0001 USDC. */
+export const MIN_USDC_AMOUNT = 1_000n;
 
 /** Supported currency tokens. Add new tokens here when expanding. */
 export const SUPPORTED_CURRENCIES = ['USDC'] as const;
@@ -103,7 +103,8 @@ export function usdcToStroops(usdc: string): bigint {
 }
 
 /**
- * Convert stroops (BigInt) to a human-readable USDC string with 2 decimal places.
+ * Convert stroops (BigInt) to a human-readable USDC string without losing
+ * precision. Values with fewer than two fractional digits keep two for display.
  *
  * @example
  *   stroopsToUsdc(15_000_000n)  // '1.50'
@@ -113,12 +114,8 @@ export function stroopsToUsdc(stroops: bigint): string {
   const intPart = stroops / STROOPS_PER_USDC;
   const fracPart = stroops % STROOPS_PER_USDC;
 
-  // Show 2 decimal places (USDC display convention)
-  const fracStr = fracPart.toString().padStart(7, '0').slice(0, 2);
-  const roundedFrac = Math.round(Number(fracPart) / 100_000)
-    .toString()
-    .padStart(2, '0');
-  return `${intPart}.${roundedFrac}`;
+  const exactFraction = fracPart.toString().padStart(7, '0').replace(/0+$/, '');
+  return `${intPart}.${exactFraction.padEnd(2, '0')}`;
 }
 
 /**

@@ -227,16 +227,26 @@ export async function previewPropertyPricing(req: Request, res: Response): Promi
 
 export async function getPropertyQuoteHandler(req: Request, res: Response): Promise<void> {
   const { id: propertyId } = req.params;
-  const { start, end } = req.query;
+  const { start, end, guests } = req.query;
 
   if (!start || !end) {
     res.status(400).json({ error: 'start and end query params are required' });
     return;
   }
 
-  const result = await getPropertyQuote(propertyId, start as string, end as string);
+  let guestCount: number | undefined;
+  if (guests !== undefined) {
+    const parsed = Number(guests);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      res.status(400).json({ error: 'guests must be a positive integer' });
+      return;
+    }
+    guestCount = parsed;
+  }
+
+  const result = await getPropertyQuote(propertyId, start as string, end as string, guestCount);
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({ error: result.error });
     return;
   }
   res.json(result.data);

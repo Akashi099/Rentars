@@ -12,7 +12,7 @@ import type { ServiceResponse } from './index.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PLATFORM_FEE_RATE = 0.1; // 10 %
+const PLATFORM_FEE_RATE = 0.05; // 5 % — must match PLATFORM_FEE_PCT in pricing.service.ts
 const EXPLORER_BASE = 'https://stellar.expert/explorer/public/tx';
 
 // Layout (points, y measured from top of A4)
@@ -57,6 +57,8 @@ export interface ReceiptData {
   displayAmount?:   number | null; // converted amount at booking time
   rateTimestampMs?: number;        // Unix ms when rate was fetched
   rateStale?:       boolean;       // whether the rate was stale at booking time
+  /** Stellar transaction hash from the settled payment — audit reference. */
+  txHash?:          string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -116,13 +118,26 @@ export async function fetchReceiptData(
     properties: { title: string; address?: string; city?: string; country?: string; price_per_night?: number } | null;
   };
 
-  const prop         = b.properties;
+  const prop          = b.properties;
   const pricePerNight = prop?.price_per_night ?? 0;
-  const nights       = calcNights(b.check_in, b.check_out);
-  const subtotal     = pricePerNight * nights;
-  const platformFee  = Math.round(subtotal * PLATFORM_FEE_RATE * 100) / 100;
-  const total        = b.total_price ?? subtotal + platformFee;
+  const nights        = calcNights(b.check_in, b.check_out);
+  // Use the booking's settled total as the canonical amount (immutable ledger record).
+  // Derive the breakdown from that total so line items reconcile with what was charged.
+  const total        = b.total_price;
+  const platformFee  = Math.round(total * PLATFORM_FEE_RATE / (1 + PLATFORM_FEE_RATE) * 100) / 100;
+  const subtotal     = Math.round((total - platformFee) * 100) / 100;
   const address      = [prop?.address, prop?.city, prop?.country].filter(Boolean).join(', ');
+
+  // Fetch the settled payment's Stellar transaction hash as an audit reference.
+  let txHash: string | undefined;
+  const { data: paymentRow } = await supabase
+    .from('payments')
+    .select('stellar_tx_hash')
+    .eq('booking_id', b.id)
+    .maybeSingle();
+  if (paymentRow) {
+    txHash = (paymentRow as { stellar_tx_hash?: string | null }).stellar_tx_hash ?? undefined;
+  }
 
   // Fetch tenant display name and email for participant details on the receipt
   let tenantName:  string | undefined;
@@ -163,6 +178,7 @@ export async function fetchReceiptData(
       tenantEmail,
       escrowId:    b.escrow_id,
       onChainId:   b.on_chain_id,
+      txHash,
       createdAt:   b.created_at,
       displayCurrency: bookingRow.display_currency ?? undefined,
       displayAmount:   bookingRow.display_amount   ?? null,
@@ -303,7 +319,7 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
   }
 
   // ── Blockchain reference ─────────────────────────────────────────────────
-  if (data.escrowId || data.onChainId !== undefined) {
+  if (data.escrowId || data.onChainId !== undefined || data.txHash) {
     pdf.hline(ML, PdfBuilder.PAGE_HEIGHT - y, W, LINE);
     y += 14;
     pdf.text('Blockchain Reference', ML, y, { size: 11, bold: true, colour: DARK });
@@ -312,6 +328,12 @@ export function generateReceiptPdf(data: ReceiptData): Buffer {
     if (data.escrowId) {
       pdf.text('Escrow ID',    ML, y,      { size: 7, colour: MUTED });
       pdf.text(data.escrowId, ML, y + 10,  { size: 8, colour: DARK });
+      y += 26;
+    }
+
+    if (data.txHash) {
+      pdf.text('Settlement Tx Hash', ML, y,      { size: 7, colour: MUTED });
+      pdf.text(data.txHash,          ML, y + 10, { size: 8, colour: DARK });
       y += 26;
     }
 

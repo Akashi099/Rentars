@@ -25,6 +25,8 @@ export interface QuoteTokenClaims {
   ver: string;
   /** Expiry instant (ISO 8601). */
   exp: string;
+  /** Guest count the quote was issued for; absent on tokens issued without occupancy. */
+  gc?: number;
 }
 
 function sign(body: string, secret: string): string {

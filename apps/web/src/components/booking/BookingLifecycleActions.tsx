@@ -13,6 +13,16 @@ interface Props {
   onBookingUpdated: (updated: Booking) => void;
 }
 
+interface RefundPreview {
+  tier: 'full' | 'partial' | 'none';
+  refundPct: number;
+  refundAmount: number;
+  totalPrice: number;
+  hoursUntilCheckIn: number;
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+
 /**
  * Renders the set of lifecycle action buttons appropriate for the current
  * booking state.  Only buttons valid in the current state are shown.
@@ -27,6 +37,9 @@ interface Props {
 export default function BookingLifecycleActions({ booking, onBookingUpdated }: Props) {
   const [isDisputeModalOpen, setIsDisputeModalOpen] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [refundPreview, setRefundPreview] = useState<RefundPreview | null>(null);
+  const [refundPreviewLoading, setRefundPreviewLoading] = useState(false);
+  const [refundPreviewError, setRefundPreviewError] = useState<string | null>(null);
 
   const status      = normaliseStatus(booking.status);
   const transitions = TENANT_TRANSITIONS[status] ?? [];
@@ -38,9 +51,43 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
       setShowCancelConfirm(false);
     });
 
-  if (transitions.length === 0) return null;
-
   const isLoading = pendingAction !== null;
+
+  // Fetch refund preview from the booking-time policy snapshot when the
+  // cancel confirmation dialog is shown (#769).
+  useEffect(() => {
+    if (!showCancelConfirm) {
+      setRefundPreview(null);
+      setRefundPreviewError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setRefundPreviewLoading(true);
+    setRefundPreviewError(null);
+
+    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+    fetch(`${API_BASE}/api/v1/bookings/${booking.id}/refund-preview`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error('Failed to fetch refund preview')))
+      .then((data: RefundPreview) => {
+        if (!cancelled) setRefundPreview(data);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setRefundPreview(null);
+          setRefundPreviewError(error instanceof Error ? error.message : 'Refund calculation is unavailable');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRefundPreviewLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [showCancelConfirm, booking.id]);
+
+  if (transitions.length === 0) return null;
 
   const handleDispute = async () => {
     if (!disputeReason.trim()) return;
@@ -142,13 +189,57 @@ export default function BookingLifecycleActions({ booking, onBookingUpdated }: P
           <p className="text-sm text-gray-800 dark:text-gray-200 font-medium">
             Are you sure you want to cancel this booking?
           </p>
-          <p className="text-xs text-gray-600 dark:text-gray-400">
-            Cancellation will trigger an escrow refund. This action cannot be undone.
-          </p>
+
+          {/* Refund preview from booking-time policy snapshot (#769) */}
+          {refundPreviewLoading && (
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+              Calculating refund…
+            </div>
+          )}
+          {!refundPreviewLoading && refundPreview && (
+            <div className="p-3 rounded-lg bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-600 dark:text-gray-400">Refund tier</span>
+                <span className={`text-xs font-medium capitalize ${
+                  refundPreview.tier === 'full' ? 'text-green-600'
+                  : refundPreview.tier === 'partial' ? 'text-amber-600'
+                  : 'text-red-600'
+                }`}>
+                  {refundPreview.tier} ({Math.round(refundPreview.refundPct * 100)}%)
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-600 dark:text-gray-400">Refund amount</span>
+                <span className="text-xs font-semibold text-gray-900 dark:text-gray-100">
+                  {refundPreview.refundAmount.toFixed(2)} USDC
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-600 dark:text-gray-400">Total price</span>
+                <span className="text-xs text-gray-700 dark:text-gray-300">
+                  {refundPreview.totalPrice.toFixed(2)} USDC
+                </span>
+              </div>
+              {refundPreview.hoursUntilCheckIn > 0 && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600 dark:text-gray-400">Hours until check-in</span>
+                  <span className="text-xs text-gray-700 dark:text-gray-300">
+                    {Math.round(refundPreview.hoursUntilCheckIn)}h
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+          {!refundPreviewLoading && refundPreviewError && (
+            <p role="alert" className="text-xs text-red-700 dark:text-red-300">
+              {refundPreviewError}. Refresh the preview before cancelling.
+            </p>
+          )}
           <div className="flex gap-2">
             <button
               type="button"
-              disabled={isLoading}
+              disabled={isLoading || refundPreviewLoading || !refundPreview || !!refundPreviewError}
               onClick={() => cancel()}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-red-600 text-white
                 text-sm font-medium hover:bg-red-700 disabled:opacity-50 transition

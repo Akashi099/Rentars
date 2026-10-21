@@ -164,12 +164,20 @@ export default function BookingConfirmationPage({
         </div>
       </div>
 
-      {escrow && (
+      {booking.status.toLowerCase() === 'escrow_reconcile_failed' ? (
+        <EscrowStatusCard status="manual_review" amount={booking.total_price} />
+      ) : escrow ? (
         <EscrowStatusCard
           status={escrow.status}
           amount={escrow.amount}
           releaseDate={escrow.releaseDate}
         />
+      ) : null}
+
+      {booking.status.toLowerCase() === 'escrow_reconcile_failed' && (
+        <div role="alert" className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+          Escrow verification failed. Do not retry payment; funds may still be locked. Our operations team has been notified.
+        </div>
       )}
 
       <div className="bg-white dark:bg-gray-900 rounded-lg shadow-md p-6">
