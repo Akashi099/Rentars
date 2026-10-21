@@ -1,10 +1,14 @@
 import { isConnected, getAddress, signTransaction, getNetwork } from '@stellar/freighter-api';
+import { validateNetworkConsistency } from '@/lib/network-utils';
 
 export interface WalletState {
   isConnected: boolean;
   address: string | null;
   network: 'testnet' | 'mainnet';
   networkMismatch: boolean;
+  /** True once wallet, frontend env, and backend have all been confirmed to
+   *  agree on the same network.  Remains false until the three-way check runs. */
+  networkValidated: boolean;
   isLoading: boolean;
   error: string | null;
 }
@@ -197,7 +201,10 @@ export function isValidStellarAddress(address: string): boolean {
  * Connect to Freighter wallet
  * @throws FreighterError if wallet is not installed or connection fails
  */
-export async function connectFreighterWallet(expectedNetwork?: 'testnet' | 'mainnet'): Promise<string> {
+export async function connectFreighterWallet(
+  expectedNetwork?: 'testnet' | 'mainnet',
+  apiUrl?: string,
+): Promise<string> {
   const installed = await isFreighterInstalled();
   if (!installed) {
     throw new FreighterError(
@@ -222,13 +229,24 @@ export async function connectFreighterWallet(expectedNetwork?: 'testnet' | 'main
     }
   }
 
+  // Three-way check: also verify the backend agrees on the same network.
+  if (expectedNetwork && apiUrl) {
+    const mismatchReason = await validateNetworkConsistency(expectedNetwork, apiUrl);
+    if (mismatchReason) {
+      throw new FreighterError(mismatchReason, 'NETWORK_MISMATCH');
+    }
+  }
+
   return address;
 }
 
 /**
  * Get wallet status without throwing
  */
-export async function getWalletStatus(expectedNetwork?: 'testnet' | 'mainnet'): Promise<WalletState> {
+export async function getWalletStatus(
+  expectedNetwork?: 'testnet' | 'mainnet',
+  apiUrl?: string,
+): Promise<WalletState> {
   try {
     const installed = await isFreighterInstalled();
     if (!installed) {
@@ -237,6 +255,7 @@ export async function getWalletStatus(expectedNetwork?: 'testnet' | 'mainnet'): 
         address: null,
         network: expectedNetwork || 'testnet',
         networkMismatch: false,
+        networkValidated: false,
         isLoading: false,
         error: 'Freighter wallet not installed',
       };
@@ -244,17 +263,33 @@ export async function getWalletStatus(expectedNetwork?: 'testnet' | 'mainnet'): 
 
     const address = await getFreighterPublicKey();
     const walletNetwork = await getWalletNetwork();
-    const networkMismatch = expectedNetwork ? walletNetwork !== expectedNetwork : false;
+    const localMismatch = expectedNetwork ? walletNetwork !== expectedNetwork : false;
+
+    // Three-way network consistency check (wallet + frontend env + backend).
+    let networkMismatch = localMismatch;
+    let networkValidated = false;
+    let errorMsg: string | null = localMismatch
+      ? `Wallet is on ${walletNetwork} but app expects ${expectedNetwork}. Please switch networks in Freighter.`
+      : null;
+
+    if (!localMismatch && apiUrl) {
+      const mismatchReason = await validateNetworkConsistency(walletNetwork, apiUrl);
+      if (mismatchReason) {
+        networkMismatch = true;
+        errorMsg = mismatchReason;
+      } else {
+        networkValidated = true;
+      }
+    }
 
     return {
       isConnected: true,
       address,
       network: walletNetwork,
       networkMismatch,
+      networkValidated,
       isLoading: false,
-      error: networkMismatch 
-        ? `Wallet is on ${walletNetwork} but app expects ${expectedNetwork}. Please switch networks in Freighter.`
-        : null,
+      error: errorMsg,
     };
   } catch (error) {
     return {
@@ -262,6 +297,7 @@ export async function getWalletStatus(expectedNetwork?: 'testnet' | 'mainnet'): 
       address: null,
       network: expectedNetwork || 'testnet',
       networkMismatch: false,
+      networkValidated: false,
       isLoading: false,
       error: error instanceof Error ? error.message : 'Unknown error',
     };

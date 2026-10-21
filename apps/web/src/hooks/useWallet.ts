@@ -2,10 +2,8 @@ import { useState, useCallback, useEffect } from 'react';
 import {
   connectFreighterWallet,
   getWalletStatus,
-  isValidStellarAddress,
   FreighterError,
   WalletState,
-  checkNetworkMatch,
 } from '@/lib/freighter-utils';
 import { getExpectedNetwork } from '@/lib/network-utils';
 
@@ -19,6 +17,8 @@ export interface UseWalletReturn {
 const WALLET_STORAGE_KEY = 'freighter_wallet_connected';
 const WALLET_ADDRESS_KEY = 'freighter_wallet_address';
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+
 /**
  * Hook for managing Freighter wallet connection and status
  */
@@ -30,6 +30,7 @@ export function useWallet(): UseWalletReturn {
     address: null,
     network: expectedNetwork,
     networkMismatch: false,
+    networkValidated: false,
     isLoading: true,
     error: null,
   });
@@ -70,7 +71,8 @@ export function useWallet(): UseWalletReturn {
 
   const checkStatus = useCallback(async () => {
     setState((prev) => ({ ...prev, isLoading: true }));
-    const status = await getWalletStatus(expectedNetwork);
+    // Pass apiUrl so getWalletStatus can run the three-way network check.
+    const status = await getWalletStatus(expectedNetwork, API_URL);
     setState({
       ...status,
       isLoading: false,
@@ -81,7 +83,8 @@ export function useWallet(): UseWalletReturn {
     setState((prev) => ({ ...prev, isLoading: true, error: null }));
 
     try {
-      const address = await connectFreighterWallet(expectedNetwork);
+      // Pass apiUrl so connectFreighterWallet can run the three-way network check.
+      const address = await connectFreighterWallet(expectedNetwork, API_URL);
       
       // Persist connection state
       localStorage.setItem(WALLET_STORAGE_KEY, 'true');
@@ -92,6 +95,7 @@ export function useWallet(): UseWalletReturn {
         address,
         network: expectedNetwork,
         networkMismatch: false,
+        networkValidated: true,
         isLoading: false,
         error: null,
       });
@@ -137,6 +141,7 @@ export function useWallet(): UseWalletReturn {
       address: null,
       network: expectedNetwork,
       networkMismatch: false,
+      networkValidated: false,
       isLoading: false,
       error: null,
     });

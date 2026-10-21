@@ -1,4 +1,5 @@
 import { getRpcHealth } from '@/blockchain/soroban.js';
+import { validateContractRegistry } from '@/blockchain/contractRegistry.js';
 import { pingRedis } from '@/config/redis.js';
 import { supabase } from '@/config/supabase.js';
 import { type Request, type Response, Router } from 'express';
@@ -92,6 +93,12 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     blockchain: toHealthStatus(blockchainResult),
   };
 
+  // Validate the contract registry inline so the readiness probe catches any
+  // startup misconfiguration that slipped past the early-exit validation.
+  const registryErrors = validateContractRegistry(false /* non-strict — warn only */);
+  const contractRegistryStatus: HealthStatus =
+    registryErrors.length === 0 ? 'ok' : 'error';
+
   // Database is always required; others are optional
   const notReady = checks.database === 'error' ||
     (process.env.REDIS_URL && checks.redis === 'error');
@@ -100,7 +107,13 @@ router.get('/health/ready', async (_req: Request, res: Response) => {
     status: notReady ? 'not_ready' : 'ready',
     service: 'Rentars API 🚀',
     timestamp: new Date().toISOString(),
-    checks,
+    checks: {
+      ...checks,
+      contractRegistry: contractRegistryStatus,
+      ...(registryErrors.length > 0 && {
+        contractRegistryErrors: registryErrors.map((e) => `${e.contract}.${e.field}: ${e.message}`),
+      }),
+    },
   });
 });
 
