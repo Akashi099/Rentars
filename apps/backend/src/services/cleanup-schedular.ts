@@ -30,6 +30,7 @@ const RETENTION_STARTUP_PREVIEW_DELAY_MS = 10_000;
 
 let concurrentReconciliations = 0;
 let reconciliationBackoffMs = INITIAL_BACKOFF_MS;
+let notificationOutboxRunning = false;
 
 /** Guard: prevent two full retention runs from overlapping. */
 let retentionRunning = false;
@@ -97,6 +98,10 @@ export function startSyncScheduler(): void {
     runEscrowReconciliation().catch((err) => console.error('[reconcile] Scheduler error:', err));
   }, RECONCILIATION_INTERVAL_MS);
 
+  setInterval(() => {
+    runNotificationOutbox().catch((err) => console.error('[notification-outbox] Scheduler error:', err));
+  }, NOTIFICATION_OUTBOX_INTERVAL_MS);
+
   // Idempotency-key cleanup — runs once per hour, purges records older than 24 h
   setInterval(() => {
     runIdempotencyCleanup().catch((err) => console.error('[idempotency] Cleanup error:', err));
@@ -159,6 +164,19 @@ export function startSyncScheduler(): void {
     `idempotency cleanup interval: ${IDEMPOTENCY_CLEANUP_INTERVAL_MS / 1000}s, ` +
     `booking expiry interval: ${BOOKING_EXPIRY_INTERVAL_MS / 1000}s`,
   );
+}
+
+async function runNotificationOutbox(): Promise<void> {
+  if (notificationOutboxRunning) return;
+  notificationOutboxRunning = true;
+  try {
+    const result = await processNotificationOutbox();
+    if (!result.success) {
+      console.error(`[notification-outbox] Dispatch failed: ${result.error}`);
+    }
+  } finally {
+    notificationOutboxRunning = false;
+  }
 }
 
 async function runIdempotencyCleanup(): Promise<void> {

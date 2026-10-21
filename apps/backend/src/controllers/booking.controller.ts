@@ -345,7 +345,10 @@ export async function cancelBooking(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  res.json(result.data);
+  res.json({
+    ...result.data,
+    ...(result.warning ? { warning: result.warning } : {}),
+  });
 }
 
 export async function confirmBooking(req: Request, res: Response): Promise<void> {
@@ -762,4 +765,104 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
   }
 
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/bookings/:id/refund-preview
+ *
+ * Shows the refund calculation from the booking-time policy snapshot *before*
+ * the tenant confirms cancellation.  Does not modify any state. (#769)
+ *
+ * Returns: { tier, refundPct, refundAmount, totalPrice, hoursUntilCheckIn, policy }
+ */
+export async function getRefundPreviewHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  // Load the booking to get check_in
+  const bookingResult = await bookingService.getBookingById(req.params.id);
+  if (!bookingResult.success || !bookingResult.data) {
+    res.status(404).json({ error: 'Booking not found' });
+    return;
+  }
+
+  const booking = bookingResult.data;
+
+  // Only the tenant or admin can preview a refund
+  if (booking.tenant_id !== userId && req.user?.role !== 'admin') {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  if (!booking.check_in) {
+    res.status(422).json({ error: 'Booking is missing check-in date' });
+    return;
+  }
+
+  const result = await getRefundPreview(req.params.id, booking.check_in, new Date());
+  if (!result.success || !result.data) {
+    res.status(400).json({ error: result.error ?? 'Failed to compute refund preview' });
+    return;
+  }
+
+  res.json({
+    tier: result.data.tier,
+    refundPct: result.data.refundPct,
+    refundAmount: result.data.refundAmount,
+    totalPrice: result.data.totalPrice,
+    hoursUntilCheckIn: result.data.hoursUntilCheckIn,
+    policy: result.data.policy,
+    snapshotId: result.data.snapshotId,
+  });
+}
+
+/**
+ * GET /api/v1/bookings/:id/refund
+ *
+ * Returns the current refund request status for a booking. (#769)
+ * Settlement states: requested, submitted, confirmed, failed, manual_review.
+ */
+export async function getRefundStatusHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await getRefundRequestByBooking(req.params.id);
+  if (!result.success) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+
+  if (!result.data) {
+    res.status(404).json({ error: 'No refund request found for this booking' });
+    return;
+  }
+
+  const refund = result.data;
+
+  // Only the tenant, host, or admin can view the refund status
+  if (refund.tenant_id !== userId && refund.host_id !== userId && req.user?.role !== 'admin') {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  res.json({
+    id: refund.id,
+    bookingId: refund.booking_id,
+    status: refund.status,
+    refundAmount: refund.refund_amount,
+    refundTier: refund.refund_tier,
+    refundPolicyPct: refund.refund_policy_pct,
+    currency: refund.currency,
+    txHash: refund.tx_hash,
+    errorMessage: refund.error_message,
+    attemptCount: refund.attempt_count,
+    createdAt: refund.created_at,
+    updatedAt: refund.updated_at,
+  });
 }

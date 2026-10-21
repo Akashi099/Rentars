@@ -1,9 +1,9 @@
 'use client';
 
-import { Lock, CheckCircle, RefreshCw } from 'lucide-react';
+import { Lock, CheckCircle, RefreshCw, AlertTriangle } from 'lucide-react';
 
 interface EscrowStatusCardProps {
-  status: 'locked' | 'released' | 'refunded';
+  status: 'locked' | 'released' | 'refunded' | 'pending' | 'manual_review';
   amount: number;
   releaseDate?: string;
 }
@@ -31,6 +31,18 @@ export default function EscrowStatusCard({
       label: 'Refunded',
       color: 'text-blue-600 dark:text-blue-400',
       bgColor: 'bg-blue-50 dark:bg-blue-950',
+    },
+    pending: {
+      icon: RefreshCw,
+      label: 'Escrow verification pending',
+      color: 'text-yellow-600 dark:text-yellow-400',
+      bgColor: 'bg-yellow-50 dark:bg-yellow-950',
+    },
+    manual_review: {
+      icon: AlertTriangle,
+      label: 'Escrow requires manual review',
+      color: 'text-red-600 dark:text-red-400',
+      bgColor: 'bg-red-50 dark:bg-red-950',
     },
   };
 

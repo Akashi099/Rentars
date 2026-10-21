@@ -15,8 +15,9 @@
  * wallet layer and is fully independent of the auth mechanism.
  */
 
-import { Horizon, Transaction } from '@stellar/stellar-sdk';
+import { Horizon, Networks, Transaction } from '@stellar/stellar-sdk';
 import { updatePaymentStatus, getPaymentStatus } from './payment.service.js';
+import { usdcToStroops } from '@/utils/payment.utils.js';
 
 const CONFIRMATION_TIMEOUT_MS = 60_000; // 60 seconds max wait
 const POLL_INTERVAL_MS = 3_000;         // poll every 3 seconds
@@ -28,6 +29,37 @@ function getHorizonServer(): Horizon.Server {
       ? 'https://horizon.stellar.org'
       : 'https://horizon-testnet.stellar.org';
   return new Horizon.Server(url);
+}
+
+/**
+ * Reject signed transactions unless they contain exactly the quoted USDC
+ * payment operation. The issuer is configured explicitly so an unrelated
+ * asset named "USDC" cannot satisfy the quote.
+ */
+export function validateSignedPaymentTransaction(
+  signedXdr: string,
+  expectedAmountStroops: bigint,
+): void {
+  const network = process.env.STELLAR_NETWORK ?? 'testnet';
+  const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  const issuer = process.env.STELLAR_USDC_ISSUER;
+  if (!issuer) throw new Error('STELLAR_USDC_ISSUER is not configured');
+
+  const transaction = new Transaction(signedXdr, passphrase);
+  if (transaction.operations.length !== 1) {
+    throw new Error('Payment transaction must contain exactly one operation');
+  }
+
+  const operation = transaction.operations[0];
+  if (operation?.type !== 'payment') {
+    throw new Error('Payment transaction must contain a Stellar payment operation');
+  }
+  if (operation.asset.getCode() !== 'USDC' || operation.asset.getIssuer() !== issuer) {
+    throw new Error('Payment transaction asset does not match configured USDC');
+  }
+  if (usdcToStroops(operation.amount) !== expectedAmountStroops) {
+    throw new Error('Payment transaction amount does not match the signed quote');
+  }
 }
 
 export interface SubmitResult {
@@ -114,6 +146,7 @@ export async function retryTransaction(
     txHash = payment.stellar_tx_hash;
   } else {
     if (!signedXdr) throw new Error('signedXdr required for payments that were never submitted');
+    validateSignedPaymentTransaction(signedXdr, payment.amount_stroops);
     const result = await submitTransaction(signedXdr);
     txHash = result.txHash;
     await updatePaymentStatus(paymentId, txHash, 'submitted');

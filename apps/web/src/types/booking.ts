@@ -11,7 +11,8 @@ export type BookingStatus =
   | 'Confirmed' | 'confirmed'
   | 'Completed' | 'completed'
   | 'Cancelled' | 'cancelled'
-  | 'Disputed'  | 'disputed';
+  | 'Disputed'  | 'disputed'
+  | 'escrow_reconcile_failed';
 
 /** Normalise a raw status string from the API to lowercase. */
 export function normaliseStatus(status: string): Lowercase<BookingStatus> {
@@ -44,7 +45,7 @@ export interface Booking {
   total_price: number;
   status: BookingStatus;
   escrow_id?: string;
-  escrow_status?: 'locked' | 'released' | 'refunded';
+  escrow_status?: 'locked' | 'released' | 'refunded' | 'pending' | 'manual_review';
   on_chain_id?: number;
   rules_acknowledged_at?: string | null;
   dispute_reason?: string | null;

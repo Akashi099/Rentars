@@ -23,6 +23,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { supabase } from '@/config/supabase.js';
+import { usdcToStroops } from '@/utils/payment.utils.js';
 import {
   transitionPaymentStatus,
   mapProviderStatus,
@@ -243,17 +244,50 @@ export async function verifyAndProcessCallback(
   }
 
   const incomingStroops = BigInt(body.amountStroops);
-  if (incomingStroops !== payment.amount_stroops) {
+  const { data: booking, error: bookingError } = await supabase
+    .from('bookings')
+    .select('total_price')
+    .eq('id', body.bookingId)
+    .single();
+
+  if (bookingError) {
+    console.error(`[Callback] Failed to verify booking amount for ${body.bookingId}:`, bookingError.message);
+    return {
+      status: 'quarantined',
+      httpStatus: 503,
+      message: 'Booking verification is temporarily unavailable; retry the event',
+    };
+  }
+
+  let bookingAmountStroops: bigint | null = null;
+  if (booking) {
+    try {
+      bookingAmountStroops = usdcToStroops(String(booking.total_price));
+    } catch {
+      bookingAmountStroops = null;
+    }
+  }
+
+  if (
+    !booking ||
+    bookingAmountStroops === null ||
+    incomingStroops !== payment.amount_stroops ||
+    payment.amount_stroops !== bookingAmountStroops
+  ) {
     // Amount mismatch — quarantine; do NOT mark paid
     console.error(
-      `[Callback] Amount mismatch for bookingId=${body.bookingId}: ` +
-      `got=${incomingStroops} expected=${payment.amount_stroops}`,
+      `[Callback] Amount mismatch or booking lookup failure for bookingId=${body.bookingId}: ` +
+      `provider=${incomingStroops} payment=${payment.amount_stroops} ` +
+      `booking=${bookingAmountStroops ?? 'unavailable'}`,
     );
     // Transition to under_review so the discrepancy is auditable
     await transitionPaymentStatus(
       payment.id,
       'under_review',
-      { ...body, _reason: 'amount_mismatch' } as unknown as Record<string, unknown>,
+      {
+        ...body,
+        _reason: 'amount_mismatch',
+      } as unknown as Record<string, unknown>,
     );
     // Record in replay ledger to avoid re-processing
     await recordEvent(body.eventId, body.bookingId, eventHash);
@@ -288,7 +322,25 @@ export async function verifyAndProcessCallback(
     };
   }
 
-  const { replayed } = transitionResult.data!;
+  const transition = transitionResult.data;
+  if (!transition) {
+    console.error(`[Callback] Transition returned no data for payment=${payment.id}`);
+    return {
+      status: 'quarantined',
+      httpStatus: 200,
+      message: 'Event received; payment under review',
+    };
+  }
+
+  const { replayed } = transition;
+
+  if (transition.payment.status === 'under_review') {
+    return {
+      status: 'quarantined',
+      httpStatus: 200,
+      message: 'Event received; payment under review',
+    };
+  }
 
   return {
     status: replayed ? 'replayed' : 'acknowledged',

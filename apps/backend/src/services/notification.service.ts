@@ -282,8 +282,39 @@ export async function createNotification(
     .from('notifications')
     .insert(insertPayload)
     .select()
+    .eq('user_id', userId)
+    .eq('idempotency_key', idempotencyKey!)
     .single();
+  if (lookupError || !existing) {
+    return { success: false, error: lookupError?.message ?? 'Idempotent notification could not be loaded' };
+  }
+  return { success: true, data: existing as Notification };
+}
 
+export async function enqueueNotificationOutbox(
+  userId: string,
+  type: NotificationType,
+  data: Record<string, unknown>,
+  dedupeKey: string,
+): Promise<ServiceResponse<void>> {
+  if (!userId || !dedupeKey) {
+    return { success: false, error: 'userId and dedupeKey are required' };
+  }
+  if (!VALID_NOTIFICATION_TYPES.includes(type)) {
+    return { success: false, error: `Unknown notification type: ${type}` };
+  }
+
+  const { error } = await supabase
+    .from('notification_outbox')
+    .upsert(
+      {
+        recipient_id: userId,
+        notification_type: type,
+        data,
+        dedupe_key: dedupeKey,
+      },
+      { onConflict: 'recipient_id,dedupe_key', ignoreDuplicates: true },
+    );
   if (error) return { success: false, error: error.message };
 
   // Invalidate the notification cache so the next list request sees the new row.

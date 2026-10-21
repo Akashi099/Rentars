@@ -1,5 +1,10 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import {
+  getHostLedgerBalance,
+  recordBookingSettlement,
+  type PeriodFilter,
+} from './ledger.service.js';
 
 const PLATFORM_FEE_RATE = 0.05;
 
@@ -63,4 +68,64 @@ export class EarningsService {
       },
     };
   }
+
+  /**
+   * Reconciled earnings — derives the host's balance from the append-only ledger
+   * (#770).  This is the auditable view: every credit and debit is sourced from
+   * a settlement event, not a mutable summary row.
+   */
+  async getReconciledEarnings(
+    hostId: string,
+    filter: PeriodFilter,
+  ): Promise<ServiceResponse<EarningsSummary>> {
+    if (!hostId) return { success: false, error: 'hostId is required' };
+    if (!filter.from || !filter.to) {
+      return { success: false, error: 'from and to date range are required' };
+    }
+
+    // Derive balance from the ledger (credits − debits)
+    const balanceResult = await getHostLedgerBalance(hostId, filter);
+    if (!balanceResult.success || !balanceResult.data) {
+      return { success: false, error: balanceResult.error };
+    }
+
+    const balance = balanceResult.data;
+
+    // Fetch pending vs released from bookings table (for the pending/released split)
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('total_price, status, properties!inner(owner_id)')
+      .eq('properties.owner_id', hostId)
+      .not('status', 'eq', 'Cancelled')
+      .gte('created_at', filter.from)
+      .lte('created_at', filter.to);
+
+    if (error) return { success: false, error: error.message };
+
+    let pending = 0;
+    let released = 0;
+
+    for (const row of (data ?? []) as Array<{ total_price: number; status: string }>) {
+      const price = Number(row.total_price) || 0;
+      if (row.status === 'Confirmed' || row.status === 'Completed') {
+        released += price;
+      } else {
+        pending += price;
+      }
+    }
+
+    return {
+      success: true,
+      data: {
+        gross: balance.total_credits,
+        platform_fees: balance.total_debits,
+        net: balance.net,
+        pending: Math.round(pending * 0.95 * 100) / 100,
+        released: Math.round(released * 0.95 * 100) / 100,
+      },
+    };
+  }
 }
+
+// Re-export ledger helpers for convenience
+export { recordBookingSettlement };

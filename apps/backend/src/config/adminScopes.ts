@@ -10,7 +10,7 @@
  *   admin       — all scopes (full platform access)
  *   moderator   — content moderation, dispute management, search analytics
  *   support     — read-only user/booking/property lookup, rate-limit summary
- *   finance     — refund approvals, reconciliation (dual-approval required)
+ *   finance     — refund approvals, reconciliation, ledger adjustments (dual-approval required)
  *
  * The JWT `role` claim carries one of: "admin" | "moderator" | "support" | "finance".
  * Sub-roles are additive: a user can only have one role.
@@ -61,6 +61,7 @@ export const DUAL_APPROVAL_REQUIRED = new Set<AdminScope>([
   'admin:disputes:resolve',
   'admin:refunds:approve',
   'admin:users:suspend',
+  'admin:ledger:adjust',
 ]);
 
 // ── Role → Scope mapping ──────────────────────────────────────────────────────
