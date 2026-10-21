@@ -53,8 +53,15 @@ export default function TenantDashboard() {
     checkIn: new Date(booking.check_in),
     checkOut: new Date(booking.check_out),
     totalPrice: booking.total_price,
-    status: booking.status as 'pending' | 'confirmed' | 'completed' | 'cancelled',
-    escrowStatus: booking.escrow_status as 'locked' | 'released' | 'refunded',
+    status: booking.status.toLowerCase() as
+      | 'pending'
+      | 'confirmed'
+      | 'completed'
+      | 'cancelled'
+      | 'escrow_reconcile_failed',
+    escrowStatus: booking.status.toLowerCase() === 'escrow_reconcile_failed'
+      ? 'manual_review'
+      : booking.escrow_status,
   }));
 
   return (

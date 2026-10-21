@@ -18,7 +18,12 @@ import type { Request, Response, NextFunction } from 'express';
 import { json } from 'express';
 import { authenticate } from '@/middleware/auth.middleware.js';
 import { bookingRateLimiter } from '@/middleware/rateLimiter.js';
-import { submitPayment, getStatus, retryPayment } from '@/controllers/payment.controller.js';
+import {
+  getPaymentQuote,
+  submitPayment,
+  getStatus,
+  retryPayment,
+} from '@/controllers/payment.controller.js';
 import { handlePaymentCallback } from '@/controllers/paymentCallback.controller.js';
 
 const router = Router();
@@ -49,6 +54,12 @@ router.post(
 // ── Authenticated tenant routes ───────────────────────────────────────────────
 
 router.use(authenticate);
+
+/**
+ * GET /api/v1/payments/quote?bookingId=...
+ * Return the server-computed, signed amount quote required for payment.
+ */
+router.get('/quote', getPaymentQuote);
 
 /**
  * POST /api/v1/payments/submit

@@ -28,8 +28,11 @@ export async function signUSDCPaymentTransaction(
     // Get the sender's account info
     const sourceAccount = await server.loadAccount(senderPublicKey);
 
-    // USDC contract/issuer info (this would need to be configured for testnet/mainnet)
-    const usdcAsset = new StellarSdk.Asset('USDC', recipientPublicKey); // Placeholder
+    const usdcIssuer = process.env.NEXT_PUBLIC_USDC_ISSUER;
+    if (!usdcIssuer) {
+      throw new Error('NEXT_PUBLIC_USDC_ISSUER is not configured');
+    }
+    const usdcAsset = new StellarSdk.Asset('USDC', usdcIssuer);
 
     // Build transaction
     const tx = new StellarSdk.TransactionBuilder(sourceAccount, {

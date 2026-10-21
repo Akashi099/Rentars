@@ -41,6 +41,7 @@ import {
   activateProperty,
   // Bookings
   listAdminBookings,
+  getEscrowReconciliationHandler,
   // Disputes
   listDisputes,
   resolveDispute,
@@ -88,6 +89,11 @@ router.delete('/properties/:id/featured', requireScope('admin:properties:feature
 // ── Bookings (admin view) ─────────────────────────────────────────────────────
 // Scope: admin:bookings:read → admin, moderator, support, finance
 router.get('/bookings', requireScope('admin:bookings:read'), listAdminBookings);
+router.get(
+  '/bookings/:id/escrow-reconciliation',
+  requireScope('admin:reconciliation:read'),
+  getEscrowReconciliationHandler,
+);
 
 // ── Disputes ──────────────────────────────────────────────────────────────────
 // Scope: admin:disputes:read    → admin, moderator, support, finance
