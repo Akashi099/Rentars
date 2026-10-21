@@ -585,10 +585,11 @@ export class BookingService {
     //     funds are authorised. The server total is what gets charged.
     const priceCheck = await assertQuotedTotal({
       propertyId: property_id,
-      checkIn: check_in,
-      checkOut: check_out,
+      checkIn:    check_in,
+      checkOut:   check_out,
       clientTotal: total_price,
-      quoteToken: input.quote_token,
+      quoteToken:  input.quote_token,
+      guestCount:  guest_count,
     });
     if (!priceCheck.success || !priceCheck.data) {
       return {
