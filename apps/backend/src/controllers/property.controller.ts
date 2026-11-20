@@ -18,10 +18,6 @@ import {
   type AdvancedSearchFilters,
   type Property,
 } from '@/services/property.service.js';
-import {
-  getAvailabilityRanges,
-  setAvailabilityRanges,
-} from '@/services/availability.service.js';
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
@@ -206,10 +202,29 @@ export async function updatePropertyHandler(req: AuthRequest, res: Response): Pr
   res.json(result.data);
 }
 
-export async function deletePropertyHandler(req: Request, res: Response): Promise<void> {
-  const result = await deleteProperty(req.params.id);
+/**
+ * DELETE /api/v1/properties/:id
+ *
+ * Soft-deletes a listing. Only the owner or an administrator may do so, and a
+ * listing with unfinished reservations is refused with 409
+ * PROPERTY_HAS_ACTIVE_BOOKINGS. See docs/listing-lifecycle.md.
+ */
+export async function deletePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
+  const actorId = req.userId ?? req.user?.id;
+  if (!actorId) {
+    res.status(401).json({ error: 'Authentication required' });
+    return;
+  }
+
+  const result = await deleteProperty(req.params.id, {
+    id: actorId,
+    role: req.user?.role,
+  });
   if (!result.success) {
-    res.status(400).json({ error: result.error });
+    res.status(result.statusCode ?? 400).json({
+      error: result.error,
+      ...(result.code ? { code: result.code } : {}),
+    });
     return;
   }
   res.status(204).send();
@@ -389,29 +404,6 @@ export async function trackSuggestionAcceptedHandler(req: Request, res: Response
 }
 
 // ─── Availability ─────────────────────────────────────────────────────────────
-
-export async function getAvailability(req: Request, res: Response): Promise<void> {
-  try {
-    const ranges = await getAvailabilityRanges(req.params.id);
-    res.json(ranges);
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-}
-
-export async function setAvailability(req: AuthRequest, res: Response): Promise<void> {
-  try {
-    const ranges = await setAvailabilityRanges(req.params.id, req.userId!, req.body.ranges);
-    res.json(ranges);
-  } catch (err) {
-    const message = (err as Error).message;
-    if (message.startsWith('Forbidden') || message === 'Property not found') {
-      res.status(message.startsWith('Forbidden') ? 403 : 404).json({ error: message });
-      return;
-    }
-    res.status(400).json({ error: message });
-  }
-}
 
 // ─── Duplicate ────────────────────────────────────────────────────────────────
 

@@ -2,6 +2,7 @@ import { syncAllBookings, syncAllProperties, reconcileAllPendingEscrows } from '
 import { purgeExpired as purgeExpiredIdempotencyKeys } from './idempotency.service.js';
 import { BookingService } from './booking.service.js';
 import { processDueAccountDeletions } from './privacy.service.js';
+import { env } from '@/config/env.js';
 
 const bookingService = new BookingService();
 

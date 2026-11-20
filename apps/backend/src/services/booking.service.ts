@@ -42,7 +42,7 @@ import {
   escrowFailuresTotal,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
-import { calculateRangePrice } from './pricing.service.js';
+import { calculateRangePrice, pricingSnapshotFromQuote } from './pricing.service.js';
 import {
   bookingAuthorizationService,
   type BookingActor,
@@ -907,11 +907,15 @@ export class BookingService {
 
     // Store the agreed listing terms on the booking. The snapshot is immutable
     // (see migration 00065), so this is the only write that sets it.
+    // The accepted quote is stored with the terms, in the same write, so the booking
+    // records the exact nightly prices and rules the tenant agreed to (#926).
     const { error: snapshotError } = await supabase
       .from('bookings')
       .update({
         listing_terms_snapshot: termsSnapshot.data.terms,
         listing_revision: termsSnapshot.data.revision,
+        pricing_version: priceCheck.data.quote.pricing_version ?? null,
+        pricing_snapshot: pricingSnapshotFromQuote(priceCheck.data.quote),
       })
       .eq('id', bookingId);
 

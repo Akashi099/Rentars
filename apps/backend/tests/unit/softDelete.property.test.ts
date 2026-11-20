@@ -114,19 +114,45 @@ function makeBlockchain(overrides: Partial<BlockchainServices> = {}): Blockchain
 describe('deleteProperty (soft-delete)', () => {
   beforeEach(() => mockFrom.mockClear());
 
+  // deleteProperty first reads the listing (owner, tombstone) and any active
+  // bookings, then writes deleted_at, then re-checks bookings. Route by table.
+  const routeDelete = (updateResult: { error: { message: string } | null }, onUpdate?: (p: Record<string, unknown>) => void) => {
+    mockFrom.mockImplementation((table: string) => {
+      if (table === 'bookings') {
+        const q: Record<string, unknown> = {};
+        q.select = mock(() => q);
+        q.eq = mock(() => q);
+        q.in = mock(() => q);
+        q.gte = mock(() => q);
+        q.limit = mock(async () => ({ data: [], error: null }));
+        return q;
+      }
+      return {
+        select: mock(() => ({
+          eq: mock(() => ({
+            maybeSingle: mock(async () => ({
+              data: { id: 'prop-active-001', owner_id: 'owner-1', deleted_at: null },
+              error: null,
+            })),
+          })),
+        })),
+        update: mock((payload: Record<string, unknown>) => {
+          onUpdate?.(payload);
+          return {
+            eq: mock(() => ({
+              is: mock(async () => updateResult),
+            })),
+          };
+        }),
+      };
+    });
+  };
+
   it('should update deleted_at instead of removing the row', async () => {
     let updatedPayload: Record<string, unknown> | null = null;
-
-    mockFrom.mockImplementation(() => ({
-      update: mock((payload: Record<string, unknown>) => {
-        updatedPayload = payload;
-        return {
-          eq: mock(() => ({
-            is: mock(async () => ({ error: null })),
-          })),
-        };
-      }),
-    }));
+    routeDelete({ error: null }, (p) => {
+      updatedPayload = p;
+    });
 
     const result = await deleteProperty('prop-active-001');
     expect(result.success).toBe(true);
@@ -140,13 +166,7 @@ describe('deleteProperty (soft-delete)', () => {
   });
 
   it('should return error when database update fails', async () => {
-    mockFrom.mockImplementation(() => ({
-      update: mock(() => ({
-        eq: mock(() => ({
-          is: mock(async () => ({ error: { message: 'DB write failed' } })),
-        })),
-      })),
-    }));
+    routeDelete({ error: { message: 'DB write failed' } });
 
     const result = await deleteProperty('prop-active-001');
     expect(result.success).toBe(false);

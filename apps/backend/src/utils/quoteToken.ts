@@ -23,6 +23,11 @@ export interface QuoteTokenClaims {
   tot: number;
   /** Listing version: the property's updated_at when the quote was computed. */
   ver: string;
+  /**
+   * Fingerprint of the nightly prices and applied rules for the stay (#926). Absent on
+   * tokens issued before it was added, in which case the check is skipped.
+   */
+  qv?: string;
   /** Expiry instant (ISO 8601). */
   exp: string;
   /** Guest count the quote was issued for; absent on tokens issued without occupancy. */

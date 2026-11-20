@@ -10,8 +10,10 @@
  *  - Title + city give human-readable context.
  *  - Slugs are intentionally stable: regenerating only happens on explicit
  *    request so existing bookmarks / indexed URLs remain valid.
- *  - The SQL function `generate_property_slug` in migration 00024 mirrors
- *    this logic exactly so backfills and server-generated slugs match.
+ *  - The SQL function `generate_property_slug` (migration 00024) backfilled
+ *    legacy rows. It does not transliterate accents, so a legacy slug for a
+ *    title such as "Café" can differ from what generateSlug produces today.
+ *    Stored slugs are never regenerated, so this only affects new rows.
  */
 
 /** Maximum length of the human-readable portion (before the id suffix). */
@@ -23,6 +25,8 @@ const BASE_MAX_LENGTH = 60;
  */
 function slugify(text: string): string {
   return text
+    .normalize('NFKD') // decompose accented letters: "é" -> "e" + combining mark
+    .replace(/\p{M}+/gu, '') // drop the combining marks, keeping the base letter
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
@@ -45,12 +49,15 @@ function slugify(text: string): string {
  *   // → 'cozy-loft-downtown-paris-a1b2c3'
  */
 export function generateSlug(title: string, city: string | undefined | null, id: string): string {
-  const titlePart = slugify(title || 'property');
-  const cityPart  = city ? slugify(city) : '';
+  // A title with no Latin letters or digits (for example, all non-Latin script)
+  // falls back to "property". Without this the base would be empty and the slug
+  // would start with the id suffix.
+  const titlePart = slugify(title) || 'property';
+  const cityPart = city ? slugify(city) : '';
 
   // Combine non-empty parts
-  const parts  = [titlePart, cityPart].filter(Boolean);
-  let   base   = parts.join('-');
+  const parts = [titlePart, cityPart].filter(Boolean);
+  let base = parts.join('-');
 
   // Truncate to keep URLs manageable
   if (base.length > BASE_MAX_LENGTH) {

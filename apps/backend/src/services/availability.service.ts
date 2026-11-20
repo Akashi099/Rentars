@@ -1,5 +1,7 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
+import { toDay } from '@/utils/availabilityRange.js';
 
 export interface AvailabilityRange {
   id: string;
@@ -81,14 +83,16 @@ export async function blockAvailabilityRange(
   if (!startDate || !endDate) return { success: false, error: 'Invalid date format' };
   if (startDate >= endDate) return { success: false, error: 'start_date must be before end_date' };
 
-  // Reject if a confirmed booking already covers any part of this range.
+  // Reject if any reserving booking covers part of this range. Uses the same
+  // status set as the booking RPC and the calendar, so a range cannot be blocked
+  // over a Disputed or Completed stay that still occupies the dates.
   const { data: conflictingBookings, error: conflictError } = await supabase
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
-    .in('status', ['Confirmed', 'Pending'])
-    .lt('check_in', input.end_date)
-    .gt('check_out', input.start_date)
+    .in('status', [...RESERVING_BOOKING_STATUSES])
+    .lt('check_in', toDay(endDate))
+    .gt('check_out', toDay(startDate))
     .limit(1);
 
   if (conflictError) return { success: false, error: conflictError.message };
@@ -188,6 +192,9 @@ export async function checkDateRangeAvailability(
   }
 
   const nights = nightsBetween(checkInDate, checkOutDate);
+  // Queries compare calendar days in UTC, so a timestamp input cannot shift a stay.
+  const checkInDay = toDay(checkInDate);
+  const checkOutDay = toDay(checkOutDate);
 
   // Load settings (min/max stay)
   const { data: settingsRow } = await supabase
@@ -237,8 +244,8 @@ export async function checkDateRangeAvailability(
     .select('id')
     .eq('property_id', propertyId)
     .eq('is_available', false)
-    .lt('start_date', checkOut)
-    .gt('end_date', checkIn)
+    .lt('start_date', checkOutDay)
+    .gt('end_date', checkInDay)
     .limit(1);
 
   if (blockedRanges && blockedRanges.length > 0) {
@@ -261,9 +268,9 @@ export async function checkDateRangeAvailability(
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
-    .not('status', 'eq', 'Cancelled')
-    .lt('check_in', checkOut)
-    .gt('check_out', checkIn)
+    .in('status', [...RESERVING_BOOKING_STATUSES])
+    .lt('check_in', checkOutDay)
+    .gt('check_out', checkInDay)
     .limit(1);
 
   if (excludeBookingId) {

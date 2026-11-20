@@ -677,8 +677,23 @@ async function hardDeleteSoftDeletedProperties(
     const { data: toDelete, error: fetchErr } = await idsQuery;
     if (fetchErr) throw new Error(fetchErr.message);
 
-    const ids = (toDelete ?? []).map((r: { id: string }) => r.id);
-    if (ids.length === 0) return noop(label);
+    const candidateIds = (toDelete ?? []).map((r: { id: string }) => r.id);
+    if (candidateIds.length === 0) return noop(label);
+
+    // Never purge a listing that has booking history. Bookings (and their
+    // payment and escrow records) are kept for the life of the platform, and
+    // the FK is RESTRICT (migration 00071), so such a delete would fail anyway.
+    const { data: bookedRows, error: bookedErr } = await supabase
+      .from('bookings')
+      .select('property_id')
+      .in('property_id', candidateIds);
+    if (bookedErr) throw new Error(bookedErr.message);
+
+    const booked = new Set((bookedRows ?? []).map((r: { property_id: string }) => r.property_id));
+    const ids = candidateIds.filter((id) => !booked.has(id));
+    if (ids.length === 0) {
+      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: heldSkipped + booked.size, failed: false };
+    }
 
     const { data, error } = await supabase
       .from('properties')
@@ -687,7 +702,13 @@ async function hardDeleteSoftDeletedProperties(
       .select('id');
 
     if (error) throw new Error(error.message);
-    return { class: label, deleted: data?.length ?? 0, eligible: eligibleCount, held_skipped: heldSkipped, failed: false };
+    return {
+      class: label,
+      deleted: data?.length ?? 0,
+      eligible: eligibleCount,
+      held_skipped: heldSkipped + booked.size,
+      failed: false,
+    };
   } catch (err) {
     return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
   }

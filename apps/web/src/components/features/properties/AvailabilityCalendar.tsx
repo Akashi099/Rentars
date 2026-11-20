@@ -65,7 +65,9 @@ export default function AvailabilityCalendar({ propertyId, onClose }: Availabili
   for (const range of ranges) {
     const start = new Date(range.start_date);
     const end = new Date(range.end_date);
-    for (const d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
+    // Step in UTC days to match the UTC date keys below. Local setDate can shift a
+    // blocked night in zones away from UTC, and DST changes can skip or repeat one.
+    for (const d = new Date(start); d < end; d.setUTCDate(d.getUTCDate() + 1)) {
       blockedDates.add(d.toISOString().split('T')[0]);
     }
   }

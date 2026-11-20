@@ -1,5 +1,8 @@
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { RESERVING_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
+import { toDay } from '@/utils/availabilityRange.js';
+import { nightsBetween } from './availability.service.js';
 
 export interface AvailabilityWindow {
   date: string;
@@ -52,12 +55,12 @@ export async function getMonthAvailability(
     .lte('start_date', endOfMonth.toISOString().split('T')[0])
     .gte('end_date', startOfMonth.toISOString().split('T')[0]);
 
-  // Fetch bookings for this month (non-cancelled)
+  // Fetch bookings that occupy dates this month (same status set as the booking RPC)
   const { data: bookings } = await supabase
     .from('bookings')
     .select('check_in, check_out')
     .eq('property_id', propertyId)
-    .neq('status', 'Cancelled')
+    .in('status', [...RESERVING_BOOKING_STATUSES])
     .lte('check_in', endOfMonth.toISOString().split('T')[0])
     .gte('check_out', startOfMonth.toISOString().split('T')[0]);
 
@@ -117,8 +120,14 @@ export async function checkAvailabilityAtomic(
     return { success: false, error: 'check_in must be before check_out' };
   }
 
+  // Stays are half-open [check_in, check_out) on UTC calendar days, the same rule
+  // the booking RPC and the calendar use. Adjacent stays (one checks out on the
+  // day another checks in) do not conflict.
+  const inDay = toDay(checkIn);
+  const outDay = toDay(checkOut);
+
   // Minimum stay validation
-  const nights = Math.ceil((checkOut.getTime() - checkIn.getTime()) / (24 * 3600 * 1000));
+  const nights = nightsBetween(checkIn, checkOut);
   if (nights < minimumStay) {
     return {
       success: true,
@@ -129,14 +138,14 @@ export async function checkAvailabilityAtomic(
     };
   }
 
-  // Lock + check overlapping bookings (pessimistic)
+  // Check overlapping reserving bookings
   const { data: conflicts, error: conflictError } = await supabase
     .from('bookings')
     .select('id')
     .eq('property_id', propertyId)
-    .neq('status', 'Cancelled')
-    .lte('check_in', checkOutStr)
-    .gte('check_out', checkInStr)
+    .in('status', [...RESERVING_BOOKING_STATUSES])
+    .lt('check_in', outDay)
+    .gt('check_out', inDay)
     .limit(1);
 
   if (conflictError) {
@@ -156,8 +165,8 @@ export async function checkAvailabilityAtomic(
     .select('id')
     .eq('property_id', propertyId)
     .eq('is_available', false)
-    .lte('start_date', checkOutStr)
-    .gte('end_date', checkInStr)
+    .lt('start_date', outDay)
+    .gt('end_date', inDay)
     .limit(1);
 
   if (blocked && blocked.length > 0) {

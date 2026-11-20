@@ -6,6 +6,7 @@
  * error handling is consistent.
  */
 
+import { randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import * as cache from './cache.service.js';
 import type { ServiceResponse } from './index.js';
@@ -15,6 +16,7 @@ import { executePaginatedQuery } from '../utils/pagination.js';
 import { CANONICAL_AMENITIES } from '@/types/amenities.js';
 import { sanitizeLongText, sanitizeShortText } from '@/utils/sanitize.js';
 import { generateSlug } from '@/utils/slug.js';
+import { ACTIVE_BOOKING_STATUSES } from '@/utils/bookingStatus.js';
 
 export interface PropertyImage {
   id: string;
@@ -26,6 +28,11 @@ export interface PropertyImage {
 const TTL_ALL = 60;
 const TTL_ONE = 300;
 const TTL_FEATURED = 120;
+
+/** Postgres unique_violation: the slug unique index rejected an insert. */
+const UNIQUE_VIOLATION = '23505';
+/** Fresh ids to try when a generated slug collides before giving up. */
+const SLUG_INSERT_ATTEMPTS = 3;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -314,35 +321,38 @@ export async function createProperty(
 
   // Guard against titles that produce no valid slug (#418).
   // generateSlug falls back to "property-<suffix>" for empty bases, but a title
-  // with no sluggable characters is itself invalid — reject it early.
-  const prospectiveSlug = generateSlug(trimmedTitle, payload.city, 'probe');
-  if (prospectiveSlug.startsWith('property-')) {
+  // with no letters or digits at all is invalid. Non-Latin titles are allowed:
+  // they get the "property" base plus the id suffix, which stays unique.
+  if (!/[\p{L}\p{N}]/u.test(trimmedTitle)) {
     return { success: false, error: 'Property title must contain at least one letter or digit' };
   }
 
-  const { data, error } = await supabase
-    .from('properties')
-    .insert(sanitized)
-    .select()
-    .single();
+  // The slug is derived from the id, so choose the id first and write the row
+  // once, with its slug. A separate follow-up UPDATE could fail and leave a
+  // listing with no URL. If the slug collides with the unique index, draw a
+  // fresh id and try again.
+  let property: Property | null = null;
+  let lastError: string | null = null;
+  for (let attempt = 0; attempt < SLUG_INSERT_ATTEMPTS && !property; attempt++) {
+    const id = randomUUID();
+    const slug = generateSlug(trimmedTitle, payload.city, id);
+    const { data, error } = await supabase
+      .from('properties')
+      .insert({ ...sanitized, id, slug })
+      .select()
+      .single();
 
-  if (error) {
-    return { success: false, error: error.message };
+    if (!error) {
+      property = data as Property;
+    } else if ((error as { code?: string }).code === UNIQUE_VIOLATION) {
+      lastError = error.message;
+    } else {
+      return { success: false, error: error.message };
+    }
   }
 
-  const property = data as Property;
-
-  // Generate and persist the URL slug now that we have the row id
-  const slug = generateSlug(property.title, property.city, property.id);
-  const { error: slugErr } = await supabase
-    .from('properties')
-    .update({ slug })
-    .eq('id', property.id);
-
-  if (!slugErr) {
-    property.slug = slug;
-  } else {
-    console.error('[createProperty] Failed to set slug:', slugErr.message);
+  if (!property) {
+    return { success: false, error: lastError ?? 'Could not allocate a unique listing slug' };
   }
 
   await Promise.all([
@@ -404,7 +414,10 @@ export async function updateProperty(
   }
 
   // Sanitize user-generated text fields before storing
-  const sanitized: Partial<Property> = { ...payload };
+  // The slug is server-owned and immutable once set (migration 00072). Drop any
+  // client-supplied value rather than letting the write fail.
+  const { slug: _clientSlug, ...payloadWithoutSlug } = payload;
+  const sanitized: Partial<Property> = { ...payloadWithoutSlug };
   if (payload.title !== undefined) {
     sanitized.title = sanitizeShortText(payload.title, 255);
   }
@@ -509,36 +522,130 @@ const SAVED_SEARCH_MATCH_FIELDS = [
 
 /**
  * Soft-delete a property record by setting `deleted_at` to the current
- * timestamp.  The row is preserved in the database so that historical bookings,
- * reviews, and on-chain references continue to resolve correctly.
+ * timestamp. The row is preserved so historical bookings, reviews and on-chain
+ * references continue to resolve. Lifecycle rules: docs/listing-lifecycle.md.
  *
- * The listing is immediately hidden from all public reads and cannot receive
- * new bookings after this call returns.
+ * Rules enforced here:
+ *  - When `actor` is supplied (every HTTP caller), only the listing owner or an
+ *    administrator may delete it.
+ *  - A listing with reservations that still have unfinished obligations
+ *    (Pending, Confirmed or Disputed, with check-out not yet passed) cannot be
+ *    deleted. Returns code PROPERTY_HAS_ACTIVE_BOOKINGS (409).
+ *  - Deletion is idempotent: deleting an already-deleted listing succeeds.
  *
- * @param id - UUID of the property row to soft-delete.
+ * The active-booking check runs again after the tombstone is written. If a
+ * booking slipped in between the check and the write, the tombstone is rolled
+ * back so the guest's reservation is never left on a hidden listing.
+ *
+ * @param id    - UUID of the property row to soft-delete.
+ * @param actor - Authenticated caller. Omit only for trusted internal callers.
  */
-export async function deleteProperty(id: string): Promise<ServiceResponse<void>> {
+export async function deleteProperty(
+  id: string,
+  actor?: { id: string; role?: string },
+): Promise<ServiceResponse<void>> {
   if (!id) {
     return { success: false, error: 'Property ID is required' };
   }
 
+  const { data: current, error: readError } = await supabase
+    .from('properties')
+    .select('id, owner_id, deleted_at')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (readError) {
+    return { success: false, error: readError.message };
+  }
+  if (!current) {
+    return { success: false, error: 'Property not found', statusCode: 404 };
+  }
+
+  const row = current as { owner_id: string; deleted_at: string | null };
+  if (row.deleted_at) {
+    return { success: true };
+  }
+
+  if (actor && actor.id !== row.owner_id && actor.role !== 'admin') {
+    return {
+      success: false,
+      error: 'Forbidden: only the property owner or an administrator can delete this listing',
+      statusCode: 403,
+    };
+  }
+
+  const before = await findActiveReservations(id);
+  if (!before.success) return { success: false, error: before.error };
+  if (before.data!.length > 0) return activeBookingsRefusal();
+
+  const deletedAt = new Date().toISOString();
   const { error } = await supabase
     .from('properties')
-    .update({ deleted_at: new Date().toISOString() })
+    .update({ deleted_at: deletedAt })
     .eq('id', id)
-    .is('deleted_at', null); // idempotent: only update if not already deleted
+    .is('deleted_at', null);
 
   if (error) {
     return { success: false, error: error.message };
   }
 
+  // Re-check now that the tombstone is visible to booking writes. A reservation
+  // created in the gap is rolled back rather than left on a hidden listing.
+  const after = await findActiveReservations(id);
+  if (!after.success || after.data!.length > 0) {
+    await supabase
+      .from('properties')
+      .update({ deleted_at: null })
+      .eq('id', id)
+      .eq('deleted_at', deletedAt);
+    if (!after.success) return { success: false, error: after.error };
+    return activeBookingsRefusal();
+  }
+
+  await invalidatePropertyCaches(id);
+  return { success: true };
+}
+
+/** Bookings on a listing that still have unfinished obligations. */
+async function findActiveReservations(
+  propertyId: string,
+): Promise<ServiceResponse<Array<{ id: string }>>> {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await supabase
+    .from('bookings')
+    .select('id')
+    .eq('property_id', propertyId)
+    .in('status', [...ACTIVE_BOOKING_STATUSES])
+    .gte('check_out', today)
+    .limit(1);
+
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: (data ?? []) as Array<{ id: string }> };
+}
+
+function activeBookingsRefusal(): ServiceResponse<void> {
+  return {
+    success: false,
+    error: 'Cannot delete a listing with active bookings. Cancel or complete them first.',
+    statusCode: 409,
+    conflict: true,
+    code: 'PROPERTY_HAS_ACTIVE_BOOKINGS',
+  };
+}
+
+/** Clear every cache entry that can still serve a deleted listing. */
+async function invalidatePropertyCaches(propertyId: string): Promise<void> {
   await Promise.all([
-    cache.del(`property:${id}`),
+    cache.del(`property:${propertyId}`),
     cache.del('properties:all'),
     cache.del('properties:featured'),
+    // Featured results are cached per cap (properties:featured:<n>), which the
+    // bare key above does not reach. Without this a deleted listing can stay
+    // featured until the TTL expires.
+    ...Array.from({ length: FEATURED_CAP }, (_, i) =>
+      cache.del(`properties:featured:${i + 1}`),
+    ),
   ]);
-
-  return { success: true };
 }
 
 /**
