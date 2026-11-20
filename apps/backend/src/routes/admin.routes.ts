@@ -35,6 +35,7 @@ import {
   getUserDetail,
   suspendUser,
   activateUser,
+  changeUserRoleHandler,
   // Property management
   listAdminProperties,
   suspendProperty,
@@ -74,6 +75,8 @@ router.get('/users', requireScope('admin:users:read'), listUsers);
 router.get('/users/:id', requireScope('admin:users:read'), getUserDetail);
 router.post('/users/:id/suspend', requireScope('admin:users:suspend'), suspendUser);
 router.post('/users/:id/activate', requireScope('admin:users:activate'), activateUser);
+// Scope: admin:users:role → admin only. Actor role is re-checked against the DB in the service.
+router.patch('/users/:id/role', requireScope('admin:users:role'), changeUserRoleHandler);
 
 // ── Property management ───────────────────────────────────────────────────────
 // Scope: admin:properties:read     → admin, moderator, support

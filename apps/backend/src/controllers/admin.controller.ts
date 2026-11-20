@@ -5,6 +5,9 @@ import { getTopQueries, getZeroResultQueries, getDailySearchVolume } from '@/ser
 import { auditLogger } from '@/services/auditLogger.service.js';
 import { supabase } from '@/config/supabase.js';
 import type { AdminRequest } from '@/middleware/admin.middleware.js';
+import { changeUserRole } from '@/services/roleAssignment.service.js';
+import { ASSIGNABLE_ROLES } from '@/config/roleTransitions.js';
+import type { RequestWithId } from '@/middleware/logging.middleware.js';
 import { z } from 'zod';
 
 function getRouteId(value: string | string[] | undefined): string | null {
@@ -800,4 +803,46 @@ export async function approveRefundHandler(req: AdminRequest, res: Response): Pr
     approved_by: req.adminId,
     co_approved_by: approvalActorId,
   });
+}
+
+// ─── Role assignment (#916) ───────────────────────────────────────────────────
+
+const changeRoleBodySchema = z
+  .object({ role: z.enum(ASSIGNABLE_ROLES) })
+  .strict();
+
+/**
+ * PATCH /api/v1/admin/users/:id/role
+ * Body: { role } only. Any other field is rejected (strict), so a forged
+ * `admin` flag or `actorRole` in the body cannot influence authority.
+ */
+export async function changeUserRoleHandler(req: AdminRequest, res: Response): Promise<void> {
+  const id = getRouteId(req.params.id);
+  if (!id || !req.adminId) {
+    res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
+    return;
+  }
+
+  const parsed = changeRoleBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      error: { code: 'VALIDATION_FAILED', message: 'Body must be { "role": <assignable role> }.' },
+    });
+    return;
+  }
+
+  const result = await changeUserRole({
+    actorId: req.adminId,
+    targetId: id,
+    toRole: parsed.data.role,
+    requestId: (req as RequestWithId).requestId,
+    ip: req.ip,
+  });
+
+  if (!result.ok) {
+    res.status(result.status).json({ error: { code: result.code, message: result.message } });
+    return;
+  }
+
+  res.json({ userId: result.userId, role: result.newRole, previousRole: result.oldRole });
 }

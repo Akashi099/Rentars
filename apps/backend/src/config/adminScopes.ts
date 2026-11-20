@@ -31,6 +31,7 @@ export type AdminScope =
   | 'admin:users:read'
   | 'admin:users:suspend'      // HIGH-RISK: irreversible user impact
   | 'admin:users:activate'
+  | 'admin:users:role'         // role assignment: admin only, transition matrix enforced (#916)
   // Property management
   | 'admin:properties:read'
   | 'admin:properties:suspend'
@@ -76,6 +77,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:users:read',
     'admin:users:suspend',
     'admin:users:activate',
+    'admin:users:role',
     'admin:properties:read',
     'admin:properties:suspend',
     'admin:properties:activate',

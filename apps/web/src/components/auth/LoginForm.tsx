@@ -20,6 +20,7 @@ export function LoginForm({ onSubmit, serverError }: LoginFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [captchaToken, setCaptchaToken] = useState<string>('');
   const [captchaError, setCaptchaError] = useState<string>('');
+  const [captchaResetKey, setCaptchaResetKey] = useState(0);
   const t = useTranslations('auth');
   const { summaryRef, focusFirstError } = useFormErrorFocus();
 
@@ -59,6 +60,9 @@ export function LoginForm({ onSubmit, serverError }: LoginFormProps) {
       await onSubmit({ ...data, captchaToken });
     } finally {
       setIsSubmitting(false);
+      // Tokens are single-use: clear the token and show a fresh challenge for the next attempt (#917).
+      setCaptchaToken('');
+      setCaptchaResetKey((k) => k + 1);
     }
   };
 
@@ -126,7 +130,7 @@ export function LoginForm({ onSubmit, serverError }: LoginFormProps) {
           <span id="login-captcha-label" className="sr-only">
             Security verification
           </span>
-          <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} />
+          <HCaptcha onVerify={onCaptchaVerify} onExpire={onCaptchaExpire} resetKey={captchaResetKey} />
         </div>
         {captchaError && (
           <p

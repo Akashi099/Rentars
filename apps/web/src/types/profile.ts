@@ -1,21 +1,22 @@
+/** Canonical profile as returned by GET /api/profile (owner view) (#918). */
 export interface UserProfile {
-  id: string;
-  email: string;
-  name: string;
-  avatar_url?: string;
-  phone?: string;
-  address?: string;
-  stellar_wallet?: string;
-  wallet_verified: boolean;
-  role: 'tenant' | 'host' | 'both';
-  created_at: string;
-  updated_at: string;
+  user_id: string;
+  name?: string | null;
+  avatar_url?: string | null;
+  phone?: string | null;
+  bio?: string | null;
+  stellar_address?: string | null;
+  verification_status?: 'unverified' | 'verified';
+  created_at?: string;
+  updated_at?: string;
+  completeness?: { score: number; maxScore: number; missingFields: string[] };
 }
 
+/** Fields the profile form can send. Omitted keys are left unchanged on the server. */
 export interface ProfileUpdateData {
   name?: string;
-  phone?: string;
-  address?: string;
-  avatar_url?: string;
-  stellar_wallet?: string;
+  phone?: string | null;
+  avatar_url?: string | null;
+  stellar_address?: string | null;
+  expected_updated_at?: string;
 }

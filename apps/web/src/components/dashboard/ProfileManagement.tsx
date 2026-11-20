@@ -3,9 +3,10 @@
 import { useState, useRef, useEffect } from 'react';
 import { Upload, Check, AlertCircle, Crop, X } from 'lucide-react';
 import type { UserProfile, ProfileUpdateData } from '@/types/profile';
+import { buildProfilePatch, type ProfilePatchField, type SavedProfileFields } from '@/lib/profile/profilePatch';
 
 interface ProfileManagementProps {
-  profile?: UserProfile & { completeness?: { score: number; maxScore: number; missingFields: string[] } };
+  profile?: UserProfile;
   onUpdate?: (data: ProfileUpdateData) => void;
 }
 
@@ -13,20 +14,30 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const ALLOWED_AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
 export default function ProfileManagement({ profile, onUpdate }: ProfileManagementProps) {
+  // `saved` is the last server-confirmed state. The form diffs against it, so
+  // only changed fields are sent (#918).
+  const [saved, setSaved] = useState<SavedProfileFields & { updated_at?: string }>(() => ({
+    name: profile?.name ?? '',
+    phone: profile?.phone ?? '',
+    stellar_address: profile?.stellar_address ?? '',
+    avatar_url: profile?.avatar_url ?? null,
+    updated_at: profile?.updated_at,
+  }));
   const [formData, setFormData] = useState({
-    name: profile?.name || '',
-    phone: profile?.phone || '',
-    address: profile?.address || '',
-    stellarWallet: profile?.stellar_wallet || '',
+    name: saved.name ?? '',
+    phone: saved.phone ?? '',
+    stellarAddress: saved.stellar_address ?? '',
   });
-  const [avatarPreview, setAvatarPreview] = useState(profile?.avatar_url);
+  const [avatarPreview, setAvatarPreview] = useState<string | null>(saved.avatar_url ?? null);
   const [isLoading, setIsLoading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<ProfilePatchField, string>>>({});
   const [cropSrc, setCropSrc] = useState<string | null>(null);
   const [cropError, setCropError] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const completeness = profile?.completeness ?? { score: 0, maxScore: 100, missingFields: [] };
+  const walletLinked = Boolean(saved.stellar_address);
   const completenessPct = Math.round((completeness.score / completeness.maxScore) * 100);
 
   const startCropping = (file: File) => {
@@ -73,7 +84,8 @@ export default function ProfileManagement({ profile, onUpdate }: ProfileManageme
     try {
       if (typeof window !== 'undefined' && (window as any).freighter) {
         const publicKey = await (window as any).freighter.getPublicKey();
-        setFormData({ ...formData, stellarWallet: publicKey });
+        setFormData({ ...formData, stellarAddress: publicKey });
+        setFieldErrors((e) => ({ ...e, stellarAddress: undefined }));
         setMessage({ type: 'success', text: 'Wallet verified successfully!' });
       } else {
         setMessage({ type: 'error', text: 'Freighter wallet not found' });
@@ -83,8 +95,41 @@ export default function ProfileManagement({ profile, onUpdate }: ProfileManageme
     }
   };
 
+  /** Applies the server's canonical profile to the form and baseline (#918). */
+  const applyServerProfile = (next: UserProfile) => {
+    const base = {
+      name: next.name ?? '',
+      phone: next.phone ?? '',
+      stellar_address: next.stellar_address ?? '',
+      avatar_url: next.avatar_url ?? null,
+      updated_at: next.updated_at,
+    };
+    setSaved(base);
+    setFormData({ name: base.name, phone: base.phone, stellarAddress: base.stellar_address });
+    setAvatarPreview(base.avatar_url);
+    return base;
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setMessage(null);
+
+    const result = buildProfilePatch(
+      saved,
+      { name: formData.name, phone: formData.phone, stellarAddress: formData.stellarAddress, avatarUrl: avatarPreview },
+      saved.updated_at,
+    );
+    if (!result.ok) {
+      setFieldErrors(result.errors);
+      setMessage({ type: 'error', text: Object.values(result.errors).join(' ') });
+      return;
+    }
+    setFieldErrors({});
+    if (!result.changed) {
+      setMessage({ type: 'success', text: 'No changes to save.' });
+      return;
+    }
+
     setIsLoading(true);
     try {
       const token = localStorage.getItem('token');
@@ -93,23 +138,38 @@ export default function ProfileManagement({ profile, onUpdate }: ProfileManageme
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            name: formData.name,
-            phone: formData.phone,
-            address: formData.address,
-            stellar_wallet: formData.stellarWallet,
-            avatar_url: avatarPreview,
-          }),
+          body: JSON.stringify(result.body),
         },
       );
+      const payload = (await response.json().catch(() => ({}))) as UserProfile & {
+        current?: UserProfile;
+        error?: string | { message?: string };
+      };
+
       if (response.ok) {
+        const next = applyServerProfile(payload);
         setMessage({ type: 'success', text: 'Profile updated successfully!' });
-        onUpdate?.({ name: formData.name, phone: formData.phone, address: formData.address, stellar_wallet: formData.stellarWallet, avatar_url: avatarPreview });
+        const update: ProfileUpdateData = {
+          name: next.name ?? undefined,
+          phone: next.phone,
+          stellar_address: next.stellar_address,
+          avatar_url: next.avatar_url,
+          expected_updated_at: next.updated_at,
+        };
+        onUpdate?.(update);
+      } else if (response.status === 409 && payload.current) {
+        // Someone else saved first. Show their values rather than overwriting them.
+        applyServerProfile(payload.current);
+        setMessage({
+          type: 'error',
+          text: 'This profile was updated elsewhere. The form now shows the latest values; re-apply your changes and save again.',
+        });
       } else {
-        setMessage({ type: 'error', text: 'Failed to update profile' });
+        const errText = typeof payload.error === 'string' ? payload.error : payload.error?.message;
+        setMessage({ type: 'error', text: errText || 'Failed to update profile. Your changes are still here; try again.' });
       }
     } catch {
-      setMessage({ type: 'error', text: 'Error updating profile' });
+      setMessage({ type: 'error', text: 'Network error while saving. Your changes are still here; try again.' });
     } finally {
       setIsLoading(false);
     }
@@ -177,30 +237,44 @@ export default function ProfileManagement({ profile, onUpdate }: ProfileManageme
 
         {/* Name */}
         <div>
-          <label className={labelClass}>Full Name</label>
-          <input type="text" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} className={inputClass} />
+          <label htmlFor="profile-name" className={labelClass}>Full Name</label>
+          <input
+            id="profile-name"
+            type="text"
+            value={formData.name}
+            onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+            aria-invalid={fieldErrors.name ? true : undefined}
+            aria-describedby={fieldErrors.name ? 'profile-name-error' : undefined}
+            className={inputClass}
+          />
+          {fieldErrors.name && <p id="profile-name-error" className="text-xs text-red-600 mt-1">{fieldErrors.name}</p>}
         </div>
 
         {/* Phone */}
         <div>
-          <label className={labelClass}>Phone Number</label>
-          <input type="tel" value={formData.phone} onChange={(e) => setFormData({ ...formData, phone: e.target.value })} className={inputClass} />
-        </div>
-
-        {/* Address */}
-        <div>
-          <label className={labelClass}>Address</label>
-          <input type="text" value={formData.address} onChange={(e) => setFormData({ ...formData, address: e.target.value })} className={inputClass} />
+          <label htmlFor="profile-phone" className={labelClass}>Phone Number</label>
+          <input
+            id="profile-phone"
+            type="tel"
+            value={formData.phone}
+            onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+            aria-invalid={fieldErrors.phone ? true : undefined}
+            aria-describedby={fieldErrors.phone ? 'profile-phone-error' : undefined}
+            className={inputClass}
+          />
+          {fieldErrors.phone && <p id="profile-phone-error" className="text-xs text-red-600 mt-1">{fieldErrors.phone}</p>}
         </div>
 
         {/* Stellar Wallet */}
         <div>
-          <label className={labelClass}>Stellar Wallet Address</label>
+          <label htmlFor="profile-wallet" className={labelClass}>Stellar Wallet Address</label>
           <div className="flex gap-2">
             <input
+              id="profile-wallet"
               type="text"
-              value={formData.stellarWallet}
+              value={formData.stellarAddress}
               readOnly
+              aria-invalid={fieldErrors.stellarAddress ? true : undefined}
               className="flex-1 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-gray-100"
               placeholder="Connect wallet to link"
             />
@@ -208,7 +282,7 @@ export default function ProfileManagement({ profile, onUpdate }: ProfileManageme
               Link Wallet
             </button>
           </div>
-          {profile?.wallet_verified && (
+          {walletLinked && (
             <div className="mt-2 flex items-center gap-2 text-green-600 dark:text-green-400 text-sm">
               <Check size={16} />
               Wallet verified

@@ -24,7 +24,12 @@ export default function RegisterPage() {
 
       if (!response.ok) {
         const err = await response.json();
-        throw new Error(err.message || t('registerFailed'));
+        // CAPTCHA responses carry a user-facing message, including retry guidance (#917).
+        const captchaMessage =
+          typeof err.code === 'string' && err.code.startsWith('CAPTCHA_') && typeof err.error === 'string'
+            ? err.error
+            : null;
+        throw new Error(captchaMessage || err.message || t('registerFailed'));
       }
 
       toast.success(t('accountCreated'));

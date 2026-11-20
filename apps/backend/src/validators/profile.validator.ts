@@ -10,22 +10,25 @@ import { ValidationError } from '@/types/errors.js';
 
 export const updateProfileSchema = z
   .object({
+    // Trim first so whitespace-only input is rejected as empty (#918).
     name: z
       .string()
+      .trim()
       .min(1, 'name must not be empty')
       .max(100, 'name must be at most 100 characters')
-      .trim()
       .optional(),
 
     bio: z
       .string()
-      .max(500, 'bio must be at most 500 characters')
       .trim()
-      .optional(),
+      .max(500, 'bio must be at most 500 characters')
+      .optional()
+      .nullable(),
 
     avatar_url: z
       .string()
       .url('avatar_url must be a valid URL')
+      .max(255, 'avatar_url must be at most 255 characters')
       .optional()
       .nullable(),
 
@@ -47,14 +50,11 @@ export const updateProfileSchema = z
       .optional()
       .nullable(),
 
-    preferred_currency: z
-      .enum(['USD', 'EUR', 'GBP', 'USDC'], {
-        errorMap: () => ({ message: 'preferred_currency must be one of: USD, EUR, GBP, USDC' }),
-      })
-      .optional(),
+    // Optimistic-concurrency precondition: the `updated_at` the client last saw.
+    expected_updated_at: z.string().min(10).max(64).optional(),
   })
   .refine(
-    (data) => Object.keys(data).length > 0,
+    (data) => Object.keys(data).some((key) => key !== 'expected_updated_at'),
     { message: 'At least one field must be provided for update' },
   );
 

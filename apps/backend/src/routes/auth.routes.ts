@@ -55,6 +55,9 @@ router.post('/logout', logout);
 // POST /api/v1/auth/logout-all-devices — revoke all refresh tokens for user
 router.post('/logout-all-devices', authenticate, logoutAllDevices);
 
+// Current identity and server-side role (#916).
+router.get('/me', authenticate, getCurrentUserHandler);
+
 // POST /api/v1/auth/verify-email — confirm email address with token
 router.post('/verify-email', verifyEmailLimiter, validateBody(verifyEmailSchema), verifyEmailHandler);
 

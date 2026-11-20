@@ -17,6 +17,8 @@ import { auditLogger } from '@/services/auditLogger.service.js';
 import { removeAllPushSubscriptionsForUser } from '@/services/push.service.js';
 import { env } from '@/config/env.js';
 import { AuthError } from '@/types/errors.js';
+import { supabase } from '@/config/supabase.js';
+import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 export async function register(req: Request, res: Response): Promise<void> {
   try {
@@ -212,4 +214,38 @@ export async function logoutAllDevices(req: Request, res: Response): Promise<voi
   });
 
   res.json({ message: 'Logged out from all devices successfully.' });
+}
+
+/**
+ * GET /api/auth/me
+ * Returns the authenticated user's identity and CURRENT role from the database.
+ * The web client must use this, not a role copied into localStorage, to decide
+ * what the UI shows (#916). A missing or suspended account is treated as 401.
+ */
+export async function getCurrentUserHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, role, status')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error) {
+    res.status(500).json({ error: 'Could not load account' });
+    return;
+  }
+  if (!data || (data as { status?: string }).status === 'suspended') {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  res.json({
+    id: (data as { id: string }).id,
+    role: (data as { role?: string | null }).role ?? 'tenant',
+  });
 }

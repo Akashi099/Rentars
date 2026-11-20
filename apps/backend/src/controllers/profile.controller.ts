@@ -25,16 +25,42 @@ export async function getPublicProfileHandler(req: Request, res: Response): Prom
     res.status(404).json({ error: result.error });
     return;
   }
-  const completeness = computeProfileCompleteness(result.data);
-  res.json({ ...result.data, completeness });
+  // Public view only: no completeness, since it would reveal which private fields are empty (#918).
+  res.json(result.data);
 }
 
 export async function updateProfileHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await updateProfile(req.userId!, req.body);
+  const { expected_updated_at: expectedUpdatedAt, ...fields } = req.body as Record<string, unknown>;
+  const result = await updateProfile(req.userId!, fields, {
+    expectedUpdatedAt: typeof expectedUpdatedAt === 'string' ? expectedUpdatedAt : undefined,
+  });
+
   if (!result.success) {
+    if (result.errorCode === 'CONFLICT') {
+      // Return the canonical current profile so the client can merge without losing data.
+      res.status(409).json({ error: result.error, code: 'PROFILE_CONFLICT', current: result.current });
+      return;
+    }
+    if (result.errorCode === 'NOT_FOUND') {
+      res.status(404).json({ error: result.error });
+      return;
+    }
     res.status(400).json({ error: result.error });
     return;
   }
+
+  if (typeof fields.stellar_address === 'string' || fields.stellar_address === null) {
+    await auditLogger.log({
+      actorId: req.userId,
+      action: 'account.wallet_link',
+      resourceType: 'account',
+      resourceId: req.userId,
+      ip: req.ip,
+      success: true,
+      meta: { stellar_address: fields.stellar_address, via: 'profile_patch' },
+    });
+  }
+
   res.json(result.data);
 }
 

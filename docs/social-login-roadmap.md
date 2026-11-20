@@ -264,6 +264,59 @@ When this feature is re-prioritized:
 - **Phase 3 (Q3 2024):** Frontend OAuth flows, account linking UI
 - **Phase 4 (Q4 2024):** Testing, security audit, launch
 
+## Callback Policy and Setup (provider-independent)
+
+This section is the contract every provider must follow before a button is shown. It does not enable any provider.
+
+### Status
+
+- Social login remains **deferred** (#738). No provider control is rendered; `SocialLoginDeferred.test.tsx` still guards this.
+- Building blocks exist in `apps/web/src/lib/auth/`:
+  - `oauthState.ts`: issues a random `state` (64 hex chars), stores it in `sessionStorage` with a 10-minute TTL, and consumes it exactly once on callback. A missing, unknown, expired, reused, or wrong-provider state is rejected.
+  - `safeReturnPath.ts`: `sanitizeReturnPath(next)` accepts only same-origin, in-app paths. Protocol-relative (`//host`), backslash (`/\\host`), absolute, control-character, and whitespace-containing values fall back to `/dashboard`. Every post-login redirect that reads `next` or `returnTo` must go through it.
+- Not yet done, and blocked on provider credentials and the #738 decision: the backend token exchange, a live smoke test per configured provider, and the enabled UI.
+
+### Allowed redirect URIs
+
+Redirect URIs are matched **exactly** (scheme, host, port, path). No wildcards and no client-supplied URIs.
+
+| Environment | Redirect URI |
+|---|---|
+| Production | `https://rentars.app/auth/callback` |
+| Staging | `https://staging.rentars.app/auth/callback` |
+| Local development | `http://localhost:3001/auth/callback` (test provider apps only) |
+
+### Provider dashboard settings
+
+**Supabase (Authentication → URL Configuration):**
+- Site URL: the environment's web origin (for example `https://rentars.app`).
+- Additional Redirect URLs: only the exact callback URIs in the table above.
+
+**Google Cloud Console (OAuth client, Web application):** Authorized redirect URI must be the Supabase callback for the project, `https://<project-ref>.supabase.co/auth/v1/callback`. Do not add the app's own callback here.
+
+**GitHub OAuth App:** Authorization callback URL is the Supabase callback for the project, as above. One OAuth App per environment.
+
+### Callback failure states
+
+Each failure returns the user to the login form with a fixed, non-sensitive `error` code. No session is created on any of these paths.
+
+| Situation | Redirect |
+|---|---|
+| Provider success, state valid | `sanitizeReturnPath(next)`, default `/dashboard`, after the auth context is refreshed |
+| User cancels at provider | `/login?error=cancelled` |
+| Provider returns `error=access_denied` or any other error | `/login?error=provider_denied` |
+| `state` missing, unknown, expired, or reused | `/login?error=invalid_state` |
+| Email matches an existing account and the provider link is not confirmed | `/login?error=account_link_required` |
+| Token exchange or provider unavailable | `/login?error=provider_unavailable` (retryable) |
+
+### Account merge policy
+
+- **Never merge by email alone.** A provider identity is not attached to an existing account because the email matches.
+- **New identity, no matching account:** create the account. Store `auth_method` and the provider subject ID. Require a verified provider email.
+- **New identity, matching existing account:** do not link automatically. The user signs in with their existing method first, then confirms the link from account settings. Until confirmed, the provider login is rejected with `account_link_required`.
+- **Same identity again:** sign in to the linked account.
+- **Unverified provider email:** never used for matching or account creation.
+
 ## See Also
 
 - [CONTRIBUTING.md](../CONTRIBUTING.md) — Testing and development setup

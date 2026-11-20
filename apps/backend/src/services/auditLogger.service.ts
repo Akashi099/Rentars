@@ -89,6 +89,8 @@ export type AuditAction =
   // Admin
   | 'admin.user_suspend'
   | 'admin.user_activate'
+  | 'admin.user_role_change'
+  | 'admin.user_role_change_denied'
   | 'admin.user_delete'
   | 'admin.property_suspend'
   | 'admin.property_activate'
