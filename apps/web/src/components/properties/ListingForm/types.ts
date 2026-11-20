@@ -9,6 +9,7 @@ export interface ListingFormData {
   city: string;
   state: string;
   zipCode: string;
+  country: string;
   latitude?: number;
   longitude?: number;
 

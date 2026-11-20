@@ -8,6 +8,10 @@ interface ImageItem {
   url: string;
   file?: File;
   isPrimary?: boolean;
+  /** Set by the server once the image is saved. Undefined for a local preview. */
+  moderationStatus?: 'pending' | 'approved' | 'rejected';
+  /** Host-facing reason when a photo was rejected, so the host can correct it. */
+  moderationReason?: string | null;
 }
 
 type UploadStatus = 'idle' | 'uploading' | 'error';
@@ -193,7 +197,13 @@ export default function ImageUploader({
 
         const img = await res.json();
         updateSlot(index, {
-          image: { id: img.id, url: img.url, isPrimary: img.is_primary },
+          image: {
+            id: img.id,
+            url: img.url,
+            isPrimary: img.is_primary,
+            moderationStatus: img.moderation_status,
+            moderationReason: img.moderation_reason ?? null,
+          },
           status: 'idle',
           progress: 100,
           error: undefined,
@@ -259,7 +269,13 @@ export default function ImageUploader({
 
             const img = await res.json();
             updateSlot(slotIndex, {
-              image: { id: img.id, url: img.url, isPrimary: img.is_primary },
+              image: {
+            id: img.id,
+            url: img.url,
+            isPrimary: img.is_primary,
+            moderationStatus: img.moderation_status,
+            moderationReason: img.moderation_reason ?? null,
+          },
               status: 'idle',
               progress: 100,
             });
@@ -496,6 +512,24 @@ export default function ImageUploader({
                 <span className="absolute top-1 left-1 bg-yellow-400 text-yellow-900 text-xs font-semibold px-1.5 py-0.5 rounded">
                   Primary
                 </span>
+              )}
+
+              {/* Saved state: a local preview is not on the listing yet. */}
+              {slot.status === 'idle' && (
+                <span className="absolute bottom-1 left-1 bg-white/90 text-gray-800 text-xs font-medium px-1.5 py-0.5 rounded">
+                  {!slot.image.id
+                    ? 'Not saved yet'
+                    : slot.image.moderationStatus === 'pending'
+                      ? 'Awaiting review'
+                      : slot.image.moderationStatus === 'rejected'
+                        ? 'Rejected'
+                        : 'Saved'}
+                </span>
+              )}
+              {slot.status === 'idle' && slot.image.moderationStatus === 'rejected' && (
+                <p role="note" className="absolute inset-x-0 bottom-0 bg-red-700/90 text-white text-xs p-1 leading-tight">
+                  {slot.image.moderationReason ?? 'This photo was not approved. Remove it and upload a replacement.'}
+                </p>
               )}
 
               {/* Actions overlay (idle only) */}

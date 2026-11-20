@@ -270,6 +270,8 @@ export async function getPropertyById(
     .from('property_images')
     .select('id, url, is_primary, display_order')
     .eq('property_id', id)
+    // Public and cacheable: only moderator-approved images are served here (#922).
+    .eq('moderation_status', 'approved')
     .order('display_order', { ascending: true });
 
   if (!imageError && Array.isArray(imageRows)) {
@@ -1439,8 +1441,22 @@ function hasValue(value: unknown): boolean {
  * @returns An error message for the first invalid field, or null when valid.
  */
 function validateDraftPatch(patch: Partial<Property>): string | null {
+  // Autosave accepts partial input, so minimum lengths are checked at step advance and submit.
+  // Maximums and formats must hold on every write, to match the create schema (#920).
   if (patch.title !== undefined && (typeof patch.title !== 'string' || patch.title.trim() === '')) {
     return 'title must be a non-empty string';
+  }
+  if (typeof patch.title === 'string' && patch.title.trim().length > 100) {
+    return 'title must be at most 100 characters';
+  }
+  if (typeof patch.description === 'string' && patch.description.trim().length > 2000) {
+    return 'description must be at most 2000 characters';
+  }
+  for (const field of ['check_in_time', 'check_out_time'] as const) {
+    const value = (patch as Record<string, unknown>)[field];
+    if (value !== undefined && value !== null && (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value))) {
+      return `${field} must be in HH:MM format`;
+    }
   }
   if (patch.price_per_night !== undefined && (typeof patch.price_per_night !== 'number' || !(patch.price_per_night > 0))) {
     return 'price_per_night must be a positive number';
@@ -1620,10 +1636,12 @@ export async function publishDraft(
     return { success: false, error: 'Only drafts can be published', statusCode: 409 };
   }
 
+  // Pending images count toward readiness; rejected and removed ones do not (#922).
   const { count: imageCount } = await supabase
     .from('property_images')
     .select('id', { count: 'exact', head: true })
-    .eq('property_id', propertyId);
+    .eq('property_id', propertyId)
+    .in('moderation_status', ['pending', 'approved']);
 
   const readiness = getPublishReadiness(row, imageCount ?? 0);
   if (!readiness.ready) {

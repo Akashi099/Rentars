@@ -37,6 +37,7 @@ export type AdminScope =
   | 'admin:properties:suspend'
   | 'admin:properties:activate'
   | 'admin:properties:feature'
+  | 'admin:properties:moderate_images' // approve / reject / remove property photos (#922)
   // Booking management
   | 'admin:bookings:read'
   // Dispute management
@@ -82,6 +83,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:suspend',
     'admin:properties:activate',
     'admin:properties:feature',
+    'admin:properties:moderate_images',
     'admin:bookings:read',
     'admin:disputes:read',
     'admin:disputes:resolve',
@@ -102,6 +104,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
     'admin:properties:suspend',
     'admin:properties:activate',
     'admin:properties:feature',
+    'admin:properties:moderate_images',
     'admin:bookings:read',
     'admin:disputes:read',
     'admin:disputes:resolve',

@@ -27,6 +27,7 @@ import { searchPropertiesEndpoint, searchNearbyEndpoint } from '@/controllers/pr
 import {
   uploadImage,
   listImages,
+  listOwnerImages,
   deleteImage,
   reorderImages,
   setAsPrimary,
@@ -140,8 +141,11 @@ router.post('/:id/versions/:versionId/rollback', authenticate, requireEmailVerif
 
 // ── Image management ───────────────────────────────────────────────────────────
 
-// GET /api/v1/properties/:id/images
+// GET /api/v1/properties/:id/images — public, approved images only
 router.get('/:id/images', listImages);
+
+// GET /api/v1/properties/:id/images/manage — owner, includes pending/rejected with reasons (#922)
+router.get('/:id/images/manage', authenticate, listOwnerImages);
 
 // POST /api/v1/properties/:id/images
 router.post('/:id/images', authenticate, imageUploadLimiter, upload.single('image'), uploadImage);

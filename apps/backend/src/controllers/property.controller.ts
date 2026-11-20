@@ -1,4 +1,7 @@
 import type { Request, Response } from 'express';
+import { propertySchema, updatePropertySchema } from '@/validators/property.validator.js';
+import type { ZodError } from 'zod';
+
 import {
   createProperty,
   deleteProperty,
@@ -184,7 +187,13 @@ export async function getPropertyBySlugHandler(req: Request, res: Response): Pro
 }
 
 export async function createPropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await createProperty(req.body);
+  // The same rules the web form enforces at each step. A direct API call must not bypass them (#920).
+  const parsed = propertySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ error: 'Validation failed', fields: zodFieldErrors(parsed.error) });
+    return;
+  }
+  const result = await createProperty({ ...req.body, ...parsed.data });
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -194,7 +203,12 @@ export async function createPropertyHandler(req: AuthRequest, res: Response): Pr
 }
 
 export async function updatePropertyHandler(req: AuthRequest, res: Response): Promise<void> {
-  const result = await updateProperty(req.params.id, req.body, req.userId);
+  const parsed = updatePropertySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ error: 'Validation failed', fields: zodFieldErrors(parsed.error) });
+    return;
+  }
+  const result = await updateProperty(req.params.id, { ...req.body, ...parsed.data }, req.userId);
   if (!result.success) {
     res.status(400).json({ error: result.error });
     return;
@@ -520,6 +534,15 @@ export async function getViewStatsHandler(req: Request, res: Response): Promise<
 // ─── Occupancy heatmap ────────────────────────────────────────────────────────
 
 import { getOccupancyHeatmap } from '@/services/occupancy.service.js';
+
+function zodFieldErrors(error: ZodError): Record<string, string[]> {
+  const fields: Record<string, string[]> = {};
+  for (const issue of error.issues) {
+    const key = issue.path.join('.') || '_';
+    (fields[key] ??= []).push(issue.message);
+  }
+  return fields;
+}
 
 /**
  * GET /api/v1/properties/:id/occupancy-heatmap

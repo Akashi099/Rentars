@@ -255,7 +255,9 @@ describe('getPropertyById — soft-delete visibility', () => {
       return {
         select: mock(() => ({
           eq: mock(() => ({
-            order: mock(async () => ({ data: [], error: null })),
+            eq: mock(() => ({
+              order: mock(async () => ({ data: [], error: null })),
+            })),
           })),
         })),
       };
@@ -295,7 +297,9 @@ describe('getPropertyById — soft-delete visibility', () => {
       return {
         select: mock(() => ({
           eq: mock(() => ({
-            order: mock(async () => ({ data: [], error: null })),
+            eq: mock(() => ({
+              order: mock(async () => ({ data: [], error: null })),
+            })),
           })),
         })),
       };

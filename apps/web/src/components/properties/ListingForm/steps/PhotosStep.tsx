@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
 import ImageUploader from '@/components/features/properties/ImageUploader';
+import { useState } from 'react';
 import type { ListingFormData } from '../types';
 
 interface PhotosStepProps {
@@ -11,7 +11,12 @@ interface PhotosStepProps {
   onUploadStatusChange?: (inProgress: boolean) => void;
 }
 
-export default function PhotosStep({ formData, setFormData, errors, onUploadStatusChange }: PhotosStepProps) {
+export default function PhotosStep({
+  formData,
+  setFormData,
+  errors,
+  onUploadStatusChange,
+}: PhotosStepProps) {
   const [uploadsInProgress, setUploadsInProgress] = useState(false);
 
   const handleUploadStatusChange = (inProgress: boolean) => {
@@ -21,6 +26,10 @@ export default function PhotosStep({ formData, setFormData, errors, onUploadStat
 
   return (
     <div className="space-y-6">
+      <p className="text-sm text-gray-600">
+        Photos are saved when you submit the listing. Each one is reviewed before it appears
+        publicly.
+      </p>
       <ImageUploader
         onChange={(images) =>
           setFormData({ ...formData, images: images.map((img) => img.file!).filter(Boolean) })

@@ -1,141 +1,183 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  type DraftLoadResult,
+  LISTING_STEPS,
+  type RestoredDraft,
+  clearDraft as clearStoredDraft,
+  readDraft,
+  writeDraft,
+} from '@/components/properties/ListingForm/draft';
 import type { ListingFormData, ListingStep } from '@/components/properties/ListingForm/types';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-const STEPS: ListingStep[] = ['basic', 'location', 'amenities', 'photos', 'pricing', 'review'];
-const DRAFT_STORAGE_KEY = 'listing_form_draft';
 const DRAFT_SAVE_DEBOUNCE_MS = 1000;
 
-interface DraftState {
-  formData: Partial<ListingFormData>;
-  currentStep: ListingStep;
-  savedAt: number;
+type FormState = Partial<ListingFormData>;
+
+function getBrowserStorage(): Storage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
-export function useListingForm() {
+/**
+ * The listing form's state, plus its draft lifecycle (#919).
+ *
+ * - Draft owner is the host's wallet key. With no key, nothing is saved.
+ * - On mount, a valid draft is offered, never applied silently. Autosave is paused
+ *   until the host decides, so an unanswered prompt cannot overwrite the saved draft.
+ * - Dismissing the prompt keeps the draft. Discarding removes it. Publishing removes it.
+ */
+export function useListingForm(ownerKey: string | null = null) {
   const [currentStep, setCurrentStep] = useState<ListingStep>('basic');
-  const [formData, setFormData] = useState<Partial<ListingFormData>>({
+  const [formData, setFormDataState] = useState<FormState>({
     amenities: [],
     images: [],
+    maxGuests: 1,
+    bedrooms: 0,
+    bathrooms: 0,
+    petsAllowed: false,
+    smokingAllowed: false,
+    eventsAllowed: false,
+    quietHoursStart: '',
+    quietHoursEnd: '',
+    additionalRules: '',
+    // Defaults the pricing step shows, so validation sees the same values the host sees.
+    minNights: 1,
+    maxNights: null,
+    checkInTime: '15:00',
+    checkOutTime: '11:00',
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [hasDraft, setHasDraft] = useState(false);
-  const [draftDiscarded, setDraftDiscarded] = useState(false);
-  const saveTimeoutRef = useRef<NodeJS.Timeout>();
+  const [pendingDraft, setPendingDraft] = useState<RestoredDraft | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [restoredNeedsAttention, setRestoredNeedsAttention] = useState<string[]>([]);
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const currentStepIndex = STEPS.indexOf(currentStep);
+  const currentStepIndex = LISTING_STEPS.indexOf(currentStep);
 
-  // Initialize draft on mount
+  // Look for a draft once the owner is known.
   useEffect(() => {
-    try {
-      if (typeof window === 'undefined' || draftDiscarded) return;
-
-      const stored = localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (stored) {
-        const draft = JSON.parse(stored) as DraftState;
-        setFormData(draft.formData);
-        setCurrentStep(draft.currentStep);
-        setHasDraft(true);
-      }
-    } catch (err) {
-      console.warn('Failed to restore draft:', err);
+    const storage = getBrowserStorage();
+    if (!ownerKey) return;
+    const result: DraftLoadResult = readDraft(storage, ownerKey, Date.now());
+    if (result.status === 'ok') {
+      setPendingDraft(result.draft);
+      setDialogOpen(true);
+    } else if (result.status === 'expired') {
+      clearStoredDraft(storage, ownerKey);
+      setNotice('A saved draft older than 14 days was removed.');
     }
-  }, [draftDiscarded]);
+  }, [ownerKey]);
 
-  // Save draft to localStorage (debounced)
-  const saveDraft = useCallback(() => {
-    if (typeof window === 'undefined') return;
-
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
+  // Autosave, debounced, once there is no unanswered prompt.
+  useEffect(() => {
+    if (!ownerKey || pendingDraft) return;
+    const storage = getBrowserStorage();
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     saveTimeoutRef.current = setTimeout(() => {
-      try {
-        const draft: DraftState = {
-          formData,
-          currentStep,
-          savedAt: Date.now(),
-        };
-        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
-      } catch (err) {
-        console.warn('Failed to save draft:', err);
-      }
+      writeDraft(storage, { ownerKey, currentStep, formData, now: Date.now() });
     }, DRAFT_SAVE_DEBOUNCE_MS);
-  }, [formData, currentStep]);
-
-  // Auto-save when form data or step changes
-  useEffect(() => {
-    saveDraft();
     return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     };
-  }, [formData, currentStep, saveDraft]);
+  }, [ownerKey, pendingDraft, currentStep, formData]);
 
-  const clearDraft = useCallback(() => {
-    try {
-      if (typeof window !== 'undefined') {
-        localStorage.removeItem(DRAFT_STORAGE_KEY);
-      }
-    } catch (err) {
-      console.warn('Failed to clear draft:', err);
-    }
-    setHasDraft(false);
+  const setFormData = useCallback((data: FormState) => {
+    setFormDataState(data);
   }, []);
 
-  const discardDraft = useCallback(() => {
-    clearDraft();
-    setDraftDiscarded(true);
-  }, [clearDraft]);
+  /** Merges a partial update into the form. Kept alongside setFormData for existing callers. */
+  const updateFormData = useCallback((data: FormState) => {
+    setFormDataState((prev) => ({ ...prev, ...data }));
+  }, []);
 
-  const goToStep = (step: ListingStep) => {
-    setCurrentStep(step);
-  };
+  const goToStep = useCallback((step: ListingStep) => setCurrentStep(step), []);
 
-  const nextStep = () => {
-    if (currentStepIndex < STEPS.length - 1) {
-      setCurrentStep(STEPS[currentStepIndex + 1]);
-    }
-  };
-
-  const previousStep = () => {
-    if (currentStepIndex > 0) {
-      setCurrentStep(STEPS[currentStepIndex - 1]);
-    }
-  };
-
-  const updateFormData = (data: Partial<ListingFormData>) => {
-    setFormData((prev) => ({ ...prev, ...data }));
-  };
-
-  const setError = (field: string, message: string) => {
-    setErrors((prev) => ({ ...prev, [field]: message }));
-  };
-
-  const clearError = (field: string) => {
-    setErrors((prev) => {
-      const newErrors = { ...prev };
-      delete newErrors[field];
-      return newErrors;
+  const nextStep = useCallback(() => {
+    setCurrentStep((step) => {
+      const i = LISTING_STEPS.indexOf(step);
+      return i < LISTING_STEPS.length - 1 ? LISTING_STEPS[i + 1] : step;
     });
-  };
+  }, []);
+
+  const previousStep = useCallback(() => {
+    setCurrentStep((step) => {
+      const i = LISTING_STEPS.indexOf(step);
+      return i > 0 ? LISTING_STEPS[i - 1] : step;
+    });
+  }, []);
+
+  const resumeDraft = useCallback(() => {
+    if (!pendingDraft) return;
+    // Photos are never restored. They are listed in needsAttention for the host to add again.
+    setFormDataState({ ...pendingDraft.formData, images: [] });
+    setCurrentStep(pendingDraft.currentStep);
+    setRestoredNeedsAttention(pendingDraft.needsAttention);
+    setPendingDraft(null);
+    setDialogOpen(false);
+  }, [pendingDraft]);
+
+  const discardDraft = useCallback(() => {
+    clearStoredDraft(getBrowserStorage(), ownerKey);
+    setPendingDraft(null);
+    setDialogOpen(false);
+    setRestoredNeedsAttention([]);
+  }, [ownerKey]);
+
+  /** Hides the prompt but keeps the draft. The host can resume it later from the banner. */
+  const dismissDraftDialog = useCallback(() => setDialogOpen(false), []);
+  const reopenDraftDialog = useCallback(() => {
+    if (pendingDraft) setDialogOpen(true);
+  }, [pendingDraft]);
+
+  /** Call after a successful publish. */
+  const clearDraft = useCallback(() => {
+    clearStoredDraft(getBrowserStorage(), ownerKey);
+    setPendingDraft(null);
+    setRestoredNeedsAttention([]);
+  }, [ownerKey]);
+
+  const setError = useCallback((field: string, message: string) => {
+    setErrors((prev) => ({ ...prev, [field]: message }));
+  }, []);
+
+  const clearError = useCallback((field: string) => {
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  }, []);
 
   return {
     currentStep,
     currentStepIndex,
     formData,
+    setFormData,
+    updateFormData,
     errors,
-    hasDraft,
+    setErrors,
+    setError,
+    clearError,
     goToStep,
     nextStep,
     previousStep,
-    updateFormData,
-    setError,
-    clearError,
-    clearDraft,
+    pendingDraft,
+    draftDialogOpen: dialogOpen && !!pendingDraft,
+    hasPendingDraft: !!pendingDraft,
+    hasDraft: !!pendingDraft,
+    notice,
+    dismissNotice: () => setNotice(null),
+    restoredNeedsAttention,
+    resumeDraft,
     discardDraft,
+    dismissDraftDialog,
+    reopenDraftDialog,
+    clearDraft,
   };
 }

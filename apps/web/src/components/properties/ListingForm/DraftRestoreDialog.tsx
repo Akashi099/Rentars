@@ -10,6 +10,8 @@ interface DraftRestoreDialogProps {
    *  click, Escape key). Draft is NOT removed in this case. */
   onDismiss?: () => void;
   isOpen?: boolean;
+  /** What was saved, e.g. "Saved 2 h ago, on step 3 of 7 (Amenities)." */
+  summary?: string;
 }
 
 export default function DraftRestoreDialog({
@@ -18,6 +20,7 @@ export default function DraftRestoreDialog({
   onDiscard,
   onDismiss,
   isOpen = true,
+  summary,
 }: DraftRestoreDialogProps) {
   const [mounted, setMounted] = useState(false);
   const discardButtonRef = useRef<HTMLButtonElement>(null);
@@ -88,6 +91,14 @@ export default function DraftRestoreDialog({
         </h2>
         <p style={{ marginBottom: '24px', color: '#666', margin: '0 0 24px 0' }}>
           We found a saved draft of your listing. Would you like to resume editing it?
+        </p>
+        {summary && (
+          <p data-testid="draft-summary" style={{ margin: '0 0 16px 0', fontSize: '14px', color: '#333' }}>
+            {summary}
+          </p>
+        )}
+        <p style={{ margin: '0 0 16px 0', fontSize: '12px', color: '#666' }}>
+          Photos are not saved with drafts. You will need to add them again.
         </p>
         <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
           <button
