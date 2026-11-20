@@ -391,9 +391,10 @@ export async function verifyEmail(rawToken: string): Promise<ServiceResponse<voi
     email_verification_expires_at: string;
   };
 
-  // Check if already verified
+  // Already verified: treat a repeated confirmation as success so the landing
+  // page can show a positive state instead of an error.
   if (user.email_verified) {
-    throw new AuthError(AuthErrorCode.INVALID_TOKEN, 'Email has already been verified');
+    return { success: true };
   }
 
   // Check expiration
@@ -428,6 +429,61 @@ export async function verifyEmail(rawToken: string): Promise<ServiceResponse<voi
     resourceId: user.id,
     success: true,
   });
+
+  return { success: true };
+}
+
+/**
+ * Issue a fresh verification link for an unverified account.
+ *
+ * Always resolves with the same public outcome so the response cannot reveal
+ * whether an address has an account or whether it is already verified. Prior
+ * tokens are replaced, so only the most recently sent link can be used.
+ * Rate limiting is applied per IP and per address at the route layer.
+ */
+export async function resendVerification(email: string): Promise<ServiceResponse<void>> {
+  const normalizedEmail = (email ?? '').trim().toLowerCase();
+  const startedAt = Date.now();
+
+  try {
+    if (normalizedEmail) {
+      const { data: userRow } = await supabase
+        .from('users')
+        .select('id, email_verified')
+        .eq('email', normalizedEmail)
+        .single();
+
+      const user = userRow as { id: string; email_verified: boolean } | null;
+
+      if (user && !user.email_verified) {
+        const rawToken = crypto.randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + VERIFICATION_TOKEN_EXPIRES_MINUTES * 60 * 1000);
+
+        await supabase
+          .from('users')
+          .update({
+            email_verification_token: hashToken(rawToken),
+            email_verification_expires_at: expiresAt.toISOString(),
+          })
+          .eq('id', user.id);
+
+        await emailService.sendVerificationEmail({ to: normalizedEmail, token: rawToken });
+
+        await auditLogger.log({
+          actorId: user.id,
+          action: 'auth.email_verify_resend',
+          resourceType: 'auth',
+          resourceId: user.id,
+          success: true,
+        });
+      }
+    }
+  } catch (err) {
+    // Swallow and log: a failure must not change the public response.
+    console.error('[auth] Verification resend failed:', err);
+  }
+
+  await padToMinimumDuration(startedAt, PASSWORD_RESET_MIN_RESPONSE_MS);
 
   return { success: true };
 }

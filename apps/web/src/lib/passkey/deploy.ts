@@ -1,47 +1,28 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { getNetworkConfig } from '@/lib/stellar';
+import { PasskeyUnsupportedError } from './status';
 
 /**
- * Deploy a Stellar smart wallet contract
+ * Deploy a passkey-controlled smart wallet.
+ *
+ * Not implemented. The previous placeholder built a memo-only transaction, signed
+ * it with a random keypair and submitted it to the network, which could report a
+ * "deployed" wallet that does not exist. This rejects before any network call.
  */
 export async function deployStellarSmartWallet(
-  keypair: StellarSdk.Keypair,
-  network: 'testnet' | 'mainnet' = 'testnet'
+  _keypair: StellarSdk.Keypair,
+  _network: 'testnet' | 'mainnet' = 'testnet',
 ): Promise<string> {
-  const config = getNetworkConfig(network);
-  const server = new StellarSdk.Horizon.Server(config.horizonUrl);
-
-  try {
-    // Get account details
-    const account = await server.loadAccount(keypair.publicKey());
-
-    // Create a transaction to deploy the wallet
-    // This is a placeholder - actual deployment depends on your contract
-    const transaction = new StellarSdk.TransactionBuilder(account, {
-      fee: StellarSdk.BASE_FEE,
-      networkPassphrase: config.passphrase,
-    })
-      .addMemo(StellarSdk.Memo.text('Rentars Smart Wallet'))
-      .build();
-
-    // Sign the transaction
-    transaction.sign(keypair);
-
-    // Submit to network
-    const result = await server.submitTransaction(transaction);
-    return result.hash;
-  } catch (error) {
-    throw new Error(`Failed to deploy smart wallet: ${error}`);
-  }
+  throw new PasskeyUnsupportedError('wallet deployment');
 }
 
 /**
- * Get smart wallet details
+ * Read-only account lookup used by the wallet UI. Unaffected by the passkey gap.
  */
 export async function getSmartWalletDetails(
   publicKey: string,
-  network: 'testnet' | 'mainnet' = 'testnet'
-): Promise<any> {
+  network: 'testnet' | 'mainnet' = 'testnet',
+): Promise<{ publicKey: string; balance: unknown; sequenceNumber: string }> {
   const config = getNetworkConfig(network);
   const server = new StellarSdk.Horizon.Server(config.horizonUrl);
 

@@ -4,6 +4,7 @@ import { createContext, useContext, useState, useCallback, ReactNode } from 'rea
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { deriveKeyFromPasskey } from '@/lib/passkey/stellar';
 import { deployStellarSmartWallet } from '@/lib/passkey/deploy';
+import { PASSKEY_WALLET_SUPPORTED, PasskeyUnsupportedError } from '@/lib/passkey/status';
 
 interface StellarContextType {
   keypair: StellarSdk.Keypair | null;
@@ -16,6 +17,8 @@ interface StellarContextType {
   loadingDeployee: boolean;
   loadingRegister: boolean;
   loadingSign: boolean;
+  /** False until a supported passkey provider exists. Callers must offer a fallback. */
+  passkeySupported: boolean;
 }
 
 const StellarContext = createContext<StellarContextType | undefined>(undefined);
@@ -37,15 +40,20 @@ export function StellarProvider({
     async (registrationResponse: any) => {
       setLoadingRegister(true);
       try {
-        // Derive keypair from passkey registration response
-        const credentialId = registrationResponse.id;
+        // Fails closed: no keypair or wallet is created until a supported provider exists.
+        const credentialId: string = registrationResponse?.id ?? '';
         const derivedKeypair = await deriveKeyFromPasskey(credentialId);
         setKeypair(derivedKeypair);
 
-        // Deploy smart wallet
         setLoadingDeployee(true);
         const deploymentId = await deployStellarSmartWallet(derivedKeypair, network);
         setDeployee(deploymentId);
+      } catch (err) {
+        // Never keep a partially initialised identity after a failure.
+        setKeypair(null);
+        setDeployee(null);
+        if (err instanceof PasskeyUnsupportedError) throw err;
+        throw new PasskeyUnsupportedError('registration');
       } finally {
         setLoadingRegister(false);
         setLoadingDeployee(false);
@@ -55,25 +63,18 @@ export function StellarProvider({
   );
 
   const prepareSign = useCallback(async (): Promise<string> => {
-    if (!keypair) throw new Error('Keypair not initialized');
-    // Return a placeholder transaction XDR
-    return 'placeholder_xdr';
-  }, [keypair]);
+    // No placeholder XDR: a transaction can only be prepared once passkey signing exists.
+    throw new PasskeyUnsupportedError('transaction preparation');
+  }, []);
 
-  const onSign = useCallback(
-    async (signParams: any): Promise<string> => {
-      setLoadingSign(true);
-      try {
-        if (!keypair) throw new Error('Keypair not initialized');
-        // Sign the transaction
-        const signature = keypair.sign(Buffer.from(signParams.data || ''));
-        return signature.toString('base64');
-      } finally {
-        setLoadingSign(false);
-      }
-    },
-    [keypair]
-  );
+  const onSign = useCallback(async (_signParams: any): Promise<string> => {
+    setLoadingSign(true);
+    try {
+      throw new PasskeyUnsupportedError('transaction signing');
+    } finally {
+      setLoadingSign(false);
+    }
+  }, []);
 
   return (
     <StellarContext.Provider
@@ -88,6 +89,7 @@ export function StellarProvider({
         loadingDeployee,
         loadingRegister,
         loadingSign,
+        passkeySupported: PASSKEY_WALLET_SUPPORTED,
       }}
     >
       {children}

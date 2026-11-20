@@ -30,6 +30,9 @@ export const registerSchema = z.object({
     .min(1, 'name must not be empty')
     .max(100, 'name must be at most 100 characters')
     .trim(),
+
+  // Read by captchaMiddleware after validation; without it the token is stripped.
+  captchaToken: z.string().optional(),
 });
 
 // ─── Login schema ─────────────────────────────────────────────────────────────
@@ -44,6 +47,9 @@ export const loginSchema = z.object({
   password: z
     .string({ required_error: 'password is required' })
     .min(1, 'password is required'),
+
+  // Read by captchaMiddleware after validation; without it the token is stripped.
+  captchaToken: z.string().optional(),
 });
 
 // ─── Password reset schemas ───────────────────────────────────────────────────
@@ -54,6 +60,8 @@ export const requestPasswordResetSchema = z.object({
     .email('email must be a valid email address')
     .toLowerCase()
     .trim(),
+  // Read by captchaMiddleware after validation; without it the token is stripped.
+  captchaToken: z.string().optional(),
 });
 
 export const confirmPasswordResetSchema = z.object({
@@ -74,6 +82,14 @@ export const verifyEmailSchema = z.object({
   token: z.string({ required_error: 'token is required' }).min(1, 'token is required'),
 });
 
+export const resendVerificationSchema = z.object({
+  email: z
+    .string({ required_error: 'email is required' })
+    .email('email must be a valid email address')
+    .toLowerCase()
+    .trim(),
+});
+
 // ─── Wallet Challenge schema ──────────────────────────────────────────────────
 
 export const walletChallengeSchema = z.object({
@@ -88,6 +104,19 @@ export const walletChallengeSchema = z.object({
 // ─── Wallet Verify schema ─────────────────────────────────────────────────────
 
 export const walletVerifySchema = z.object({
+  address: z
+    .string({ required_error: 'address is required' })
+    .refine(
+      (addr) => StrKey.isValidEd25519PublicKey(addr),
+      'address must be a valid Stellar public key',
+    ),
+  challenge: z.string({ required_error: 'challenge is required' }),
+  signature: z.string({ required_error: 'signature is required' }),
+});
+
+// ─── Wallet link / unlink schemas ─────────────────────────────────────────────
+
+export const walletUnlinkSchema = z.object({
   address: z
     .string({ required_error: 'address is required' })
     .refine(

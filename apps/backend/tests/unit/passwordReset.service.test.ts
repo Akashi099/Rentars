@@ -22,17 +22,29 @@ const mockSupabase = {
   })),
 };
 
-const supabaseMod = await import('../../src/config/supabase.js');
-(supabaseMod as any).supabase = mockSupabase;
+// Module-level replacement via mock.module: assigning onto an imported ESM namespace throws in Bun 1.1.38.
+mock.module('../../src/config/supabase.js', () => ({ supabase: mockSupabase }));
 
 // ── Email mock ────────────────────────────────────────────────────────────────
 
 const mockSendPasswordResetEmail = mock(async () => {});
-const emailMod = await import('../../src/services/email.service.js');
-(emailMod as any).emailService = { sendPasswordResetEmail: mockSendPasswordResetEmail };
+mock.module('../../src/services/email.service.js', () => ({
+  emailService: { sendPasswordResetEmail: mockSendPasswordResetEmail },
+}));
 
-import { requestPasswordReset, confirmPasswordReset } from '../../src/services/auth.service.js';
-import { AuthError } from '../../src/types/errors.js';
+// Session revocation and refresh tokens are Redis-backed; stub them so this spec stays unit-level.
+mock.module('../../src/services/sessionRevocation.service.js', () => ({
+  markUserSessionsRevoked: async () => {},
+}));
+mock.module('../../src/services/refreshToken.service.js', () => ({
+  issueRefreshToken: async () => 'refresh',
+  consumeRefreshToken: async () => null,
+  revokeRefreshToken: async () => {},
+  revokeAllUserRefreshTokens: async () => {},
+}));
+
+const { requestPasswordReset, confirmPasswordReset } = await import('../../src/services/auth.service.js');
+const { AuthError } = await import('../../src/types/errors.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -66,10 +78,13 @@ describe('requestPasswordReset', () => {
       error: null,
     }));
 
+    // Account lookup is an indexed users-table query, not an auth listing.
     mockSupabase.from = mock((_: string) => ({
+      select: mock(() => ({
+        eq: mock(() => ({ maybeSingle: mock(async () => ({ data: { id: VALID_USER_ID }, error: null })) })),
+      })),
       insert: mock(async () => ({ data: {}, error: null })),
-      select: mockFromSelect,
-      update: mockFromUpdate,
+      update: mock(() => ({ eq: mock(() => ({ is: mock(async () => ({ data: null, error: null })) })) })),
     })) as any;
 
     await requestPasswordReset(VALID_EMAIL);
@@ -175,8 +190,13 @@ describe('confirmPasswordReset', () => {
   });
 
   it('updates the password and marks token consumed on valid token', async () => {
-    const mockUpdateEq = mock(async () => ({}));
-    const mockUpdateChain = mock(() => ({ eq: mockUpdateEq }));
+    // Conditional claim: id, unconsumed and unexpired must all match before the password changes.
+    const mockClaimSelect = mock(async () => ({ data: [{ id: 't1' }], error: null }));
+    const mockUpdateChain = mock(() => ({
+      eq: mock(() => ({
+        is: mock(() => ({ gt: mock(() => ({ select: mockClaimSelect })) })),
+      })),
+    }));
 
     mockSupabase.from = mock((_: string) => ({
       select: mock(() => ({
@@ -195,6 +215,7 @@ describe('confirmPasswordReset', () => {
     const result = await confirmPasswordReset('validtoken', 'NewPass1!');
     expect(result.success).toBe(true);
     expect(mockUpdateUserById).toHaveBeenCalledWith(VALID_USER_ID, { password: 'NewPass1!' });
+    expect(mockClaimSelect).toHaveBeenCalled();
   });
 
   it('throws when both token and password are missing', async () => {

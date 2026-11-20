@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — 2026-11-20
+
+#### #911 — Account email verification end to end
+- New `POST /api/v1/auth/verify-email/resend`. It returns the same response for every address, is rate limited per IP and per address, and replaces the stored token so only the newest link works.
+- Confirming an already-verified account returns success instead of an error.
+- `/verify-email` page shows verified, expired, invalid, missing and error states, offers a resend form, and removes the token from the address bar and history.
+
+#### #912 — Password recovery from request to reset
+- `/forgot-password` shows one neutral outcome for every address and sends the captcha token when captcha is enabled.
+- `/reset-password` reads the token only from the `token` parameter, removes it from history, and applies the same password policy as registration.
+- Captcha tokens survive request validation, so login, register and reset requests are no longer rejected when captcha is enabled.
+
+#### #913 — Passkey placeholders fail closed
+- Passkey key derivation, signature verification and wallet deployment reject with `PASSKEY_UNSUPPORTED` before generating keys, signing or submitting anything.
+- `useStellar` no longer returns a placeholder transaction. It exposes `passkeySupported: false`.
+- See `docs/passkey-wallet-decision.md` for the supported model that must be chosen first.
+
+#### #914 — Wallet linking and recovery policy
+- Wallet challenges are bound to a purpose (login, link, unlink), a user, the network and an expiry, and are single use.
+- Wallet sign-in resolves the same account record as email sign-in. The routed service no longer creates a separate identity.
+- New authenticated `POST /api/v1/auth/wallet/link(/challenge)` and `POST /api/v1/auth/wallet/unlink(/challenge)` endpoints require a fresh signed challenge.
+- An address belongs to at most one account (partial unique index, migration `00071`). Unlinking is refused when it would remove the only verified sign-in method.
+- Link and unlink changes are written to the audit log.
+
 ### Security — 2026-10-19
 
 #### #740 — Recovery and verification token hardening

@@ -1,14 +1,23 @@
 import { Router } from 'express';
-import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler } from '@/controllers/auth.controller.js';
-import { walletChallenge, walletVerify } from '@/controllers/wallet.controller.js';
+import { login, register, requestReset, confirmReset, refreshAccessToken, logout, logoutAllDevices, verifyEmailHandler, resendVerificationHandler } from '@/controllers/auth.controller.js';
+import {
+  walletChallenge,
+  walletVerify,
+  walletLinkChallenge,
+  walletLink,
+  walletUnlinkChallenge,
+  walletUnlink,
+} from '@/controllers/wallet.controller.js';
 import {
   loginSchema,
   registerSchema,
   requestPasswordResetSchema,
   confirmPasswordResetSchema,
   verifyEmailSchema,
+  resendVerificationSchema,
   walletChallengeSchema,
   walletVerifySchema,
+  walletUnlinkSchema,
   validateBody,
 } from '@/validators/auth.validator.js';
 import { createAuthRouteLimiter, emailFromBody, stellarAddressFromBody } from '@/middleware/authRateLimit.middleware.js';
@@ -25,8 +34,11 @@ const refreshLimiter = createAuthRouteLimiter({ name: 'refresh' });
 const passwordResetRequestLimiter = createAuthRouteLimiter({ name: 'password-reset-request', accountKey: emailFromBody });
 const passwordResetConfirmLimiter = createAuthRouteLimiter({ name: 'password-reset-confirm' });
 const verifyEmailLimiter = createAuthRouteLimiter({ name: 'verify-email' });
+const verifyEmailResendLimiter = createAuthRouteLimiter({ name: 'verify-email-resend', accountKey: emailFromBody });
 const walletChallengeLimiter = createAuthRouteLimiter({ name: 'wallet-challenge', accountKey: stellarAddressFromBody });
 const walletVerifyLimiter = createAuthRouteLimiter({ name: 'wallet-verify', accountKey: stellarAddressFromBody });
+const walletLinkLimiter = createAuthRouteLimiter({ name: 'wallet-link', accountKey: stellarAddressFromBody });
+const walletUnlinkLimiter = createAuthRouteLimiter({ name: 'wallet-unlink' });
 
 // POST /api/v1/auth/register — CAPTCHA required
 router.post('/register', registerLimiter, validateBody(registerSchema), captchaMiddleware, register);
@@ -46,6 +58,9 @@ router.post('/logout-all-devices', authenticate, logoutAllDevices);
 // POST /api/v1/auth/verify-email — confirm email address with token
 router.post('/verify-email', verifyEmailLimiter, validateBody(verifyEmailSchema), verifyEmailHandler);
 
+// POST /api/v1/auth/verify-email/resend — rate limited per IP and per address; enumeration-safe
+router.post('/verify-email/resend', verifyEmailResendLimiter, validateBody(resendVerificationSchema), resendVerificationHandler);
+
 // POST /api/v1/auth/password-reset/request — CAPTCHA required
 router.post('/password-reset/request', passwordResetRequestLimiter, validateBody(requestPasswordResetSchema), captchaMiddleware, requestReset);
 
@@ -54,5 +69,11 @@ router.post('/password-reset/confirm', passwordResetConfirmLimiter, validateBody
 
 router.post('/wallet/challenge', walletChallengeLimiter, validateBody(walletChallengeSchema), walletChallenge);
 router.post('/wallet/verify', walletVerifyLimiter, validateBody(walletVerifySchema), walletVerify);
+
+// Linking and unlinking require an authenticated session plus a fresh signed challenge.
+router.post('/wallet/link/challenge', authenticate, walletLinkLimiter, validateBody(walletChallengeSchema), walletLinkChallenge);
+router.post('/wallet/link', authenticate, walletLinkLimiter, validateBody(walletVerifySchema), walletLink);
+router.post('/wallet/unlink/challenge', authenticate, walletUnlinkLimiter, walletUnlinkChallenge);
+router.post('/wallet/unlink', authenticate, walletUnlinkLimiter, validateBody(walletUnlinkSchema), walletUnlink);
 
 export default router;

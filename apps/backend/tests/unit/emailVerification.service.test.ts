@@ -18,17 +18,19 @@ const mockSupabase = {
   })),
 };
 
-const supabaseMod = await import('../../src/config/supabase.js');
-(supabaseMod as any).supabase = mockSupabase;
+// Module-level replacement via mock.module: assigning onto an imported ESM
+// namespace throws in Bun 1.1.38.
+mock.module('../../src/config/supabase.js', () => ({ supabase: mockSupabase }));
 
 // ── Email mock ────────────────────────────────────────────────────────────────
 
 const mockSendVerificationEmail = mock(async () => {});
-const emailMod = await import('../../src/services/email.service.js');
-(emailMod as any).emailService = { sendVerificationEmail: mockSendVerificationEmail };
+mock.module('../../src/services/email.service.js', () => ({
+  emailService: { sendVerificationEmail: mockSendVerificationEmail },
+}));
 
-import { verifyEmail, resendVerification } from '../../src/services/auth.service.js';
-import { AuthError } from '../../src/types/errors.js';
+const { verifyEmail, resendVerification } = await import('../../src/services/auth.service.js');
+const { AuthError } = await import('../../src/types/errors.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -41,7 +43,11 @@ describe('verifyEmail', () => {
   });
 
   it('marks account as verified for a valid token', async () => {
-    const mockUpdateEq = mock(async () => ({}));
+    const mockUpdateEq = mock(() => ({
+      eq: mock(() => ({
+        eq: mock(() => ({ select: mock(async () => ({ data: [{ id: 'u1' }], error: null })) })),
+      })),
+    }));
     mockSupabase.from = mock((_: string) => ({
       select: mock(() => ({
         eq: mock(() => ({
@@ -51,6 +57,7 @@ describe('verifyEmail', () => {
           })),
         })),
       })),
+      // Conditional claim: id, stored token hash and unverified state must all still match.
       update: mock(() => ({ eq: mockUpdateEq })),
     })) as any;
 

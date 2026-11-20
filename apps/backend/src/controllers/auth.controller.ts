@@ -8,6 +8,7 @@ import {
   requestPasswordReset,
   confirmPasswordReset,
   verifyEmail,
+  resendVerification,
 } from '@/services/auth.service.js';
 import { consumeRefreshToken, revokeRefreshToken, revokeAllUserRefreshTokens } from '@/services/refreshToken.service.js';
 import { securityLogger } from '@/services/logging.service.js';
@@ -80,6 +81,17 @@ export async function verifyEmailHandler(req: Request, res: Response): Promise<v
     }
     throw err;
   }
+}
+
+/**
+ * POST /api/v1/auth/verify-email/resend
+ * Public, enumeration-safe: the response is identical whether or not the
+ * address belongs to an unverified account.
+ */
+export async function resendVerificationHandler(req: Request, res: Response): Promise<void> {
+  const { email } = req.body;
+  await resendVerification(email);
+  res.json({ message: 'If an unverified account exists for that address, a new verification link has been sent.' });
 }
 
 export async function requestReset(req: Request, res: Response): Promise<void> {
