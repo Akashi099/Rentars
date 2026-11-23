@@ -151,6 +151,489 @@ export interface TransitionResult {
   replayed: boolean;
 }
 
+// ─── Escrow operation state machine (issues #949 / #993) ─────────────────────
+
+/**
+ * Escrow operation kinds. Each kind is a distinct external side-effect and
+ * therefore has its own idempotency domain.
+ */
+export type EscrowOperationKind = 'create' | 'release' | 'refund';
+
+/**
+ * Escrow operation lifecycle:
+ *
+ *   ┌───────────┐  persist fingerprint + key, then submit
+ *   │  pending  │──────────────────────────────────────────────┐
+ *   └─────┬─────┘                                              │
+ *         │ provider accepted                                  │ timeout / unknown
+ *         ▼                                                    ▼
+ *   ┌───────────┐                                     ┌──────────────┐
+ *   │ submitted │                                     │  ambiguous   │
+ *   └─────┬─────┘                                     └──────┬───────┘
+ *         │ confirmed / failed                               │ reconcile
+ *         ▼                                                  │ (query provider)
+ *   ┌───────────┐   ┌────────┐                               │
+ *   │ confirmed │   │ failed │◄──────────────────────────────┘
+ *   └───────────┘   └────────┘
+ *
+ * Rules:
+ *  - The request fingerprint and operation key are persisted BEFORE the
+ *    provider is called, so a crash/retry can never create a second escrow.
+ *  - `ambiguous` operations block further submissions until reconciled by
+ *    querying provider state.
+ *  - Retries are bounded and only permitted for safe transient failures.
+ */
+export type EscrowOperationStatus =
+  | 'pending'
+  | 'submitted'
+  | 'confirmed'
+  | 'failed'
+  | 'ambiguous';
+
+/** Maximum number of submission attempts for a single operation key. */
+export const MAX_ESCROW_OPERATION_ATTEMPTS = 3;
+
+export interface EscrowOperation {
+  id: string;
+  /** Durable, caller-supplied idempotency key (unique per booking+kind). */
+  operation_key: string;
+  booking_id: string;
+  payment_id: string | null;
+  kind: EscrowOperationKind;
+  status: EscrowOperationStatus;
+  /** SHA-256 fingerprint of the request payload (amount, parties, etc.). */
+  request_fingerprint: string;
+  /** Provider-side reference (escrow id / tx hash) once known. */
+  provider_reference: string | null;
+  attempts: number;
+  /** Correlation id propagated from the originating request. */
+  correlation_id: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EscrowOperationContext {
+  /** Originating request correlation id (from correlation middleware). */
+  correlationId?: string;
+  bookingId: string;
+  paymentId?: string;
+  /** Stable idempotency key; defaults to a deterministic booking+kind key. */
+  operationKey?: string;
+}
+
+export interface BeginEscrowOperationParams extends EscrowOperationContext {
+  kind: EscrowOperationKind;
+  /** Request payload used to compute the fingerprint (never logged raw). */
+  request: Record<string, unknown>;
+}
+
+export interface EscrowOperationResult {
+  operation: EscrowOperation;
+  /** True when an existing operation was reused (idempotent replay). */
+  replayed: boolean;
+  /** True when the operation is ambiguous and must be reconciled first. */
+  requiresReconciliation: boolean;
+}
+
+// ─── Logging / redaction helpers ─────────────────────────────────────────────
+
+const REDACTED = '[REDACTED]';
+
+/** Keys whose values must never appear in logs. */
+const SENSITIVE_KEY_PATTERN =
+  /(authorization|auth|token|secret|private[_-]?key|seed|mnemonic|password|signature|xdr|signed[_-]?payload|payment[_-]?payload)/i;
+
+/**
+ * Recursively redact sensitive values (auth headers, wallet secrets, signed
+ * XDR / full payment payloads) from an object before logging.
+ */
+export function redactForLog(value: unknown, depth = 0): unknown {
+  if (depth > 6) return REDACTED;
+  if (Array.isArray(value)) return value.map((v) => redactForLog(v, depth + 1));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SENSITIVE_KEY_PATTERN.test(k) ? REDACTED : redactForLog(v, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Emit a structured, redacted log line carrying the correlation context so an
+ * operator can trace one booking request through backend and worker events.
+ */
+function logEscrowEvent(
+  event: string,
+  ctx: { correlationId?: string | null; bookingId?: string | null; operationId?: string | null },
+  fields: Record<string, unknown> = {},
+): void {
+  const line = {
+    scope: 'escrow_operation',
+    event,
+    correlation_id: ctx.correlationId ?? null,
+    booking_id: ctx.bookingId ?? null,
+    operation_id: ctx.operationId ?? null,
+    ...(redactForLog(fields) as Record<string, unknown>),
+  };
+  console.info(`[Escrow] ${JSON.stringify(line)}`);
+}
+
+/** Deterministic default operation key for a booking + kind. */
+export function defaultOperationKey(bookingId: string, kind: EscrowOperationKind): string {
+  return `escrow:${bookingId}:${kind}`;
+}
+
+/** Stable SHA-256 fingerprint of an escrow request payload. */
+export function fingerprintEscrowRequest(request: Record<string, unknown>): string {
+  return hashEventPayload(request);
+}
+
+// ─── Escrow operation persistence ────────────────────────────────────────────
+
+/**
+ * Persist (or reuse) an escrow operation BEFORE any provider call.
+ *
+ * Idempotency contract:
+ *  - The operation key is unique; a second call with the same key returns the
+ *    existing row instead of creating a new one.
+ *  - A different fingerprint under the same key is rejected as a conflict.
+ *  - If the existing operation is `ambiguous`, the caller must reconcile
+ *    before submitting again (`requiresReconciliation: true`).
+ */
+export async function beginEscrowOperation(
+  params: BeginEscrowOperationParams,
+): Promise<ServiceResponse<EscrowOperationResult>> {
+  const { kind, request, bookingId, paymentId, correlationId } = params;
+  const operationKey = params.operationKey ?? defaultOperationKey(bookingId, kind);
+  const fingerprint = fingerprintEscrowRequest(request);
+
+  const { data: existing } = await supabase
+    .from('escrow_operations')
+    .select()
+    .eq('operation_key', operationKey)
+    .maybeSingle();
+
+  if (existing) {
+    const op = rowToEscrowOperation(existing);
+    if (op.request_fingerprint !== fingerprint) {
+      logEscrowEvent('fingerprint_conflict', {
+        correlationId: correlationId ?? op.correlation_id,
+        bookingId,
+        operationId: op.id,
+      }, { kind, operationKey });
+      return {
+        success: false,
+        error: `Escrow operation ${operationKey} already exists with a different request fingerprint`,
+      };
+    }
+    const requiresReconciliation = op.status === 'ambiguous';
+    logEscrowEvent('operation_reused', {
+      correlationId: correlationId ?? op.correlation_id,
+      bookingId,
+      operationId: op.id,
+    }, { kind, status: op.status, attempts: op.attempts, requiresReconciliation });
+    return {
+      success: true,
+      data: { operation: op, replayed: true, requiresReconciliation },
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('escrow_operations')
+    .insert({
+      operation_key: operationKey,
+      booking_id: bookingId,
+      payment_id: paymentId ?? null,
+      kind,
+      status: 'pending',
+      request_fingerprint: fingerprint,
+      provider_reference: null,
+      attempts: 0,
+      correlation_id: correlationId ?? null,
+      last_error: null,
+    })
+    .select()
+    .single();
+
+  if (error || !data) {
+    // Unique-violation race: another process inserted first — reuse it.
+    if (error?.code === '23505') {
+      const { data: raced } = await supabase
+        .from('escrow_operations')
+        .select()
+        .eq('operation_key', operationKey)
+        .single();
+      if (raced) {
+        const op = rowToEscrowOperation(raced);
+        return {
+          success: true,
+          data: {
+            operation: op,
+            replayed: true,
+            requiresReconciliation: op.status === 'ambiguous',
+          },
+        };
+      }
+    }
+    return {
+      success: false,
+      error: `Failed to persist escrow operation: ${error?.message ?? 'unknown error'}`,
+    };
+  }
+
+  const op = rowToEscrowOperation(data);
+  logEscrowEvent('operation_created', {
+    correlationId: correlationId ?? null,
+    bookingId,
+    operationId: op.id,
+  }, { kind, operationKey });
+  return {
+    success: true,
+    data: { operation: op, replayed: false, requiresReconciliation: false },
+  };
+}
+
+/**
+ * Record that the operation was submitted to the provider. Increments the
+ * attempt counter and enforces the bounded-retry limit.
+ */
+export async function markEscrowOperationSubmitted(
+  operationId: string,
+  ctx: { correlationId?: string | null; bookingId?: string | null },
+): Promise<ServiceResponse<EscrowOperation>> {
+  const op = await getEscrowOperation(operationId);
+  if (!op) return { success: false, error: 'Escrow operation not found' };
+
+  if (op.status === 'ambiguous') {
+    return {
+      success: false,
+      error: `Escrow operation ${op.operation_key} is ambiguous; reconcile before retrying`,
+    };
+  }
+  if (op.status === 'confirmed') {
+    return { success: true, data: op };
+  }
+  if (op.attempts >= MAX_ESCROW_OPERATION_ATTEMPTS) {
+    logEscrowEvent('retry_exhausted', {
+      correlationId: ctx.correlationId ?? op.correlation_id,
+      bookingId: ctx.bookingId ?? op.booking_id,
+      operationId: op.id,
+    }, { attempts: op.attempts });
+    return {
+      success: false,
+      error: `Escrow operation ${op.operation_key} exceeded ${MAX_ESCROW_OPERATION_ATTEMPTS} attempts`,
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('escrow_operations')
+    .update({
+      status: 'submitted',
+      attempts: op.attempts + 1,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', operationId)
+    .eq('version' in op ? (op as unknown as { version: number }).version : 'id', operationId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    return { success: false, error: `Failed to mark escrow operation submitted: ${error?.message ?? 'unknown error'}` };
+  }
+
+  const updated = rowToEscrowOperation(data);
+  logEscrowEvent('operation_submitted', {
+    correlationId: ctx.correlationId ?? updated.correlation_id,
+    bookingId: ctx.bookingId ?? updated.booking_id,
+    operationId: updated.id,
+  }, { kind: updated.kind, attempts: updated.attempts });
+  return { success: true, data: updated };
+}
+
+/**
+ * Mark an operation ambiguous after a timeout or unknown provider outcome.
+ * Ambiguous operations block further submissions until reconciled.
+ */
+export async function markEscrowOperationAmbiguous(
+  operationId: string,
+  reason: string,
+  ctx: { correlationId?: string | null; bookingId?: string | null },
+): Promise<ServiceResponse<EscrowOperation>> {
+  const op = await getEscrowOperation(operationId);
+  if (!op) return { success: false, error: 'Escrow operation not found' };
+
+  const { data, error } = await supabase
+    .from('escrow_operations')
+    .update({
+      status: 'ambiguous',
+      last_error: reason,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', operationId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    return { success: false, error: `Failed to mark escrow operation ambiguous: ${error?.message ?? 'unknown error'}` };
+  }
+
+  const updated = rowToEscrowOperation(data);
+  logEscrowEvent('operation_ambiguous', {
+    correlationId: ctx.correlationId ?? updated.correlation_id,
+    bookingId: ctx.bookingId ?? updated.booking_id,
+    operationId: updated.id,
+  }, { kind: updated.kind, reason });
+  return { success: true, data: updated };
+}
+
+/**
+ * Reconcile an ambiguous operation by querying provider state. Only after a
+ * definitive provider answer is the operation moved to confirmed/failed.
+ */
+export async function reconcileEscrowOperation(
+  operationId: string,
+  providerStatus: string,
+  providerReference: string | null,
+  ctx: { correlationId?: string | null; bookingId?: string | null },
+): Promise<ServiceResponse<EscrowOperation>> {
+  const op = await getEscrowOperation(operationId);
+  if (!op) return { success: false, error: 'Escrow operation not found' };
+
+  const mapped = mapProviderStatus(providerStatus);
+  let nextStatus: EscrowOperationStatus;
+  if (mapped === 'confirmed') nextStatus = 'confirmed';
+  else if (mapped === 'failed') nextStatus = 'failed';
+  else {
+    // Still unknown — remain ambiguous, do not permit resubmission.
+    logEscrowEvent('reconcile_inconclusive', {
+      correlationId: ctx.correlationId ?? op.correlation_id,
+      bookingId: ctx.bookingId ?? op.booking_id,
+      operationId: op.id,
+    }, { providerStatus });
+    return { success: true, data: op };
+  }
+
+  const { data, error } = await supabase
+    .from('escrow_operations')
+    .update({
+      status: nextStatus,
+      provider_reference: providerReference ?? op.provider_reference,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', operationId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    return { success: false, error: `Failed to reconcile escrow operation: ${error?.message ?? 'unknown error'}` };
+  }
+
+  const updated = rowToEscrowOperation(data);
+  logEscrowEvent('operation_reconciled', {
+    correlationId: ctx.correlationId ?? updated.correlation_id,
+    bookingId: ctx.bookingId ?? updated.booking_id,
+    operationId: updated.id,
+  }, { kind: updated.kind, status: updated.status, providerReference });
+  return { success: true, data: updated };
+}
+
+/**
+ * Finalize an operation with a definitive provider outcome (confirmed/failed).
+ */
+export async function completeEscrowOperation(
+  operationId: string,
+  outcome: 'confirmed' | 'failed',
+  providerReference: string | null,
+  ctx: { correlationId?: string | null; bookingId?: string | null },
+): Promise<ServiceResponse<EscrowOperation>> {
+  const op = await getEscrowOperation(operationId);
+  if (!op) return { success: false, error: 'Escrow operation not found' };
+
+  // Idempotent: already terminal with same outcome → replay.
+  if (op.status === outcome) {
+    return { success: true, data: op };
+  }
+  if (op.status === 'confirmed' && outcome === 'failed') {
+    return { success: false, error: `Escrow operation ${op.operation_key} already confirmed` };
+  }
+
+  const { data, error } = await supabase
+    .from('escrow_operations')
+    .update({
+      status: outcome,
+      provider_reference: providerReference ?? op.provider_reference,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', operationId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    return { success: false, error: `Failed to complete escrow operation: ${error?.message ?? 'unknown error'}` };
+  }
+
+  const updated = rowToEscrowOperation(data);
+  logEscrowEvent('operation_completed', {
+    correlationId: ctx.correlationId ?? updated.correlation_id,
+    bookingId: ctx.bookingId ?? updated.booking_id,
+    operationId: updated.id,
+  }, { kind: updated.kind, status: updated.status, providerReference });
+  return { success: true, data: updated };
+}
+
+/** Load an escrow operation by id. */
+export async function getEscrowOperation(operationId: string): Promise<EscrowOperation | null> {
+  const { data } = await supabase
+    .from('escrow_operations')
+    .select()
+    .eq('id', operationId)
+    .single();
+  return data ? rowToEscrowOperation(data) : null;
+}
+
+/** Load an escrow operation by its durable operation key. */
+export async function getEscrowOperationByKey(operationKey: string): Promise<EscrowOperation | null> {
+  const { data } = await supabase
+    .from('escrow_operations')
+    .select()
+    .eq('operation_key', operationKey)
+    .maybeSingle();
+  return data ? rowToEscrowOperation(data) : null;
+}
+
+/**
+ * Guard used by callers before submitting to the provider: returns true only
+ * when the operation may safely be (re)submitted.
+ */
+export function canSubmitEscrowOperation(op: EscrowOperation): boolean {
+  if (op.status === 'ambiguous') return false;
+  if (op.status === 'confirmed') return false;
+  if (op.status === 'failed') return false;
+  return op.attempts < MAX_ESCROW_OPERATION_ATTEMPTS;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
+function rowToEscrowOperation(row: any): EscrowOperation {
+  return {
+    id:                  row.id,
+    operation_key:       row.operation_key,
+    booking_id:          row.booking_id,
+    payment_id:          row.payment_id ?? null,
+    kind:                row.kind as EscrowOperationKind,
+    status:              row.status as EscrowOperationStatus,
+    request_fingerprint: row.request_fingerprint,
+    provider_reference:  row.provider_reference ?? null,
+    attempts:            row.attempts ?? 0,
+    correlation_id:      row.correlation_id ?? null,
+    last_error:          row.last_error ?? null,
+    created_at:          row.created_at,
+    updated_at:          row.updated_at,
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -278,12 +761,7 @@ export async function createPaymentIntent(
     meta: {
       bookingId,
       amountStroops: amountStroops.toString(),
-      originalAmountMinor: originalAmountMinor?.toString(),
-      originalCurrency,
-      convertedAmountStroops: convertedAmountStroops?.toString(),
-      rateSource,
-      rateTimestamp,
-      roundingMode,
+      correlationId: (metadata?.correlationId as string | undefined) ?? null,
     },
   });
 
@@ -396,11 +874,11 @@ export async function transitionPaymentStatus(
     },
   });
 
-  // Alert on quarantine
+  // Alert on quarantine (redact payload — may contain signed XDR / secrets)
   if (targetStatus === 'under_review') {
     console.error(
       `[Payment] QUARANTINE paymentId=${paymentId} reason="${quarantineReason}" payload=%j`,
-      eventPayload,
+      redactForLog(eventPayload),
     );
   }
 
