@@ -24,13 +24,52 @@ const CONFIRMATION_TIMEOUT_MS = 120_000; // 2 minutes max wait (was 60 s)
 const INITIAL_POLL_INTERVAL_MS = 2_000;
 const MAX_POLL_INTERVAL_MS = 15_000;
 
+export type StellarNetwork = 'testnet' | 'mainnet';
+
+interface NetworkConfig {
+  network: StellarNetwork;
+  passphrase: string;
+  horizonUrl: string;
+}
+
+/**
+ * Centralized network configuration. The active network is resolved from the
+ * environment exactly once per call so that wallet, backend and Horizon all
+ * agree on the same passphrase and endpoint.
+ */
+export function getNetworkConfig(): NetworkConfig {
+  const raw = (process.env.STELLAR_NETWORK ?? 'testnet').toLowerCase();
+  if (raw !== 'testnet' && raw !== 'mainnet') {
+    throw new Error(`Unsupported STELLAR_NETWORK: ${raw}`);
+  }
+  const network = raw as StellarNetwork;
+  return {
+    network,
+    passphrase: network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET,
+    horizonUrl:
+      network === 'mainnet'
+        ? 'https://horizon.stellar.org'
+        : 'https://horizon-testnet.stellar.org',
+  };
+}
+
 function getHorizonServer(): Horizon.Server {
-  const network = process.env.STELLAR_NETWORK ?? 'testnet';
-  const url =
-    network === 'mainnet'
-      ? 'https://horizon.stellar.org'
-      : 'https://horizon-testnet.stellar.org';
-  return new Horizon.Server(url);
+  return new Horizon.Server(getNetworkConfig().horizonUrl);
+}
+
+/**
+ * Ensure the network the wallet signed for matches the backend's active
+ * network. Throws on mismatch so a wrong-network transaction can never be
+ * submitted or accepted for a booking.
+ */
+export function assertNetworkMatches(walletNetwork?: string): StellarNetwork {
+  const { network } = getNetworkConfig();
+  if (walletNetwork && walletNetwork.toLowerCase() !== network) {
+    throw new Error(
+      `Network mismatch: wallet is on ${walletNetwork} but backend is on ${network}`,
+    );
+  }
+  return network;
 }
 
 /**
@@ -42,8 +81,7 @@ export function validateSignedPaymentTransaction(
   signedXdr: string,
   expectedAmountStroops: bigint,
 ): void {
-  const network = process.env.STELLAR_NETWORK ?? 'testnet';
-  const passphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+  const { passphrase } = getNetworkConfig();
   const issuer = process.env.STELLAR_USDC_ISSUER;
   if (!issuer) throw new Error('STELLAR_USDC_ISSUER is not configured');
 
@@ -66,22 +104,28 @@ export function validateSignedPaymentTransaction(
 
 export interface SubmitResult {
   txHash: string;
+  network: StellarNetwork;
 }
 
 /**
  * Submit a signed transaction XDR to Stellar Horizon.
- * Returns the transaction hash on success. Throws on failure.
+ * Returns the transaction hash and network on success. Throws on failure.
+ *
+ * The transaction is parsed with the backend's active passphrase, so a
+ * transaction signed for a different network fails to decode and is rejected
+ * before any broadcast happens.
  */
-export async function submitTransaction(signedXdr: string): Promise<SubmitResult> {
-  const server = getHorizonServer();
-  const passphrase =
-    (process.env.STELLAR_NETWORK ?? 'testnet') === 'mainnet'
-      ? 'Public Global Stellar Network ; September 2015'
-      : 'Test SDF Network ; September 2015';
+export async function submitTransaction(
+  signedXdr: string,
+  walletNetwork?: string,
+): Promise<SubmitResult> {
+  const { network, passphrase } = getNetworkConfig();
+  assertNetworkMatches(walletNetwork);
 
+  const server = getHorizonServer();
   const tx = new Transaction(signedXdr, passphrase);
   const response = await server.submitTransaction(tx);
-  return { txHash: response.hash };
+  return { txHash: response.hash, network };
 }
 
 /**
@@ -90,16 +134,17 @@ export async function submitTransaction(signedXdr: string): Promise<SubmitResult
  *
  * Status semantics:
  *   - 'confirmed'  — tx is on-ledger and successful; payment updated once.
+ *   - 'failed'     — tx is on-ledger but unsuccessful; final failure.
  *   - 'timed_out'  — deadline exceeded while tx was still not found; this is
  *                    NOT a final failure — reconciliation may still resolve it.
  *   - throws       — on a non-404 Horizon error (marks payment as 'failed').
  *
- * @returns 'confirmed' | 'timed_out'
+ * @returns 'confirmed' | 'failed' | 'timed_out'
  */
 export async function confirmTransaction(
   paymentId: string,
   txHash: string,
-): Promise<'confirmed' | 'timed_out'> {
+): Promise<'confirmed' | 'failed' | 'timed_out'> {
   const server = getHorizonServer();
   const deadline = Date.now() + CONFIRMATION_TIMEOUT_MS;
   let interval = INITIAL_POLL_INTERVAL_MS;
@@ -111,9 +156,9 @@ export async function confirmTransaction(
         await updatePaymentStatus(paymentId, txHash, 'confirmed');
         return 'confirmed';
       }
-      // On-chain but unsuccessful (fee bump failed, etc.)
+      // On-chain but unsuccessful (fee bump failed, etc.) — final failure.
       await updatePaymentStatus(paymentId, txHash, 'failed');
-      return 'timed_out';
+      return 'failed';
     } catch (err: unknown) {
       const isNotFound =
         err instanceof Error &&
@@ -141,11 +186,21 @@ export async function confirmTransaction(
  * Retry a failed or timed-out payment.
  * Double-spend protection: if a txHash already exists, re-polls it instead
  * of submitting a new transaction.
+ *
+ * Ambiguous outcomes (timed_out) are handed to the reconciliation path rather
+ * than encouraging a blind re-broadcast: a payment that was already submitted
+ * is only ever re-polled, never re-signed and re-submitted.
  */
 export async function retryTransaction(
   paymentId: string,
   signedXdr?: string,
-): Promise<{ txHash: string; status: 'confirmed' | 'timed_out' }> {
+  walletNetwork?: string,
+): Promise<{
+  txHash: string;
+  network: StellarNetwork;
+  status: 'confirmed' | 'failed' | 'timed_out';
+  reconciliationRequired: boolean;
+}> {
   const payment = await getPaymentStatus(paymentId);
   if (!payment) throw new Error('Payment not found');
 
@@ -153,19 +208,28 @@ export async function retryTransaction(
     throw new Error(`Cannot retry payment in status: ${payment.status}`);
   }
 
+  const { network } = getNetworkConfig();
+  assertNetworkMatches(walletNetwork);
+
   let txHash: string;
 
   if (payment.stellar_tx_hash) {
-    // Already submitted — re-poll to avoid double-spend
+    // Already submitted — re-poll to avoid double-spend. Never re-broadcast.
     txHash = payment.stellar_tx_hash;
   } else {
     if (!signedXdr) throw new Error('signedXdr required for payments that were never submitted');
     validateSignedPaymentTransaction(signedXdr, payment.amount_stroops);
-    const result = await submitTransaction(signedXdr);
+    const result = await submitTransaction(signedXdr, walletNetwork);
     txHash = result.txHash;
     await updatePaymentStatus(paymentId, txHash, 'submitted');
   }
 
   const status = await confirmTransaction(paymentId, txHash);
-  return { txHash, status };
+  return {
+    txHash,
+    network,
+    status,
+    // Ambiguous outcomes must go through reconciliation, not blind retries.
+    reconciliationRequired: status === 'timed_out',
+  };
 }

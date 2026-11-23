@@ -12,6 +12,7 @@
  */
 
 import { supabase } from '@/config/supabase.js';
+import { RESERVING_BOOKING_STATUSES } from './booking.service.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -90,11 +91,13 @@ export async function getOccupancyHeatmap(
   }
 
   // ── Fetch bookings that overlap [from, to] ──────────────────────────────
+  // Only statuses that actually reserve inventory (Pending, Confirmed) are
+  // shown as booked; Expired/Cancelled holds release their dates.
   const { data: bookings, error: bErr } = await supabase
     .from('bookings')
     .select('check_in, check_out, status')
     .eq('property_id', propertyId)
-    .not('status', 'eq', 'Cancelled')
+    .in('status', RESERVING_BOOKING_STATUSES)
     .lt('check_in', to)       // starts before the window ends
     .gt('check_out', from);   // ends after the window starts
 

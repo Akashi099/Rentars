@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useRef } from 'react';
 import { ErrorContent } from '@/components/error/ErrorContent';
+import { useI18n } from '@/lib/i18n/I18nProvider';
 
 interface DashboardErrorProps {
   error: Error & { digest?: string };
@@ -9,31 +10,18 @@ interface DashboardErrorProps {
 }
 
 export default function DashboardError({ error, reset }: DashboardErrorProps) {
-  const headingId = useId();
-  const liveRegionRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (liveRegionRef.current) {
-      liveRegionRef.current.textContent = `Error loading dashboard: ${error.message}`;
-    }
-  }, [error]);
+  const { t } = useI18n();
 
   return (
-    <section aria-labelledby={headingId} role="region">
-      <div
-        ref={liveRegionRef}
-        role="alert"
-        aria-live="assertive"
-        aria-atomic="true"
-        className="sr-only"
-      />
-      <ErrorContent
-        error={error}
-        reset={reset}
-        context="dashboard-error"
-        headingId={headingId}
-        retryLabel="Retry loading dashboard"
-      />
-    </section>
+    <ErrorContent
+      error={error}
+      reset={reset}
+      context="dashboard-error"
+      title={t('errors.dashboard.title')}
+      description={t('errors.dashboard.description')}
+      retryLabel={t('errors.actions.retry')}
+      homeLabel={t('errors.actions.backToHome')}
+      retryAriaLabel={t('errors.actions.retryAriaLabel')}
+    />
   );
 }

@@ -17,6 +17,82 @@ export interface TraceContext {
   baggage?: Record<string, string>;
 }
 
+/**
+ * Correlation identifiers propagated through trace baggage.
+ *
+ * These are nonsecret identifiers used to correlate a user-visible failure
+ * with backend and worker events. They must never contain auth headers,
+ * wallet secrets, or payment payloads.
+ */
+export interface CorrelationIds {
+  correlationId?: string;
+  bookingId?: string;
+  operationId?: string;
+}
+
+export const CORRELATION_BAGGAGE_KEYS = {
+  correlationId: 'correlation_id',
+  bookingId: 'booking_id',
+  operationId: 'operation_id',
+} as const;
+
+const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * Redact/validate a user-supplied correlation value before it is placed in
+ * baggage or logs. Values that do not match the safe identifier pattern are
+ * dropped rather than logged.
+ */
+export function sanitizeCorrelationValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (!CORRELATION_ID_PATTERN.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+export function getCorrelationIds(context?: TraceContext): CorrelationIds {
+  const ctx = context ?? getTraceContext();
+  const baggage = ctx?.baggage ?? {};
+  return {
+    correlationId: baggage[CORRELATION_BAGGAGE_KEYS.correlationId],
+    bookingId: baggage[CORRELATION_BAGGAGE_KEYS.bookingId],
+    operationId: baggage[CORRELATION_BAGGAGE_KEYS.operationId],
+  };
+}
+
+export function setCorrelationIds(ids: CorrelationIds, context?: TraceContext): TraceContext | undefined {
+  const ctx = context ?? getTraceContext();
+  if (!ctx) return undefined;
+
+  const baggage: Record<string, string> = { ...(ctx.baggage ?? {}) };
+
+  const correlationId = sanitizeCorrelationValue(ids.correlationId);
+  const bookingId = sanitizeCorrelationValue(ids.bookingId);
+  const operationId = sanitizeCorrelationValue(ids.operationId);
+
+  if (correlationId) baggage[CORRELATION_BAGGAGE_KEYS.correlationId] = correlationId;
+  if (bookingId) baggage[CORRELATION_BAGGAGE_KEYS.bookingId] = bookingId;
+  if (operationId) baggage[CORRELATION_BAGGAGE_KEYS.operationId] = operationId;
+
+  ctx.baggage = Object.keys(baggage).length > 0 ? baggage : undefined;
+  return ctx;
+}
+
+/**
+ * Build a TraceContext that carries correlation IDs, suitable for persisting
+ * on deferred work (queue records, idempotency records) and restoring in
+ * workers.
+ */
+export function buildCorrelationTraceContext(
+  ids: CorrelationIds,
+  parentContext?: TraceContext,
+): TraceContext {
+  const context = createTraceContext(parentContext, true);
+  setCorrelationIds(ids, context);
+  return context;
+}
+
 export interface Span {
   traceId: string;
   spanId: string;
@@ -106,9 +182,13 @@ export function extractTraceContext(headers: Record<string, string | string[] | 
 export function injectTraceContext(context: TraceContext, headers: Record<string, string>): void {
   headers['traceparent'] = `00-${context.traceId}-${context.spanId}-${context.sampled ? '01' : '00'}`;
   if (context.baggage && Object.keys(context.baggage).length > 0) {
-    headers['tracestate'] = Object.entries(context.baggage)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(',');
+    const pairs: string[] = [];
+    for (const [k, v] of Object.entries(context.baggage)) {
+      const safeKey = sanitizeCorrelationValue(k);
+      const safeValue = sanitizeCorrelationValue(v);
+      if (safeKey && safeValue) pairs.push(`${safeKey}=${safeValue}`);
+    }
+    if (pairs.length > 0) headers['tracestate'] = pairs.join(',');
   }
 }
 
@@ -122,7 +202,10 @@ function parseTracestate(tracestate?: string): Record<string, string> | undefine
   const result: Record<string, string> = {};
   for (const pair of tracestate.split(',')) {
     const [k, v] = pair.split('=', 2);
-    if (k && v) result[k.trim()] = v.trim();
+    if (!k || !v) continue;
+    const safeKey = sanitizeCorrelationValue(k);
+    const safeValue = sanitizeCorrelationValue(v);
+    if (safeKey && safeValue) result[safeKey] = safeValue;
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -232,6 +315,11 @@ function sanitizeAttributes(attrs: Record<string, unknown>): Record<string, unkn
     'stellar_secret',
     'private_key',
     'mnemonic',
+    'wallet_secret',
+    'payment_payload',
+    'card_number',
+    'cvv',
+    'x-api-key',
   ];
 
   const result: Record<string, unknown> = {};

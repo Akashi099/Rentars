@@ -1,5 +1,6 @@
 'use client';
 
+import { useI18n } from '@/lib/i18n';
 import { ErrorContent } from '@/components/error/ErrorContent';
 import { AsyncStateAnnouncer } from '@/components/state/AsyncStateAnnouncer';
 
@@ -9,18 +10,17 @@ interface PropertyErrorProps {
 }
 
 export default function PropertyError({ error, reset }: PropertyErrorProps) {
+  const { t } = useI18n();
+
   return (
-    <>
-      <AsyncStateAnnouncer
-        status="error"
-        message="There was a problem loading this property. You can try again."
-      />
-      <ErrorContent
-        error={error}
-        reset={reset}
-        context="property-error"
-        retryLabel="Try again"
-      />
-    </>
+    <ErrorContent
+      error={error}
+      reset={reset}
+      context="property-error"
+      title={t('errors.property.title')}
+      description={t('errors.property.description')}
+      retryLabel={t('errors.retry')}
+      retryAriaLabel={t('errors.retryAriaLabel')}
+    />
   );
 }

@@ -18,7 +18,7 @@ and what it protects against.
 | `bun run test:e2e` | `tests/integration/booking-e2e.test.ts` | Legacy booking lifecycle (mocked) |
 | `bun run test:rls` | `tests/rls/**` | Row Level Security (live Supabase) |
 | `bun run test:integration` | `tests/integration/**` | All integration tests |
-| `bun test --coverage` | `src/**`, `tests/**` | Full suite with coverage report |
+| `bun run test:coverage` | `src/**`, `tests/**` | Full suite with coverage report |
 
 All tests use **Bun** as the runtime (`bun test`). No Node.js or Jest binary is required.
 
@@ -313,13 +313,14 @@ sequential execution.
 
 ## Coverage
 
-The coverage threshold (enforced in `jest.config.js` for reference, and applied
-by `bun test --coverage`) requires **80 %** on branches, functions, lines, and
-statements across `src/**`.
+Coverage is collected and enforced by Bun (`bun test --coverage`), configured
+via the `coverageThreshold` / `coverageReporter` settings in `bunfig.toml`. The
+threshold requires **80 %** on branches, functions, lines, and statements across
+`src/**`. There is no Jest configuration involved.
 
 ```bash
 cd apps/backend
-bun test --coverage
+bun run test:coverage
 ```
 
 An LCOV report is written to `./coverage/` and can be uploaded to Codecov or
@@ -340,3 +341,4 @@ When adding a new endpoint:
    ```bash
    bun run test:contract && bun run test:property-based && bun run test:concurrency && bun run test:journey && bun run test:unit
    ```
+   Use `bun run test:coverage` to additionally check the coverage threshold.

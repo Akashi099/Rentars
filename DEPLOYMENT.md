@@ -12,13 +12,46 @@ Rentars is composed of three deployment layers:
 
 This guide assumes you have a working local repo clone and the following prerequisites installed:
 
-- `bun`
-- `node` / `npm`
+- `bun` (backend runtime and package manager — see `apps/backend/package.json`)
+- `node` (frontend tooling; the web workspace uses `yarn` — see `apps/web/package.json`)
 - `rustup` + `cargo`
 - `wasm32-unknown-unknown` Rust target
 - `stellar-cli`
 - A Supabase project or PostgreSQL database
 - A Redis instance or managed Redis provider
+
+### 1.1 Verified commands and ports (source of truth)
+
+The commands below are the ones actually defined in the workspace. If a command
+in this guide disagrees with a `package.json`, the `package.json` wins — please
+open an issue.
+
+| Area | Command | Where it is defined |
+|---|---|---|
+| Backend install | `bun install --frozen-lockfile` | `apps/backend/package.json` |
+| Backend dev server | `bun run dev` | `apps/backend/package.json` |
+| Backend tests | `bun test` | `apps/backend/package.json` |
+| Backend contract tests | `bun run test:contract` | `apps/backend/package.json` |
+| Migration validation | `bun run validate:migrations` | `apps/backend/package.json` |
+| Web install | `yarn install --frozen-lockfile` | `apps/web/package.json` |
+| Web dev server | `yarn dev` | `apps/web/package.json` |
+| Web build | `yarn build` | `apps/web/package.json` |
+| Web tests | `yarn test` | `apps/web/package.json` |
+| Contract build | `cargo build --target wasm32-unknown-unknown --release` | `apps/contracts/Cargo.toml` |
+
+**Ports**
+
+| Service | Local | Production |
+|---|---|---|
+| Backend API | `3000` (`PORT=3000`) | `3000` behind TLS-terminating proxy |
+| Frontend (Next.js) | `3001` (`next dev -p 3001`) | Vercel-managed (HTTPS 443) |
+| Redis | `6379` | provider-managed |
+| PostgreSQL / Supabase | `5432` (or Supabase pooler) | provider-managed |
+
+Locally the frontend must point at the backend on port `3000`, e.g.
+`NEXT_PUBLIC_API_URL=http://localhost:3000`. In production the frontend is
+served from Vercel and calls the backend over HTTPS; the backend port is not
+exposed directly to browsers.
 
 ---
 
@@ -48,12 +81,12 @@ node --version && bun --version && rustc --version
 bash scripts/check-engines.sh
 
 # 2. Environment files parse and required keys are present (values are NOT printed)
-node -e "const r=require('./apps/backend/.env.example');"  # placeholder check only
 grep -q '^SUPABASE_URL=' apps/backend/.env || echo "MISSING: SUPABASE_URL"
 grep -q '^JWT_SECRET='  apps/backend/.env || echo "MISSING: JWT_SECRET"
 
 # 3. Database is reachable and migrations are current
 psql "$DATABASE_URL" -c '\q' && echo "DB reachable"
+cd apps/backend && bun run validate:migrations && cd ../..
 
 # 4. Redis is reachable
 redis-cli -u "$REDIS_URL" ping
@@ -62,9 +95,13 @@ redis-cli -u "$REDIS_URL" ping
 ls apps/contracts/target/wasm32-unknown-unknown/release/*.wasm
 
 # 6. Dependency trees install cleanly from lockfiles
-cd apps/backend && bun install --frozen-lockfile
-cd ../web && yarn install --frozen-lockfile
+cd apps/backend && bun install --frozen-lockfile && cd ../..
+cd apps/web && yarn install --frozen-lockfile && cd ../..
 ```
+
+Expected output: each step prints no `MISSING:` lines, `DB reachable`,
+`validate:migrations` exits `0`, the `ls` lists three `.wasm` files, and both
+installs finish without lockfile errors.
 
 Never paste secret values into tickets, chat, or logs. Record only the key name
 and whether it is present.
@@ -128,23 +165,29 @@ cd apps/contracts
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-The generated WASM files will be in:
+Expected output: `Finished release [optimized] target(s)` and the following WASM
+files present under `apps/contracts/target/wasm32-unknown-unknown/release/`:
 
-- `apps/contracts/target/wasm32-unknown-unknown/release/property-listing.wasm`
-- `apps/contracts/target/wasm32-unknown-unknown/release/booking.wasm`
-- `apps/contracts/target/wasm32-unknown-unknown/release/review-contract.wasm`
+- `property-listing.wasm`
+- `booking.wasm`
+- `review-contract.wasm`
+
+Verify with `ls apps/contracts/target/wasm32-unknown-unknown/release/*.wasm`.
 
 ### 3.3 Deploy testnet contracts
 
-Deploy each contract to the Stellar testnet using `stellar contract deploy`:
+Run from `apps/contracts` (the directory containing `target/`). Deploy each
+contract to the Stellar testnet using `stellar contract deploy`:
 
 ```bash
+cd apps/contracts
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/property-listing.wasm --source "$TESTNET_ADMIN_ADDRESS" --network testnet
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/booking.wasm --source "$TESTNET_ADMIN_ADDRESS" --network testnet
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/review-contract.wasm --source "$TESTNET_ADMIN_ADDRESS" --network testnet
 ```
 
-Save the contract IDs returned by each command.
+Expected output: each command prints a contract ID (a `C...` address). Save all
+three IDs; they are required in section 3.5.
 
 ### 3.4 Initialize the booking contract
 
@@ -182,7 +225,9 @@ If the frontend needs any contract metadata or network endpoints, ensure it is c
 
 ### 4.1 Required backend environment variables
 
-Use `apps/backend/.env.example` as a template and populate the following values:
+Use `apps/backend/.env.example` for local development and
+`apps/backend/.env.production.example` as the template for staging and
+production. Populate the following values:
 
 - `PORT` — backend port, typically `3000`
 - `NODE_ENV` — `production`
@@ -208,7 +253,19 @@ applied in the canonical order defined in
 [`apps/backend/database/MIGRATIONS_NAMING.md`](apps/backend/database/MIGRATIONS_NAMING.md)
 and listed in `setup.sql`. **Do not apply individual migration files by hand** —
 always run the canonical entrypoint so ordering, duplicate-prefix handling, and
-idempotency rules are preserved:
+idempotency rules are preserved.
+
+Validate the migration set before applying it:
+
+```bash
+cd apps/backend
+bun run validate:migrations
+```
+
+Expected output: the validator exits `0` and reports no ordering, duplicate
+prefix, or naming violations. A non-zero exit must be fixed before proceeding.
+
+Then apply the canonical entrypoint:
 
 ```bash
 cd apps/backend/database
@@ -216,6 +273,7 @@ cd apps/backend/database
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f setup.sql
 ```
 
+Expected output: `psql` completes with exit code `0` and no `ERROR:` lines.
 `-v ON_ERROR_STOP=1` makes `psql` abort on the first SQL error, matching the CI
 pipeline (`.github/workflows/ci.yml`, job `rls-tests`). This is the only supported
 migration path for staging and production.
@@ -236,13 +294,16 @@ For production, use a Redis provider and set `REDIS_URL` to the provider’s sec
 
 ### 4.4 Backend startup commands
 
-Local development:
+Local development (backend listens on `PORT=3000`):
 
 ```bash
 cd apps/backend
-yarn install
+bun install --frozen-lockfile
 bun run dev
 ```
+
+Expected output: the server logs that it is listening on port `3000`, and
+`curl -sf http://localhost:3000/health` returns `{"status":"ok",...}`.
 
 Docker-based startup:
 
@@ -250,7 +311,9 @@ Docker-based startup:
 docker compose -f docker-compose.yml up --build
 ```
 
-Production deployment should use your preferred container or VM tooling, ensuring environment variables and health checks are configured.
+Production deployment should use your preferred container or VM tooling, ensuring environment variables and health checks are configured. The backend
+container listens on `3000`; terminate TLS at your proxy/load balancer and do not
+publish the container port directly to the internet.
 
 ---
 
@@ -263,15 +326,19 @@ Deploy `apps/web` as a Next.js application.
 In Vercel:
 
 - Set the root directory to `apps/web`
-- Select `yarn install` or `npm install` as build step if needed
+- Install command: `yarn install --frozen-lockfile`
 - Build command: `yarn build`
 - Output directory: `.next`
 
+Locally the frontend runs on port `3001` (`yarn dev`); in Vercel it is served
+over HTTPS on the default domain port.
+
 ### 5.2 Frontend environment variables
 
-Configure the following Vercel environment variables for production or preview:
+Use `apps/web/.env.example` as the template. Configure the following Vercel
+environment variables for production or preview:
 
-- `NEXT_PUBLIC_API_URL` — backend API endpoint (e.g. `https://api.rentars.app`)
+- `NEXT_PUBLIC_API_URL` — backend API endpoint (e.g. `https://api.rentars.app`; locally `http://localhost:3000`)
 - `NEXT_PUBLIC_STELLAR_NETWORK` — `testnet` or `mainnet`
 - `NEXT_PUBLIC_HORIZON_URL` — `https://horizon-testnet.stellar.org` or `https://horizon.stellar.org`
 - `NEXT_PUBLIC_SOROBAN_RPC_URL` — `https://soroban-testnet.stellar.org` or `https://soroban-mainnet.stellar.org`
@@ -293,6 +360,18 @@ After deployment, verify:
 ---
 
 ## 6. Mainnet Deployment Checklist
+
+> **⚠️ REQUIRES APPROVAL — GATED STEP**
+>
+> Mainnet deployment is **not** part of routine staging/testnet work. Do not
+> execute any command in this section until you have:
+>
+> 1. A written approval from the engineering lead **and** the product lead.
+> 2. A completed, signed-off testnet run using the section 2.2 verification.
+> 3. Confirmation that the section 6.2 security review is closed.
+>
+> Record the approval reference (ticket ID) next to the release before
+> proceeding. Unapproved mainnet actions are a rollback trigger.
 
 Before switching from testnet to mainnet, complete this checklist:
 
@@ -790,7 +869,48 @@ Set alerts for health gates:
 
 ## 9. Validation Steps
 
-To confirm deployments are production-ready, verify:
+### 9.1 Step-by-step verification checklist
+
+Run these in order and record the observed output. A step is only "verified"
+when the expected output is observed.
+
+| # | Step | Command | Expected output |
+|---|---|---|---|
+| 1 | Toolchain | `bash scripts/check-engines.sh` | exit `0`, versions match pins |
+| 2 | Backend install | `cd apps/backend && bun install --frozen-lockfile` | exit `0`, no lockfile errors |
+| 3 | Web install | `cd apps/web && yarn install --frozen-lockfile` | exit `0`, no lockfile errors |
+| 4 | Migration validation | `cd apps/backend && bun run validate:migrations` | exit `0`, no violations |
+| 5 | Migrations applied | `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f apps/backend/database/setup.sql` | exit `0`, no `ERROR:` |
+| 6 | Backend tests | `cd apps/backend && bun test` | all tests pass |
+| 7 | Contract tests | `cd apps/backend && bun run test:contract` | all tests pass |
+| 8 | Web tests | `cd apps/web && yarn test` | all tests pass |
+| 9 | Contract build | `cd apps/contracts && cargo build --target wasm32-unknown-unknown --release` | three `.wasm` files present |
+| 10 | Backend health | `curl -sf "$BACKEND_URL/health"` | `status: ok` |
+| 11 | Deep health | `curl -sf "$BACKEND_URL/health/deep"` | all dependencies `connected` |
+| 12 | Auth guard | `curl -s -o /dev/null -w '%{http_code}' "$BACKEND_URL/api/v1/bookings"` | `401` |
+| 13 | Frontend | `curl -sfI "$FRONTEND_URL"` | `HTTP/2 200` |
+
+### 9.2 Capability status
+
+The table below distinguishes code-complete capabilities from those verified in
+a deployed environment. Do not describe an item as production-ready until it has
+been verified in staging/testnet and recorded here.
+
+| Capability | Status | Notes |
+|---|---|---|
+| Backend API + tests | Code-complete | Verified locally and in CI |
+| Database migrations (`setup.sql`) | Code-complete | Verified locally and in CI (`rls-tests`) |
+| Frontend build + tests | Code-complete | Verified locally and in CI |
+| Soroban contract build | Code-complete | Verified locally |
+| Testnet contract deploy | Deployment-verified | Requires funded testnet account |
+| Staging backend/frontend deploy | Deployment-verified | Follow section 2.2 |
+| Mainnet contract deploy | **Not verified — gated** | Requires approval (section 6) |
+| Mainnet backend/frontend | **Not verified — gated** | Requires approval (section 6) |
+| Rollback drill | Not verified | Must be completed before mainnet |
+
+### 9.3 Documentation acceptance
+
+To confirm this guide is accurate, verify:
 
 1. ✅ `DEPLOYMENT.md` documents testnet setup, backend deployment, frontend deployment, and mainnet checklist
 2. ✅ Release state machine (IDLE → DEPLOYING → CANARY → STABLE → ROLLED_BACK) defined
@@ -804,4 +924,7 @@ To confirm deployments are production-ready, verify:
 10. ✅ Rollback approval process requires 2 approvers for production
 11. ✅ No commands expose signing secrets in logs or CLI arguments
 
-If all checks are satisfied, deployment automation is production-ready.
+If all checks are satisfied, deployment automation is production-ready for
+staging/testnet. Mainnet remains gated behind the approval process in section 6
+until the capability status table in section 9.2 records it as
+deployment-verified.

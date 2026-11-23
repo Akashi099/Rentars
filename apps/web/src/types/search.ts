@@ -18,104 +18,53 @@ export interface PriceHistogramResult {
 }
 
 /**
- * Shared typed async-state model for data-driven hooks and pages.
- *
- * Distinguishes initial loading, refresh, empty results, and errors so that
- * components never present default or stale data as a confirmed success.
+ * A single search result rendered both on the map (as a pin) and in the
+ * accessible list fallback. The same `id` is used to synchronize selection
+ * state between the map pin and its equivalent list item.
  */
-
-/** Lifecycle status of an async data source. */
-export type AsyncStatus = 'idle' | 'loading' | 'success' | 'error';
-
-/** Metadata describing a recoverable failure and how to retry it. */
-export interface AsyncError {
-  /** Human-readable message safe to display to users. */
-  message: string;
-  /** Optional machine-readable error code (e.g. HTTP status or API code). */
-  code?: string;
-  /** Whether the failure can be retried by the user. */
-  recoverable: boolean;
-  /** Number of consecutive failed attempts so far. */
-  attempt: number;
-  /** Timestamp (ms since epoch) of the most recent failure. */
-  failedAt: number;
+export interface SearchResultItem {
+  /** Stable unique identifier for the listing; shared by map pin and list item. */
+  id: string;
+  /** Human-readable title used in labels and list entries. */
+  title: string;
+  /** Formatted price string (e.g. "$1,250,000") for display and announcements. */
+  price: string;
+  /** Optional formatted address for display and announcements. */
+  address?: string;
+  /** Optional number of bedrooms, included in essential details. */
+  bedrooms?: number;
+  /** Optional number of bathrooms, included in essential details. */
+  bathrooms?: number;
+  /** Optional formatted living area (e.g. "1,200 sq ft"). */
+  area?: string;
+  /** Latitude of the listing for map placement. */
+  latitude: number;
+  /** Longitude of the listing for map placement. */
+  longitude: number;
+  /** Optional URL to the property detail view. */
+  href?: string;
 }
 
-/** Initial loading state — no data has been fetched yet. */
-export interface AsyncIdleState {
-  status: 'idle';
-  data: undefined;
-  error: undefined;
-  /** True while a request is in flight. */
-  isLoading: false;
-  /** True during a background refresh that keeps previous data visible. */
-  isRefreshing: false;
-  /** True when the last successful response was empty. */
-  isEmpty: false;
-  /** True when displayed data comes from a previous successful response. */
-  isStale: false;
+/**
+ * Selection state shared between the map pins and the accessible list
+ * fallback so that both views stay in sync.
+ */
+export interface SearchResultSelection {
+  /** Id of the currently selected result, or null when nothing is selected. */
+  selectedId: string | null;
+  /** Id of the result whose detail view is currently open, or null. */
+  detailId: string | null;
 }
 
-/** Loading state — a request is in flight and no confirmed data exists yet. */
-export interface AsyncLoadingState<T> {
-  status: 'loading';
-  data: undefined;
-  error: undefined;
-  isLoading: true;
-  isRefreshing: false;
-  isEmpty: false;
-  isStale: false;
+/**
+ * Metadata describing the accessible list fallback for a set of search
+ * results. Guarantees every visible map result has an equivalent list entry.
+ */
+export interface SearchResultListFallback {
+  /** Ordered results rendered in the list; mirrors the visible map results. */
+  items: SearchResultItem[];
+  /** Current selection state, synchronized with the map. */
+  selection: SearchResultSelection;
+  /** Whether the map interaction is available; when false the list is the primary view. */
+  mapAvailable: boolean;
 }
-
-/** Success state — a confirmed response was received (possibly empty). */
-export interface AsyncSuccessState<T> {
-  status: 'success';
-  data: T;
-  error: undefined;
-  isLoading: false;
-  isRefreshing: false;
-  /** True when the confirmed response contains no results. */
-  isEmpty: boolean;
-  /** True when this data is being shown while a refresh is in flight. */
-  isStale: boolean;
-}
-
-/** Error state — the request failed; data may be stale or absent. */
-export interface AsyncErrorState<T> {
-  status: 'error';
-  /** Last confirmed data, if any (never presented as a fresh success). */
-  data: T | undefined;
-  error: AsyncError;
-  isLoading: false;
-  isRefreshing: false;
-  isEmpty: false;
-  /** True when `data` is from a previous successful response. */
-  isStale: boolean;
-}
-
-/** Discriminated union of all async states. */
-export type AsyncState<T> =
-  | AsyncIdleState
-  | AsyncLoadingState<T>
-  | AsyncSuccessState<T>
-  | AsyncErrorState<T>;
-
-/** Options for retrying a recoverable failure. */
-export interface AsyncRetryOptions {
-  /** Force a full reload instead of a background refresh. */
-  force?: boolean;
-}
-
-/** Retry control exposed by the reusable async-state hook. */
-export interface AsyncRetry {
-  /** Whether the current error (if any) can be retried. */
-  canRetry: boolean;
-  /** Trigger a retry of the failed request. */
-  retry: (options?: AsyncRetryOptions) => void;
-}
-
-/** Predicate used to decide whether a successful response is empty. */
-export type AsyncEmptyPredicate<T> = (data: T) => boolean;
-</｜｜DSML｜｜ parameter>
-</｜｜DSML｜｜ invoke>
-</｜｜DSML｜｜ calls>
