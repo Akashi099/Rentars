@@ -27,6 +27,42 @@ export function pinAccessibleName(
   return title.length > 0 ? title : PIN_FALLBACK_LABEL;
 }
 
+/**
+ * Compute the full accessible label for a property map pin, including useful
+ * listing context (price, bedrooms, location) without overloading the
+ * announcement. The title always leads so the pin is easy to identify.
+ *
+ * @example pinAccessibleLabel({ title: 'Beach House', price: 1200, ... })
+ *          // 'Beach House, $1,200 per month, 2 bedrooms, Miami'
+ */
+export function pinAccessibleLabel(
+  property: Partial<Property> & { title?: string | null },
+): string {
+  const parts: string[] = [pinAccessibleName(property)];
+
+  const price = (property as any).price;
+  if (typeof price === 'number' && Number.isFinite(price)) {
+    parts.push(`$${price.toLocaleString('en-US')} per month`);
+  }
+
+  const bedrooms = (property as any).bedrooms;
+  if (typeof bedrooms === 'number' && bedrooms > 0) {
+    parts.push(`${bedrooms} ${bedrooms === 1 ? 'bedroom' : 'bedrooms'}`);
+  }
+
+  const city = (property as any).city;
+  const location =
+    typeof city === 'string' && city.trim().length > 0
+      ? city.trim()
+      : typeof (property as any).address === 'string' &&
+          (property as any).address.trim().length > 0
+        ? (property as any).address.trim()
+        : '';
+  if (location) parts.push(location);
+
+  return parts.join(', ');
+}
+
 // Module-level so the DivIcon instance (and therefore the marker element) is
 // reused across renders instead of being rebuilt on every state change.
 const pinIcon = new L.DivIcon({
@@ -45,6 +81,11 @@ export interface PropertyMapPinProps {
   /** Fired when the pin is activated (click, Enter, or Space). */
   onSelect?: (source: 'pointer' | 'keyboard') => void;
   onClick?: () => void;
+  /**
+   * Called when the detail view (popup) closes, so the caller can restore
+   * focus predictably to the originating pin or list item.
+   */
+  onClose?: () => void;
 }
 
 /**
@@ -60,6 +101,7 @@ export default function PropertyMapPin({
   selected,
   onSelect,
   onClick,
+  onClose,
 }: PropertyMapPinProps) {
   const lat = (property as any).lat as number | undefined;
   const lng = (property as any).lng as number | undefined;
@@ -69,13 +111,14 @@ export default function PropertyMapPin({
     <AccessibleMarker
       position={[lat, lng]}
       icon={pinIcon}
-      label={pinAccessibleName(property)}
+      label={pinAccessibleLabel(property)}
       selected={selected}
       onSelect={onSelect}
+      onClose={onClose}
       eventHandlers={onClick ? { click: () => onClick() } : undefined}
     >
       {/* Click opens popup; also allow explicit callback */}
-      <PropertyMapPopup property={property} onClick={onClick} />
+      <PropertyMapPopup property={property} onClick={onClick} onClose={onClose} />
     </AccessibleMarker>
   );
 }
