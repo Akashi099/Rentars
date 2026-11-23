@@ -17,6 +17,19 @@
 
 import type { ListingFormData, ListingStep } from './types';
 
+/**
+ * Validation messages are i18n keys, not English text (#994). The form renders them
+ * with `t(key, params)`; `params` carries the interpolation values (limits, ranges)
+ * and plural counts. Keys live under `listing.validation.*` in every locale.
+ */
+export type ValidationMessage = { key: string; params?: Record<string, string | number> };
+
+/** A form error is either a plain i18n key or a key plus interpolation params. */
+export type FormError = string | ValidationMessage;
+
+const msg = (key: string, params?: Record<string, string | number>): ValidationMessage =>
+  params ? { key, params } : { key };
+
 // ── API-mirrored limits (keep in sync with property.validator.ts) ────────────
 
 export const TITLE_MIN = 3;
@@ -63,7 +76,7 @@ export const MIN_PRICE_PER_NIGHT = 10;
 export const MIN_AMENITIES = 1;
 export const MIN_PHOTOS = 1;
 
-export type FormErrors = Record<string, string>;
+export type FormErrors = Record<string, FormError>;
 
 /** Which step owns each field. Used to send the host back to the right step. */
 export const FIELD_STEP: Record<string, ListingStep> = {
@@ -104,97 +117,136 @@ const isWhole = (v: unknown): v is number => isFiniteNumber(v) && Number.isInteg
 const STEP_RULES: Record<ListingStep, (d: Partial<ListingFormData>, e: FormErrors) => void> = {
   basic(d, e) {
     const title = (d.title ?? '').trim();
-    if (title.length < TITLE_MIN) e.title = `Title must be at least ${TITLE_MIN} characters`;
-    else if (title.length > TITLE_MAX) e.title = `Title must be at most ${TITLE_MAX} characters`;
+    if (title.length < TITLE_MIN) {
+      e.title = msg('listing.validation.title.min', { count: TITLE_MIN });
+    } else if (title.length > TITLE_MAX) {
+      e.title = msg('listing.validation.title.max', { count: TITLE_MAX });
+    }
 
     const description = (d.description ?? '').trim();
     if (description.length < DESCRIPTION_MIN) {
-      e.description = `Description must be at least ${DESCRIPTION_MIN} characters`;
+      e.description = msg('listing.validation.description.min', { count: DESCRIPTION_MIN });
     } else if (description.length > DESCRIPTION_MAX) {
-      e.description = `Description must be at most ${DESCRIPTION_MAX} characters`;
+      e.description = msg('listing.validation.description.max', { count: DESCRIPTION_MAX });
     }
 
     if (!d.propertyType || !(PROPERTY_TYPES as readonly string[]).includes(d.propertyType)) {
-      e.propertyType = 'Choose a property type';
+      e.propertyType = 'listing.validation.propertyType.required';
     }
-    if (!isWhole(d.maxGuests) || d.maxGuests < 1) e.maxGuests = 'At least 1 guest is required';
-    if (!isWhole(d.bedrooms) || d.bedrooms < 0) e.bedrooms = 'Bedrooms must be 0 or more';
-    if (!isWhole(d.bathrooms) || d.bathrooms < 0) e.bathrooms = 'Bathrooms must be 0 or more';
+    if (!isWhole(d.maxGuests) || d.maxGuests < 1) {
+      e.maxGuests = msg('listing.validation.maxGuests.min', { count: 1 });
+    }
+    if (!isWhole(d.bedrooms) || d.bedrooms < 0) {
+      e.bedrooms = msg('listing.validation.bedrooms.min', { count: 0 });
+    }
+    if (!isWhole(d.bathrooms) || d.bathrooms < 0) {
+      e.bathrooms = msg('listing.validation.bathrooms.min', { count: 0 });
+    }
   },
 
   location(d, e) {
-    if ((d.address ?? '').trim().length < 5) e.address = 'Address is required';
+    if ((d.address ?? '').trim().length < 5) e.address = 'listing.validation.address.required';
     const city = (d.city ?? '').trim();
-    if (city.length < 1) e.city = 'City is required';
-    else if (city.length > CITY_MAX) e.city = `City must be at most ${CITY_MAX} characters`;
+    if (city.length < 1) e.city = 'listing.validation.city.required';
+    else if (city.length > CITY_MAX) {
+      e.city = msg('listing.validation.city.max', { count: CITY_MAX });
+    }
 
     const country = (d.country ?? '').trim();
-    if (country.length < 1) e.country = 'Country is required';
-    else if (country.length > COUNTRY_MAX)
-      e.country = `Country must be at most ${COUNTRY_MAX} characters`;
+    if (country.length < 1) e.country = 'listing.validation.country.required';
+    else if (country.length > COUNTRY_MAX) {
+      e.country = msg('listing.validation.country.max', { count: COUNTRY_MAX });
+    }
 
     if (!isFiniteNumber(d.latitude) || d.latitude < LAT_RANGE[0] || d.latitude > LAT_RANGE[1]) {
-      e.latitude = `Latitude must be between ${LAT_RANGE[0]} and ${LAT_RANGE[1]}`;
+      e.latitude = msg('listing.validation.latitude.range', {
+        min: LAT_RANGE[0],
+        max: LAT_RANGE[1],
+      });
     }
     if (!isFiniteNumber(d.longitude) || d.longitude < LNG_RANGE[0] || d.longitude > LNG_RANGE[1]) {
-      e.longitude = `Longitude must be between ${LNG_RANGE[0]} and ${LNG_RANGE[1]}`;
+      e.longitude = msg('listing.validation.longitude.range', {
+        min: LNG_RANGE[0],
+        max: LNG_RANGE[1],
+      });
     }
 
     // ZIP format is checked only for US addresses, because that is the only format the form knows.
     if (country.toUpperCase() === 'US' && !US_ZIP_PATTERN.test(d.zipCode ?? '')) {
-      e.zipCode = 'Invalid zip code';
+      e.zipCode = 'listing.validation.zipCode.invalid';
     }
   },
 
   amenities(d, e) {
     const selected = d.amenities ?? [];
-    if (selected.length < MIN_AMENITIES) e.amenities = 'Select at least one amenity';
-    else if (selected.some((a) => !AMENITY_IDS.has(a)))
-      e.amenities = 'Remove unsupported amenities';
+    if (selected.length < MIN_AMENITIES) {
+      e.amenities = msg('listing.validation.amenities.min', { count: MIN_AMENITIES });
+    } else if (selected.some((a) => !AMENITY_IDS.has(a))) {
+      e.amenities = 'listing.validation.amenities.unsupported';
+    }
   },
 
   photos(d, e) {
-    if ((d.images ?? []).length < MIN_PHOTOS) e.images = 'Upload at least one photo';
+    if ((d.images ?? []).length < MIN_PHOTOS) {
+      e.images = msg('listing.validation.images.min', { count: MIN_PHOTOS });
+    }
   },
 
   pricing(d, e) {
     if (!isFiniteNumber(d.pricePerNight) || d.pricePerNight < MIN_PRICE_PER_NIGHT) {
-      e.pricePerNight = `Price must be at least $${MIN_PRICE_PER_NIGHT}`;
+      // The amount is passed as a number so each locale formats its own currency.
+      e.pricePerNight = msg('listing.validation.pricePerNight.min', {
+        amount: MIN_PRICE_PER_NIGHT,
+      });
     }
-    if (!isFiniteNumber(d.cleaningFee) || d.cleaningFee < 0)
-      e.cleaningFee = 'Cleaning fee cannot be negative';
-    if (!isFiniteNumber(d.serviceFee) || d.serviceFee < 0)
-      e.serviceFee = 'Service fee cannot be negative';
+    if (!isFiniteNumber(d.cleaningFee) || d.cleaningFee < 0) {
+      e.cleaningFee = 'listing.validation.cleaningFee.negative';
+    }
+    if (!isFiniteNumber(d.serviceFee) || d.serviceFee < 0) {
+      e.serviceFee = 'listing.validation.serviceFee.negative';
+    }
 
     const minNights = d.minNights ?? 1;
-    if (!isWhole(minNights) || minNights < 1) e.minNights = 'Minimum stay must be at least 1 night';
+    if (!isWhole(minNights) || minNights < 1) {
+      e.minNights = msg('listing.validation.minNights.min', { count: 1 });
+    }
     if (d.maxNights !== null && d.maxNights !== undefined) {
       if (!isWhole(d.maxNights) || d.maxNights < minNights) {
-        e.maxNights = 'Maximum stay must be at least the minimum stay';
+        e.maxNights = 'listing.validation.maxNights.belowMin';
       }
     }
 
-    if (!TIME_PATTERN.test(d.checkInTime ?? '')) e.checkInTime = 'Check-in time must be HH:MM';
-    if (!TIME_PATTERN.test(d.checkOutTime ?? '')) e.checkOutTime = 'Check-out time must be HH:MM';
+    if (!TIME_PATTERN.test(d.checkInTime ?? '')) {
+      e.checkInTime = 'listing.validation.checkInTime.format';
+    }
+    if (!TIME_PATTERN.test(d.checkOutTime ?? '')) {
+      e.checkOutTime = 'listing.validation.checkOutTime.format';
+    }
   },
 
   rules(d, e) {
     if ((d.additionalRules ?? '').length > ADDITIONAL_RULES_MAX) {
-      e.additionalRules = `Additional rules must be under ${ADDITIONAL_RULES_MAX} characters`;
+      e.additionalRules = msg('listing.validation.additionalRules.max', {
+        count: ADDITIONAL_RULES_MAX,
+      });
     }
     const start = d.quietHoursStart ?? '';
     const end = d.quietHoursEnd ?? '';
     // Quiet hours are a pair: a start without an end, or the reverse, is not a rule.
-    if (start !== '' && !TIME_PATTERN.test(start)) e.quietHoursStart = 'Use HH:MM';
-    if (end !== '' && !TIME_PATTERN.test(end)) e.quietHoursEnd = 'Use HH:MM';
+    if (start !== '' && !TIME_PATTERN.test(start)) {
+      e.quietHoursStart = 'listing.validation.quietHours.format';
+    }
+    if (end !== '' && !TIME_PATTERN.test(end)) {
+      e.quietHoursEnd = 'listing.validation.quietHours.format';
+    }
     if ((start === '') !== (end === '')) {
       e[start === '' ? 'quietHoursStart' : 'quietHoursEnd'] =
-        'Set both quiet-hours times, or neither';
+        'listing.validation.quietHours.pair';
     }
   },
 
   review(d, e) {
-    if (d.agreeToTerms !== true) e.agreeToTerms = 'You must agree to terms';
+    if (d.agreeToTerms !== true) e.agreeToTerms = 'listing.validation.agreeToTerms.required';
   },
 };
 
@@ -279,9 +331,32 @@ export function apiErrorsToFormErrors(fields: Record<string, string[]>): {
   for (const [apiField, messages] of Object.entries(fields)) {
     const formField =
       API_FIELD_TO_FORM[apiField] ?? (apiField.startsWith('amenities') ? 'amenities' : apiField);
-    errors[formField] = messages[0] ?? 'Invalid value';
+    // Server messages are already localized by the API; provider error codes are not
+    // translated, so they are passed through unchanged.
+    errors[formField] = messages[0] ?? 'listing.validation.invalidValue';
     const step = FIELD_STEP[formField];
     if (step && firstInvalidStep === null) firstInvalidStep = step;
   }
   return { errors, firstInvalidStep };
+}
+
+/**
+ * Returns the first invalid field in the order the form renders it, so the form can
+ * move focus to that control and announce its error (#995). `fieldOrder` is the
+ * rendered order of the fields on the current step.
+ */
+export function firstInvalidField(
+  errors: FormErrors,
+  fieldOrder: readonly string[]
+): string | null {
+  for (const field of fieldOrder) {
+    if (errors[field] !== undefined) return field;
+  }
+  const remaining = Object.keys(errors);
+  return remaining.length > 0 ? remaining[0] : null;
+}
+
+/** Resolves a form error to its i18n key and interpolation params. */
+export function resolveFormError(error: FormError): ValidationMessage {
+  return typeof error === 'string' ? { key: error } : error;
 }

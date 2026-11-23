@@ -28,6 +28,53 @@ export interface CreateEscrowRequest {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Correlation context propagated to the provider and to logs. All values are
+ * non-secret identifiers; never include tokens, wallet secrets, or payment
+ * payloads here.
+ */
+export interface OperationContext {
+  /** Durable, per-booking operation key (idempotency key). */
+  operationKey: string;
+  /** Booking the operation belongs to. */
+  bookingId: string;
+  /** Request correlation ID originating from the API layer. */
+  requestId?: string;
+  /** Logical operation name, e.g. "escrow.create". */
+  operation?: string;
+}
+
+export interface CreateEscrowOptions {
+  context: OperationContext;
+}
+
+export interface ReleaseEscrowOptions {
+  context: OperationContext;
+}
+
+export interface RefundEscrowOptions {
+  context: OperationContext;
+}
+
+export interface RefundEscrowRequest {
+  escrowId: string;
+  reason: string;
+}
+
+/**
+ * Result of reconciling an ambiguous provider outcome after a timeout.
+ * `found` is false when the provider has no record of the operation, which
+ * means it is safe to retry with the same operation key.
+ */
+export interface EscrowReconciliationResult {
+  found: boolean;
+  escrowId?: string;
+  contractId?: string;
+  status?: EscrowStatus['status'];
+  /** True when the provider state shows the operation already took effect. */
+  applied: boolean;
+}
+
 export interface CreateEscrowResponse {
   escrowId: string;
   contractId: string;
@@ -71,14 +118,25 @@ export class TrustlessWorkClient {
     method: string,
     path: string,
     body?: unknown,
+    context?: OperationContext,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${this.apiKey}`,
+    };
+    if (context) {
+      // Idempotency + correlation headers. These are non-secret identifiers.
+      headers['Idempotency-Key'] = context.operationKey;
+      headers['X-Operation-Key'] = context.operationKey;
+      headers['X-Booking-Id'] = context.bookingId;
+      if (context.requestId) {
+        headers['X-Request-Id'] = context.requestId;
+      }
+    }
     const response = await fetch(url, {
       method,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
+      headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
@@ -105,8 +163,24 @@ export class TrustlessWorkClient {
    * @returns CreateEscrowResponse containing escrowId, contractId, and status
    * @throws EscrowError on non-2xx API responses
    */
-  async createEscrow(params: CreateEscrowRequest): Promise<CreateEscrowResponse> {
-    return this.request<CreateEscrowResponse>('POST', '/escrows', params);
+  async createEscrow(
+    params: CreateEscrowRequest,
+    options?: CreateEscrowOptions,
+  ): Promise<CreateEscrowResponse> {
+    const context = options?.context;
+    const body: CreateEscrowRequest = context
+      ? {
+          ...params,
+          metadata: {
+            ...(params.metadata ?? {}),
+            operationKey: context.operationKey,
+            bookingId: context.bookingId,
+            ...(context.requestId ? { requestId: context.requestId } : {}),
+            ...(context.operation ? { operation: context.operation } : {}),
+          },
+        }
+      : params;
+    return this.request<CreateEscrowResponse>('POST', '/escrows', body, context);
   }
 
   /**
@@ -129,9 +203,42 @@ export class TrustlessWorkClient {
    * @param reason - Human-readable reason for the release
    * @throws EscrowError on non-2xx API responses
    */
-  async releaseEscrow(escrowId: string, reason: string): Promise<void> {
+  async releaseEscrow(
+    escrowId: string,
+    reason: string,
+    options?: ReleaseEscrowOptions,
+  ): Promise<void> {
     const body: ReleaseEscrowRequest = { escrowId, reason };
-    await this.request<void>('POST', `/escrows/${escrowId}/release`, body);
+    await this.request<void>(
+      'POST',
+      `/escrows/${escrowId}/release`,
+      body,
+      options?.context,
+    );
+  }
+
+  /**
+   * Refund escrowed funds to the buyer (tenant). Idempotent when an operation
+   * context is supplied: the provider receives the same operation key on
+   * every retry.
+   *
+   * @param escrowId - ID of the escrow to refund
+   * @param reason - Human-readable reason for the refund
+   * @param options - Operation/correlation context
+   * @throws EscrowError on non-2xx API responses
+   */
+  async refundEscrow(
+    escrowId: string,
+    reason: string,
+    options?: RefundEscrowOptions,
+  ): Promise<void> {
+    const body: RefundEscrowRequest = { escrowId, reason };
+    await this.request<void>(
+      'POST',
+      `/escrows/${escrowId}/refund`,
+      body,
+      options?.context,
+    );
   }
 
   /**
@@ -151,8 +258,41 @@ export class TrustlessWorkClient {
    * @returns EscrowStatus with amounts, participants, and current state
    * @throws EscrowError on non-2xx API responses
    */
-  async getEscrowStatus(escrowId: string): Promise<EscrowStatus> {
-    return this.request<EscrowStatus>('GET', `/escrows/${escrowId}`);
+  async getEscrowStatus(
+    escrowId: string,
+    context?: OperationContext,
+  ): Promise<EscrowStatus> {
+    return this.request<EscrowStatus>('GET', `/escrows/${escrowId}`, undefined, context);
+  }
+
+  /**
+   * Reconcile an ambiguous outcome (e.g. a timeout after the provider may have
+   * accepted the request) by querying provider state. Callers must not retry a
+   * create/release/refund until this returns a definitive answer.
+   *
+   * @param escrowId - Provider escrow reference to look up
+   * @param context - Operation/correlation context for tracing
+   * @returns Reconciliation result describing whether the operation applied
+   * @throws EscrowError on non-2xx API responses
+   */
+  async reconcileEscrowOperation(
+    escrowId: string,
+    context?: OperationContext,
+  ): Promise<EscrowReconciliationResult> {
+    try {
+      const status = await this.getEscrowStatus(escrowId, context);
+      return {
+        found: true,
+        escrowId: status.escrowId,
+        status: status.status,
+        applied: status.status === 'released' || status.status === 'cancelled',
+      };
+    } catch (err) {
+      if (err instanceof EscrowError && err.statusCode === 404) {
+        return { found: false, applied: false };
+      }
+      throw err;
+    }
   }
 
   /**
@@ -163,21 +303,27 @@ export class TrustlessWorkClient {
    * @returns CreateEscrowResponse containing escrowId, contractId, and status
    * @throws EscrowError on non-2xx API responses
    */
-  async createBookingEscrow(params: BookingEscrowParams): Promise<CreateEscrowResponse> {
-    return this.createEscrow({
-      buyer: params.buyerAddress,
-      seller: params.sellerAddress,
-      amount: params.amountUsdc,
-      token: 'USDC',
-      title: `Booking ${params.bookingId} — Property ${params.propertyId}`,
-      description: `Rental escrow for check-in ${params.checkIn} to check-out ${params.checkOut}`,
-      metadata: {
-        bookingId: params.bookingId,
-        propertyId: params.propertyId,
-        checkIn: params.checkIn,
-        checkOut: params.checkOut,
+  async createBookingEscrow(
+    params: BookingEscrowParams,
+    options?: CreateEscrowOptions,
+  ): Promise<CreateEscrowResponse> {
+    return this.createEscrow(
+      {
+        buyer: params.buyerAddress,
+        seller: params.sellerAddress,
+        amount: params.amountUsdc,
+        token: 'USDC',
+        title: `Booking ${params.bookingId} — Property ${params.propertyId}`,
+        description: `Rental escrow for check-in ${params.checkIn} to check-out ${params.checkOut}`,
+        metadata: {
+          bookingId: params.bookingId,
+          propertyId: params.propertyId,
+          checkIn: params.checkIn,
+          checkOut: params.checkOut,
+        },
       },
-    });
+      options,
+    );
   }
 
   // ─── Soroban Escrow Integration ──────────────────────────────────────────────

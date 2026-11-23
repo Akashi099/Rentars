@@ -236,9 +236,75 @@ const PERMANENT_ERROR_PATTERNS = [
 type ErrorCategory = 'transient' | 'permanent' | 'ambiguous';
 
 export function classifyError(message: string): ErrorCategory {
-  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))
-    ? 'transient'
-    : 'permanent';
+  if (TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'transient';
+  if (PERMANENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'permanent';
+  // Unknown failure — we cannot tell whether the operation was accepted, so
+  // it must be treated as ambiguous and verified against provider state.
+  return 'ambiguous';
+}
+
+// ─── Correlation context ─────────────────────────────────────────────────────
+
+/**
+ * Correlation identifiers carried through the reconciliation worker.
+ *
+ * These are non-secret identifiers persisted on the operation/queue record so
+ * that a worker restart (or a retry after a crash) resumes the *same*
+ * operation key rather than minting a new one. They are attached to every log
+ * line and reconciliation outcome so an operator can trace a user-visible
+ * failure end-to-end.
+ */
+export interface CorrelationContext {
+  correlation_id: string;
+  booking_id: string;
+  operation_id: string;
+}
+
+/**
+ * Restore correlation context from a persisted operation/queue record.
+ *
+ * If the record already carries a correlation_id and operation_id we reuse
+ * them verbatim (worker restart / retry path). Only when they are missing do
+ * we mint new ones — and even then the operation_id is derived deterministically
+ * from the booking + escrow hash so a restart cannot create a second key.
+ */
+export function restoreCorrelationContext(record: {
+  correlation_id?: string | null;
+  operation_id?: string | null;
+  booking_id: string;
+  escrow_hash?: string | null;
+}): CorrelationContext {
+  const operationId =
+    record.operation_id ??
+    `escrow:${record.booking_id}:${record.escrow_hash ?? 'unknown'}`;
+  return {
+    correlation_id: record.correlation_id ?? randomUUID(),
+    booking_id: record.booking_id,
+    operation_id: operationId,
+  };
+}
+
+/**
+ * Emit a structured, correlation-tagged log line. Never include auth headers,
+ * wallet secrets, or full payment payloads — only non-secret identifiers.
+ */
+function logWithCorrelation(
+  ctx: CorrelationContext,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  extra: Record<string, unknown> = {},
+): void {
+  const line = JSON.stringify({
+    level,
+    message,
+    correlation_id: ctx.correlation_id,
+    booking_id: ctx.booking_id,
+    operation_id: ctx.operation_id,
+    ...extra,
+  });
+  if (level === 'error') console.error(line);
+  else if (level === 'warn') console.warn(line);
+  else console.log(line);
 }
 
 export function getReconciliationBackoffMs(attempt: number): number {
@@ -259,6 +325,8 @@ async function writeBlockchainLog(entry: {
   on_chain_status?: string;
   error_category?: ErrorCategory;
   attempt?: number;
+  correlation_id?: string;
+  operation_id?: string;
 }): Promise<void> {
   const { error } = await supabase.from('blockchain_logs').insert({
     ...entry,
@@ -307,11 +375,15 @@ async function getHostId(bookingId: string): Promise<string | null> {
  *  - Does not include internal error details (privacy-safe payload only).
  *  - Falls through on notification errors so reconciliation state is still saved.
  */
-async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<void> {
+async function notifyEscrowFailure(
+  bookingId: string,
+  attempt: number,
+  ctx?: CorrelationContext,
+): Promise<void> {
   // Check deduplication flag — never send twice
   const { data: booking, error: bookingError } = await supabase
     .from('bookings')
-    .select(`${dedupColumn}, tenant_id, property_id`)
+    .select('escrow_failure_notified_at, tenant_id, property_id')
     .eq('id', bookingId)
     .single();
 
@@ -330,6 +402,7 @@ async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<
     message: 'Your booking escrow could not be confirmed after multiple attempts. Our support team has been alerted.',
     supportLink: '/support',
     attempt,
+    ...(ctx ? { correlationId: ctx.correlation_id, operationId: ctx.operation_id } : {}),
   };
 
   const deliveries: Array<Promise<ServiceResponse<void>>> = [];
@@ -347,10 +420,11 @@ async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<
     deliveries.push(
       enqueueNotificationOutbox(hostId, 'system_alert', {
         bookingId,
-        message: messages.host,
+        message: 'A booking escrow could not be confirmed after multiple attempts. Our support team has been alerted.',
         supportLink: '/host/support',
         attempt,
         audience: 'host',
+        ...(ctx ? { correlationId: ctx.correlation_id, operationId: ctx.operation_id } : {}),
       }, `escrow-reconciliation-failed:${bookingId}:host`),
     );
   }
@@ -366,7 +440,7 @@ async function notifyEscrowFailure(bookingId: string, attempt: number): Promise<
   // Mark as notified to prevent duplicate alerts
   const { error } = await supabase
     .from('bookings')
-    .update({ [dedupColumn]: new Date().toISOString() })
+    .update({ escrow_failure_notified_at: new Date().toISOString() })
     .eq('id', bookingId);
   if (error) throw new Error(`Failed to mark booking as notified: ${error.message}`);
 }
@@ -388,11 +462,22 @@ async function reconcilePendingEscrow(
     escrow_hash?: string;
     reconcile_attempts?: number;
     reconcile_provider_event_id?: string | null;
+    correlation_id?: string | null;
+    operation_id?: string | null;
   },
 ): Promise<void> {
   if (!booking.escrow_hash || !booking.on_chain_id) {
     return;
   }
+
+  // Restore (or deterministically derive) the correlation context so a worker
+  // restart resumes the *same* operation key instead of minting a new one.
+  const ctx = restoreCorrelationContext({
+    correlation_id: booking.correlation_id,
+    operation_id: booking.operation_id,
+    booking_id: booking.id,
+    escrow_hash: booking.escrow_hash,
+  });
 
   const currentAttempt = (booking.reconcile_attempts ?? 0) + 1;
   const attemptId = randomUUID();
@@ -404,12 +489,32 @@ async function reconcilePendingEscrow(
       attempt_number: currentAttempt,
       provider_event_id: booking.escrow_hash,
       status: 'pending',
+      correlation_id: ctx.correlation_id,
+      operation_id: ctx.operation_id,
     });
   if (attemptInsertError) {
     // A duplicate attempt number means another worker already claimed this run.
     if (attemptInsertError.code === '23505') return;
     throw new Error(`Failed to persist reconciliation attempt: ${attemptInsertError.message}`);
   }
+
+  // Persist the correlation context on the booking so subsequent restarts
+  // reuse the same identifiers.
+  const { error: ctxPersistError } = await supabase
+    .from('bookings')
+    .update({
+      correlation_id: ctx.correlation_id,
+      operation_id: ctx.operation_id,
+    })
+    .eq('id', booking.id);
+  if (ctxPersistError) {
+    throw new Error(`Failed to persist correlation context: ${ctxPersistError.message}`);
+  }
+
+  logWithCorrelation(ctx, 'info', 'Reconciliation attempt started', {
+    attempt: currentAttempt,
+    escrow_hash: booking.escrow_hash,
+  });
 
   // Increment attempt counter first so even a transient failure is tracked
   const { error: attemptUpdateError } = await supabase
@@ -456,6 +561,8 @@ async function reconcilePendingEscrow(
         log_type: 'reconciliation',
         message: 'Transaction still pending',
         attempt: currentAttempt,
+        correlation_id: ctx.correlation_id,
+        operation_id: ctx.operation_id,
       });
 
       // Check if we've hit the attempt ceiling on a perpetually-pending tx —
@@ -503,11 +610,17 @@ async function reconcilePendingEscrow(
         message: 'Escrow transaction confirmed',
         on_chain_status: 'funded',
         attempt: currentAttempt,
+        correlation_id: ctx.correlation_id,
+        operation_id: ctx.operation_id,
+      });
+
+      logWithCorrelation(ctx, 'info', 'Escrow transaction confirmed', {
+        attempt: currentAttempt,
       });
 
       // Recovered after prior retries — tell the tenant/host it resolved.
-      if (wasFailing) {
-        await notifyEscrowOutcome(booking.id, 'recovered', currentAttempt);
+      if (currentAttempt > 1) {
+        await notifyEscrowOutcome(booking.id, 'recovered', currentAttempt, ctx);
       }
       return;
     }
@@ -530,11 +643,90 @@ async function reconcilePendingEscrow(
         currentAttempt,
         'On-chain transaction failed',
         attemptId,
+        ctx,
       );
     }
   } catch (err) {
     const message = (err as Error).message;
     const category = classifyError(message);
+
+    // Ambiguous outcomes must be verified against provider state before we
+    // permit another submission. Query the provider once more; if it now
+    // reports a terminal state we resolve instead of blindly retrying.
+    if (category === 'ambiguous') {
+      const verified = await verifyProviderState(booking.escrow_hash, ctx);
+      if (verified === 'success') {
+        const { error: bookingError } = await supabase
+          .from('bookings')
+          .update({
+            status: 'confirmed',
+            updated_at: new Date().toISOString(),
+            next_reconcile_at: null,
+            last_reconcile_error: null,
+          })
+          .eq('id', booking.id);
+        if (bookingError) throw new Error(`Failed to mark escrow reconciled: ${bookingError.message}`);
+
+        await supabase
+          .from('escrow_reconciliation_attempts')
+          .update({ status: 'succeeded', next_retry_at: null })
+          .eq('id', attemptId);
+
+        await writeBlockchainLog({
+          booking_id: booking.id,
+          tx_hash: booking.escrow_hash,
+          log_type: 'success',
+          message: 'Ambiguous outcome resolved as success via provider verification',
+          on_chain_status: 'funded',
+          attempt: currentAttempt,
+          correlation_id: ctx.correlation_id,
+          operation_id: ctx.operation_id,
+        });
+        logWithCorrelation(ctx, 'info', 'Ambiguous outcome resolved as success', {
+          attempt: currentAttempt,
+        });
+        return;
+      }
+      if (verified === 'failed') {
+        await supabase
+          .from('escrow_reconciliation_attempts')
+          .update({
+            status: 'manual_review',
+            error_category: 'permanent',
+            error_message: 'Provider confirmed failure after ambiguous result',
+            next_retry_at: null,
+          })
+          .eq('id', attemptId);
+        await quarantineBooking(
+          booking.id,
+          booking.escrow_hash,
+          currentAttempt,
+          'Provider confirmed failure after ambiguous result',
+          attemptId,
+          ctx,
+        );
+        return;
+      }
+      // Still ambiguous — route to manual review, do NOT retry.
+      await supabase
+        .from('escrow_reconciliation_attempts')
+        .update({
+          status: 'manual_review',
+          error_category: 'ambiguous',
+          error_message: message,
+          next_retry_at: null,
+        })
+        .eq('id', attemptId);
+      await routeToManualReview(
+        booking.id,
+        booking.escrow_hash,
+        currentAttempt,
+        `Ambiguous outcome could not be verified: ${message}`,
+        ctx,
+      );
+      return;
+    }
+
     const nextRetryAt =
       category === 'transient' && currentAttempt < MAX_RECONCILE_ATTEMPTS
         ? new Date(Date.now() + getReconciliationBackoffMs(currentAttempt)).toISOString()
@@ -566,14 +758,48 @@ async function reconcilePendingEscrow(
       message: `Reconciliation error: ${message}`,
       error_category: category,
       attempt: currentAttempt,
+      correlation_id: ctx.correlation_id,
+      operation_id: ctx.operation_id,
+    });
+
+    logWithCorrelation(ctx, 'warn', 'Reconciliation error', {
+      attempt: currentAttempt,
+      category,
+      next_retry_at: nextRetryAt,
     });
 
     if (!nextRetryAt) {
-      await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message, attemptId);
+      await quarantineBooking(booking.id, booking.escrow_hash, currentAttempt, message, attemptId, ctx);
     }
 
     // Transient, below threshold: schedule a backed-off retry.
     await scheduleNextAttempt(booking.id, currentAttempt);
+  }
+}
+
+/**
+ * Query the provider for the authoritative state of an escrow transaction.
+ *
+ * Used to reconcile ambiguous outcomes (e.g. a timeout after the provider may
+ * have accepted the request) before permitting another submission. Returns
+ * 'success', 'failed', or 'unknown' when the provider cannot be reached or the
+ * transaction is still pending.
+ */
+async function verifyProviderState(
+  txHash: string,
+  ctx: CorrelationContext,
+): Promise<'success' | 'failed' | 'unknown'> {
+  try {
+    const server = getSorobanServer();
+    const txStatus = await getTransactionStatus(server, txHash);
+    if (txStatus.status === 'success') return 'success';
+    if (txStatus.status === 'failed') return 'failed';
+    return 'unknown';
+  } catch (err) {
+    logWithCorrelation(ctx, 'warn', 'Provider state verification failed', {
+      error: (err as Error).message,
+    });
+    return 'unknown';
   }
 }
 
@@ -588,6 +814,7 @@ async function transitionBookingState(
   attempt: number,
   reason: string,
   attemptId?: string,
+  ctx?: CorrelationContext,
 ): Promise<void> {
   const { error: bookingError } = await supabase
     .from('bookings')
@@ -596,7 +823,6 @@ async function transitionBookingState(
       last_reconcile_error: reason,
       next_reconcile_at: null,
       updated_at: new Date().toISOString(),
-      ...extra,
     })
     .eq('id', bookingId);
   if (bookingError) throw new Error(`Failed to quarantine booking: ${bookingError.message}`);
@@ -616,13 +842,19 @@ async function transitionBookingState(
     message: `Booking quarantined: ${reason}`,
     on_chain_status: 'escrow_reconcile_failed',
     attempt,
+    correlation_id: ctx?.correlation_id,
+    operation_id: ctx?.operation_id,
   });
 
-  console.error(
-    `[Reconcile] QUARANTINE booking=${bookingId} attempt=${attempt} reason="${reason}"`,
-  );
+  if (ctx) {
+    logWithCorrelation(ctx, 'error', 'Booking quarantined', { attempt, reason });
+  } else {
+    console.error(
+      `[Reconcile] QUARANTINE booking=${bookingId} attempt=${attempt} reason="${reason}"`,
+    );
+  }
 
-  await notifyEscrowOutcome(bookingId, 'failed', attempt);
+  await notifyEscrowOutcome(bookingId, 'failed', attempt, ctx);
 }
 
 /**
@@ -637,14 +869,19 @@ async function routeToManualReview(
   txHash: string,
   attempt: number,
   reason: string,
-  eventId?: string,
+  ctx?: CorrelationContext,
 ): Promise<void> {
-  await transitionBookingState(bookingId, 'escrow_manual_review', {
-    last_reconcile_error: reason,
-    escrow_manual_review_at: new Date().toISOString(),
-    reconcile_provider_event_id: eventId ?? null,
-    reconcile_next_attempt_at: null,
-  });
+  const { error: bookingError } = await supabase
+    .from('bookings')
+    .update({
+      status: 'escrow_manual_review',
+      last_reconcile_error: reason,
+      escrow_manual_review_at: new Date().toISOString(),
+      next_reconcile_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', bookingId);
+  if (bookingError) throw new Error(`Failed to route booking to manual review: ${bookingError.message}`);
 
   await writeBlockchainLog({
     booking_id: bookingId,
@@ -653,13 +890,19 @@ async function routeToManualReview(
     message: `Booking routed to manual review: ${reason}`,
     on_chain_status: 'escrow_manual_review',
     attempt,
+    correlation_id: ctx?.correlation_id,
+    operation_id: ctx?.operation_id,
   });
 
-  console.error(
-    `[Reconcile] MANUAL REVIEW booking=${bookingId} attempt=${attempt} reason="${reason}"`,
-  );
+  if (ctx) {
+    logWithCorrelation(ctx, 'error', 'Booking routed to manual review', { attempt, reason });
+  } else {
+    console.error(
+      `[Reconcile] MANUAL REVIEW booking=${bookingId} attempt=${attempt} reason="${reason}"`,
+    );
+  }
 
-  await notifyEscrowOutcome(bookingId, 'manual_review', attempt);
+  await notifyEscrowOutcome(bookingId, 'manual_review', attempt, ctx);
 }
 
 // ─── Public reconcile entry point ─────────────────────────────────────────────
@@ -697,7 +940,12 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
     for (const booking of bookings || []) {
       try {
         await reconcilePendingEscrow(
-          booking as BookingDBRow & { escrow_hash?: string; reconcile_attempts?: number },
+          booking as BookingDBRow & {
+            escrow_hash?: string;
+            reconcile_attempts?: number;
+            correlation_id?: string | null;
+            operation_id?: string | null;
+          },
         );
         reconciled++;
       } catch (err) {
@@ -708,14 +956,20 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
 
     const { data: quarantinedBookings, error: quarantineError } = await supabase
       .from('bookings')
-      .select('id, reconcile_attempts')
+      .select('id, reconcile_attempts, correlation_id, operation_id, escrow_hash')
       .eq('status', 'escrow_reconcile_failed')
       .is('escrow_failure_notified_at', null);
     if (quarantineError) return { success: false, error: quarantineError.message };
 
     for (const booking of quarantinedBookings ?? []) {
       try {
-        await notifyEscrowFailure(booking.id, booking.reconcile_attempts ?? 0);
+        const ctx = restoreCorrelationContext({
+          correlation_id: booking.correlation_id,
+          operation_id: booking.operation_id,
+          booking_id: booking.id,
+          escrow_hash: booking.escrow_hash,
+        });
+        await notifyEscrowFailure(booking.id, booking.reconcile_attempts ?? 0, ctx);
       } catch (err) {
         failed++;
         console.error(`[reconcile] Failed to enqueue review notification for ${booking.id}:`, err);
