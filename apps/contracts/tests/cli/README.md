@@ -28,7 +28,7 @@ A hidden `.test-state.env` file is written by `setup.sh` and read by every test 
 
 | Tool | Version | Install |
 |---|---|---|
-| [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli) | ≥ 21 | `cargo install --locked stellar-cli` |
+| [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli) | ≥ 21 | `cargo install --locked stellar-cli --features opt` |
 | [Rust](https://rustup.rs) | stable (≥ 1.81) | `rustup update stable` |
 | `wasm32-unknown-unknown` target | — | `rustup target add wasm32-unknown-unknown` |
 | `curl` | any | pre-installed on most systems |
@@ -51,6 +51,11 @@ The lifecycle test (`test-booking-lifecycle.sh`) uses all four identities.
 If any account runs out of XLM after repeated test runs, re-fund with
 `./setup.sh --skip-build` (skips the slow cargo build but re-funds accounts).
 
+> **Secrets:** identities are generated locally by `setup.sh` and stored by the
+> Stellar CLI in its own keystore (default `~/.config/stellar`). Never commit
+> `.test-state.env`, keystore files, or secret keys. The scripts only persist
+> public contract IDs and account addresses in `.test-state.env`.
+
 ---
 
 ## Quick Start
@@ -62,7 +67,7 @@ cd apps/contracts/tests/cli
 # 2. Make scripts executable
 chmod +x setup.sh run-all-tests.sh test-*.sh
 
-# 3. Run everything (setup + all three suites)
+# 3. Run everything (setup + all suites, including the lifecycle test)
 ./run-all-tests.sh
 ```
 
@@ -80,6 +85,7 @@ That's it. `run-all-tests.sh` calls `setup.sh` automatically on the first run.
 ./test-property-listing.sh
 ./test-booking.sh
 ./test-review.sh
+./test-booking-lifecycle.sh
 ```
 
 ### Skipping Steps
@@ -117,6 +123,10 @@ export STELLAR_NETWORK="futurenet"
 | `STELLAR_RPC_URL` | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
 | `STELLAR_NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Network passphrase |
 | `STELLAR_CLI` | `stellar` | Path to the stellar CLI binary |
+
+These are the defaults defined in `utils/network-config.sh`; confirm them there
+if the file has changed. All tests target the Stellar **testnet** only — there is
+no mainnet path in this suite.
 
 ---
 
@@ -259,3 +269,7 @@ The testnet may be congested. Wait a few seconds between retries, or increase th
 ## CI Integration
 
 The GitHub Actions workflow at `.github/workflows/contract-tests.yml` runs `cargo test` and `cargo build --target wasm32-unknown-unknown --release` for all three contracts on every push to `main` and on pull requests targeting `main`. See the [CI workflow documentation](../../../../.github/workflows/contract-tests.yml) for details.
+
+> **Note:** CI runs the Rust unit tests and WASM build only. The shell-based
+> testnet integration suites in this directory are run manually and are not
+> executed by CI, since they require funded testnet accounts.
