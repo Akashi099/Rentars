@@ -8,6 +8,85 @@ interface RetryOptions {
   backoffMultiplier?: number;
 }
 
+/**
+ * Correlation context propagated through retries so that every attempt can be
+ * traced back to the originating request, booking, and operation (issue #100).
+ * All values must be non-secret identifiers; never pass tokens or credentials.
+ */
+export interface RetryCorrelationContext {
+  requestId?: string;
+  bookingId?: string;
+  operationKey?: string;
+  providerReference?: string;
+}
+
+/**
+ * Classification of a failed attempt:
+ * - `transient`: safe to retry (network blip, 5xx, timeout before acceptance).
+ * - `ambiguous`: outcome unknown (e.g. timeout after the provider may have
+ *   accepted). Must NOT be retried blindly; reconcile provider state first.
+ * - `permanent`: retrying cannot help (validation, 4xx, business rule).
+ */
+export type RetryFailureClass = 'transient' | 'ambiguous' | 'permanent';
+
+export interface OperationRetryOptions extends RetryOptions {
+  /** Durable operation key; all attempts are tied to this key. */
+  operationKey: string;
+  /** Correlation identifiers propagated into logs. */
+  correlation?: RetryCorrelationContext;
+  /**
+   * Classify a thrown error. Defaults to `transient` for backward
+   * compatibility, but callers performing financial operations must supply a
+   * classifier so ambiguous outcomes are never retried blindly.
+   */
+  classifyError?: (error: unknown) => RetryFailureClass;
+  /**
+   * Called before a retry is scheduled after an ambiguous failure. Should
+   * query provider state and return `true` only when it is safe to retry.
+   */
+  reconcileAmbiguous?: (error: unknown) => Promise<boolean>;
+  /** Optional logger override (defaults to console). */
+  logger?: Pick<Console, 'log' | 'warn' | 'error'>;
+}
+
+export class AmbiguousOperationError extends Error {
+  constructor(
+    message: string,
+    public readonly operationKey: string,
+    public readonly cause?: unknown
+  ) {
+    super(message);
+    this.name = 'AmbiguousOperationError';
+  }
+}
+
+export class OperationRetryExhaustedError extends Error {
+  constructor(
+    message: string,
+    public readonly operationKey: string,
+    public readonly attempts: number,
+    public readonly lastError?: unknown
+  ) {
+    super(message);
+    this.name = 'OperationRetryExhaustedError';
+  }
+}
+
+/**
+ * Build a redacted, log-safe correlation prefix. Only non-secret identifiers
+ * are emitted; any unexpected fields are ignored.
+ */
+export function formatCorrelation(context?: RetryCorrelationContext): string {
+  if (!context) return '';
+  const parts: string[] = [];
+  if (context.requestId) parts.push(`requestId=${context.requestId}`);
+  if (context.bookingId) parts.push(`bookingId=${context.bookingId}`);
+  if (context.operationKey) parts.push(`operationKey=${context.operationKey}`);
+  if (context.providerReference) parts.push(`providerRef=${context.providerReference}`);
+  return parts.length > 0 ? `[${parts.join(' ')}] ` : '';
+}
+=======
+
 // ─── Fallback defaults (used when env vars are absent or malformed) ────────────
 const FALLBACK_MAX_ATTEMPTS = 5;
 const FALLBACK_INITIAL_DELAY_MS = 1000;
@@ -109,6 +188,113 @@ function normalizeOptions(options: RetryOptions): Required<RetryOptions> {
             : base.backoffMultiplier)
         : base.backoffMultiplier,
   };
+}
+
+/**
+ * Execute `fn` with bounded retries scoped to a durable operation key.
+ *
+ * Behaviour:
+ * - Every attempt is logged with the same operation key and correlation IDs.
+ * - `transient` failures are retried up to `maxAttempts`.
+ * - `ambiguous` failures are never retried until `reconcileAmbiguous` confirms
+ *   it is safe; otherwise an `AmbiguousOperationError` is thrown so the caller
+ *   can leave the operation pending.
+ * - `permanent` failures are thrown immediately.
+ * - Retries are bounded; exhaustion throws `OperationRetryExhaustedError`.
+ */
+export async function retryOperation<T>(
+  fn: (attempt: number) => Promise<T>,
+  options: OperationRetryOptions
+): Promise<T> {
+  const config = normalizeOptions(options);
+  const logger = options.logger ?? console;
+  const classify = options.classifyError ?? (() => 'transient' as RetryFailureClass);
+  const correlation: RetryCorrelationContext = {
+    ...options.correlation,
+    operationKey: options.operationKey,
+  };
+  const prefix = formatCorrelation(correlation);
+
+  let attempt = 0;
+  let lastError: unknown;
+
+  while (attempt < config.maxAttempts) {
+    attempt++;
+    logger.log(`${prefix}operation attempt ${attempt}/${config.maxAttempts}`);
+
+    try {
+      const result = await fn(attempt);
+      if (attempt > 1) {
+        logger.log(`${prefix}operation succeeded on attempt ${attempt}`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      const failureClass = classify(error);
+      const message = error instanceof Error ? error.message : String(error);
+
+      if (failureClass === 'permanent') {
+        logger.error(`${prefix}operation failed permanently: ${message}`);
+        throw error;
+      }
+
+      if (failureClass === 'ambiguous') {
+        logger.warn(`${prefix}operation outcome ambiguous: ${message}`);
+        if (!options.reconcileAmbiguous) {
+          throw new AmbiguousOperationError(
+            `Ambiguous outcome for operation ${options.operationKey}; reconciliation required`,
+            options.operationKey,
+            error
+          );
+        }
+        let safeToRetry = false;
+        try {
+          safeToRetry = await options.reconcileAmbiguous(error);
+        } catch (reconcileError) {
+          logger.error(
+            `${prefix}reconciliation failed: ${
+              reconcileError instanceof Error ? reconcileError.message : String(reconcileError)
+            }`
+          );
+        }
+        if (!safeToRetry) {
+          throw new AmbiguousOperationError(
+            `Ambiguous outcome for operation ${options.operationKey}; reconciliation did not confirm retry safety`,
+            options.operationKey,
+            error
+          );
+        }
+        logger.log(`${prefix}reconciliation confirmed retry is safe`);
+      } else {
+        logger.warn(`${prefix}operation transient failure: ${message}`);
+      }
+
+      if (attempt >= config.maxAttempts) {
+        logger.error(
+          `${prefix}operation exhausted ${config.maxAttempts} attempts`
+        );
+        throw new OperationRetryExhaustedError(
+          `Operation ${options.operationKey} failed after ${config.maxAttempts} attempts`,
+          options.operationKey,
+          attempt,
+          lastError
+        );
+      }
+
+      const delay = calculateNextDelay(attempt - 1, config);
+      logger.log(`${prefix}retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+
+  // Unreachable in practice (loop always returns or throws), but keeps the
+  // type checker satisfied.
+  throw new OperationRetryExhaustedError(
+    `Operation ${options.operationKey} failed`,
+    options.operationKey,
+    attempt,
+    lastError
+  );
 }
 
 export async function retryDependencyConnections(

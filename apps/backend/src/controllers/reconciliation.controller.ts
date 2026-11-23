@@ -71,10 +71,26 @@ function toReconciliationDTO(row: any) {
     escalatedReason:      row.escalated_reason ?? null,
     escalatedTo:          row.escalated_to ?? null,
     escalatedAt:          row.escalated_at ?? null,
+    // Correlation identifiers (nonsecret) so operators can trace a case
+    // end-to-end through API and worker logs (#993).
+    correlationId:        row.correlation_id ?? null,
+    operationId:          row.operation_id ?? null,
     createdAt:            row.created_at,
     updatedAt:            row.updated_at,
     // Audit trail link (read-only; full records available via /admin/audit-logs)
     auditTrailRef:        `/api/v1/admin/audit-logs?resource_id=${row.booking_id}&resource_type=booking`,
+  };
+}
+
+/**
+ * Extract the nonsecret correlation identifiers for the current request.
+ * These are safe to persist and log; they never contain auth headers,
+ * wallet secrets, or payment payloads.
+ */
+function correlationContext(req: AdminRequest) {
+  return {
+    correlationId: req.correlationId ?? null,
+    operationId:   req.operationId ?? null,
   };
 }
 
@@ -103,7 +119,7 @@ export async function listReconciliationCases(req: AdminRequest, res: Response):
       'id, booking_id, payment_id, tenant_id, property_id, status, ' +
       'reconcile_attempts, escrow_hash, on_chain_id, last_reconcile_at, ' +
       'last_reconcile_error, escalated_reason, escalated_to, escalated_at, ' +
-      'created_at, updated_at',
+      'correlation_id, operation_id, created_at, updated_at',
       { count: 'exact' },
     )
     .order('created_at', { ascending: false })
@@ -152,7 +168,7 @@ export async function getReconciliationCase(req: AdminRequest, res: Response): P
       'id, booking_id, payment_id, tenant_id, property_id, status, ' +
       'reconcile_attempts, escrow_hash, on_chain_id, last_reconcile_at, ' +
       'last_reconcile_error, escalated_reason, escalated_to, escalated_at, ' +
-      'created_at, updated_at',
+      'correlation_id, operation_id, created_at, updated_at',
     )
     .eq('id', id)
     .single();
@@ -186,11 +202,12 @@ export async function retryReconciliationCase(req: AdminRequest, res: Response):
   }
 
   const { reason } = parsed.data;
+  const { correlationId, operationId } = correlationContext(req);
 
   // Fetch current state
   const { data: existing, error: fetchErr } = await supabase
     .from('reconciliation_cases')
-    .select('id, status, reconcile_attempts, booking_id')
+    .select('id, status, reconcile_attempts, booking_id, correlation_id, operation_id')
     .eq('id', id)
     .single();
 
@@ -220,6 +237,10 @@ export async function retryReconciliationCase(req: AdminRequest, res: Response):
       reconcile_attempts: (existing.reconcile_attempts ?? 0) + 1,
       last_reconcile_at: new Date().toISOString(),
       last_reconcile_error: null,
+      // Persist correlation context so the deferred retry (worker) can
+      // restore it and remain traceable to the originating request (#993).
+      correlation_id: correlationId ?? existing.correlation_id ?? null,
+      operation_id: operationId ?? existing.operation_id ?? null,
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
@@ -240,6 +261,9 @@ export async function retryReconciliationCase(req: AdminRequest, res: Response):
     meta: {
       operation: 'reconciliation_retry',
       caseId: id,
+      bookingId: existing.booking_id,
+      correlationId,
+      operationId,
       reason,
       previousStatus: existing.status,
       reconcileAttempts: existing.reconcile_attempts,
@@ -269,6 +293,7 @@ export async function escalateReconciliationCase(req: AdminRequest, res: Respons
   }
 
   const { reason, escalateTo } = parsed.data;
+  const { correlationId, operationId } = correlationContext(req);
 
   const { data: existing, error: fetchErr } = await supabase
     .from('reconciliation_cases')
@@ -315,6 +340,9 @@ export async function escalateReconciliationCase(req: AdminRequest, res: Respons
     meta: {
       operation: 'reconciliation_escalate',
       caseId: id,
+      bookingId: existing.booking_id,
+      correlationId,
+      operationId,
       reason,
       escalateTo,
       previousStatus: existing.status,
@@ -344,6 +372,7 @@ export async function resolveReconciliationCase(req: AdminRequest, res: Response
   }
 
   const { reason } = parsed.data;
+  const { correlationId, operationId } = correlationContext(req);
 
   const { data: existing, error: fetchErr } = await supabase
     .from('reconciliation_cases')
@@ -388,6 +417,9 @@ export async function resolveReconciliationCase(req: AdminRequest, res: Response
     meta: {
       operation: 'reconciliation_resolve',
       caseId: id,
+      bookingId: existing.booking_id,
+      correlationId,
+      operationId,
       reason,
       previousStatus: existing.status,
     },
