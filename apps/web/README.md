@@ -2,6 +2,8 @@
 
 A Next.js 15 decentralized rental platform frontend built on the Stellar blockchain.
 
+> **Source of truth:** This file documents the frontend workspace only. For repository-wide setup, environment templates, ports, migrations, and deployment, follow the [root README](../../README.md) and [DEPLOYMENT.md](../../DEPLOYMENT.md). Do not duplicate those instructions here.
+
 ## Overview
 
 The Rentars frontend is a modern React application that enables property owners to list rentals and tenants to book properties using USDC via the Stellar blockchain. It integrates with the Freighter wallet for secure blockchain interactions and connects to the Express backend for data persistence.
@@ -36,15 +38,13 @@ The Rentars frontend is a modern React application that enables property owners 
 
 ## Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/your-org/rentars.git
-cd rentars
+Repository-wide installation (workspace bootstrap, backend, contracts) is documented in the [root README](../../README.md). To work on the frontend only:
 
-# Install dependencies
+```bash
+# From the repository root
 yarn install
 
-# Install frontend dependencies
+# Or install just the web workspace
 cd apps/web && yarn install
 ```
 
@@ -52,41 +52,35 @@ cd apps/web && yarn install
 
 ## Environment Variables
 
-Create `.env.local` in `apps/web/`:
+Copy the template and fill in values — never commit real secrets:
 
 ```bash
-# API Configuration
-NEXT_PUBLIC_API_URL=http://localhost:3000
-
-# Supabase Configuration
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-
-# Stellar Configuration
-NEXT_PUBLIC_STELLAR_NETWORK=testnet
-NEXT_PUBLIC_STELLARhorizon_URL=https://horizon-testnet.stellar.org
-NEXT_PUBLIC_STELLARRpc_URL=https://soroban-testnet.stellar.org
-
-# Contract Addresses (Testnet)
-NEXT_PUBLIC_RENTARS_CONTRACT_ADDRESS=CA7... # Your contract address
-NEXT_PUBLIC_USDC_CONTRACT_ADDRESS=CB7...   # USDC contract on testnet
+cd apps/web
+cp .env.example .env.local
 ```
+
+The template lives at `apps/web/.env.example`. Required keys (names only; see the template for placeholders):
+
+- `NEXT_PUBLIC_API_URL` — backend base URL (local backend runs on port 3000)
+- `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` — Supabase project credentials
+- `NEXT_PUBLIC_STELLAR_NETWORK` — `testnet` for local development
+- `NEXT_PUBLIC_STELLAR_HORIZON_URL`, `NEXT_PUBLIC_STELLAR_RPC_URL` — Stellar endpoints
+- `NEXT_PUBLIC_RENTARS_CONTRACT_ADDRESS`, `NEXT_PUBLIC_USDC_CONTRACT_ADDRESS` — deployed contract IDs
+
+Mainnet values are gated: only set them for a reviewed production deployment (see [DEPLOYMENT.md](../../DEPLOYMENT.md)).
 
 ---
 
 ## Running Locally
 
-### Development Servers
+### Development Server
 
 ```bash
-# Terminal 1: Start backend
-cd apps/backend && bun run dev
-
-# Terminal 2: Start frontend
-cd apps/web && yarn dev
+cd apps/web
+yarn dev
 ```
 
-The frontend runs on **http://localhost:3001** (backend on 3000).
+The frontend runs on **http://localhost:3001** (the backend runs on port 3000). Start the backend first — see the [root README](../../README.md) for the backend dev command.
 
 ### Production Build
 
@@ -124,11 +118,13 @@ apps/web/
 │   │   │   ├── PropertyCard.tsx
 │   │   │   ├── PropertyGrid.tsx
 │   │   │   ├── PropertyList.tsx
-│   │   │   └── PropertyDetail.tsx
+│   │   │   ├── PropertyDetail.tsx
+│   │   │   └── PriceDisplay.tsx
 │   │   ├── booking/           # Booking components
 │   │   │   ├── BookingCard.tsx
 │   │   │   ├── BookingForm.tsx
-│   │   │   └── EscrowStatus.tsx
+│   │   │   ├── EscrowStatus.tsx
+│   │   │   └── PaymentStatus.tsx
 │   │   ├── wallet/            # Wallet integration
 │   │   │   ├── WalletConnect.tsx
 │   │   │   ├── WalletButton.tsx
@@ -151,6 +147,7 @@ apps/web/
 │   │   ├── useProperties.ts   # Property data fetching
 │   │   ├── useBookingDetails.ts
 │   │   ├── useEscrowStatus.ts
+│   │   ├── usePaymentStatus.ts
 │   │   ├── useUserRole.tsx
 │   │   ├── useDashboard.ts
 │   │   └── useRealTimeUpdates.ts
@@ -248,6 +245,26 @@ import { EscrowStatus } from '@/components/booking/EscrowStatus';
 />
 ```
 
+### PaymentStatus
+
+Displays the current payment lifecycle state for a booking.
+
+```tsx
+import { PaymentStatus } from '@/components/booking/PaymentStatus';
+
+<PaymentStatus bookingId={bookingId} />
+```
+
+### PriceDisplay
+
+Formats and renders USDC prices consistently.
+
+```tsx
+import { PriceDisplay } from '@/components/property/PriceDisplay';
+
+<PriceDisplay amount={property.pricePerNight} currency="USDC" />
+```
+
 ---
 
 ## Hooks Reference
@@ -305,6 +322,18 @@ const {
   lastUpdated,
   refresh
 } = useEscrowStatus(bookingId);
+```
+
+### usePaymentStatus
+
+Tracks payment lifecycle state for a booking.
+
+```typescript
+const {
+  paymentStatus,    // 'pending' | 'submitted' | 'confirmed' | 'failed'
+  isLoading,
+  refresh
+} = usePaymentStatus(bookingId);
 ```
 
 ### useUserRole
@@ -403,16 +432,18 @@ const signAndSubmit = async (transaction: Transaction) => {
 export const stellarConfig = {
   testnet: {
     networkPassphrase: Network.TESTNET_NETWORK_PASSPHRASE,
-   horizonUrl: 'https://horizon-testnet.stellar.org',
+    horizonUrl: 'https://horizon-testnet.stellar.org',
     rpcUrl: 'https://soroban-testnet.stellar.org',
   },
   mainnet: {
-    networkPassphrase: Network.TESTNET_NETWORK_PASSPHRASE,
+    networkPassphrase: Network.PUBLIC_NETWORK_PASSPHRASE,
     horizonUrl: 'https://horizon.stellar.org',
     rpcUrl: 'https://soroban-rpc.stellar.org',
   }
 };
 ```
+
+> Mainnet configuration is gated. Do not enable it without a reviewed deployment plan — see [DEPLOYMENT.md](../../DEPLOYMENT.md).
 
 ---
 
@@ -522,15 +553,17 @@ const ProtectedRoute = ({ children, requiredRole }) => {
 
 ```bash
 cd apps/web
-yarn test
+yarn test --run
 ```
 
-### Integration Tests
+### End-to-End Tests
 
 ```bash
-# Start services and run e2e
-yarn test:e2e
+cd apps/web
+yarn e2e
 ```
+
+E2E tests require the backend and frontend to be running (see [root README](../../README.md) for the local stack).
 
 ### Test Coverage
 
@@ -544,15 +577,6 @@ Minimum coverage thresholds:
 
 ## Building for Production
 
-### Environment
-
-Set production environment variables:
-
-```bash
-NEXT_PUBLIC_STELLAR_NETWORK=mainnet
-NEXT_PUBLIC_STELLAR_RPC_URL=https://soroban-rpc.stellar.org
-```
-
 ### Build
 
 ```bash
@@ -562,16 +586,7 @@ yarn build
 
 ### Deployment
 
-The frontend can be deployed to Vercel, Netlify, or any Node.js hosting:
-
-```bash
-# Vercel
-vercel deploy --prod
-
-# Docker
-docker build -t rentars-web .
-docker run -p 3001:3001 rentars-web
-```
+Deployment prerequisites, environment configuration, Docker setup, and staging/testnet verification steps are documented in [DEPLOYMENT.md](../../DEPLOYMENT.md). Mainnet deployment is gated and requires a reviewed plan; this README does not provide mainnet instructions.
 
 ---
 
@@ -650,6 +665,9 @@ Ensure backend is running on port 3000 before starting frontend.
 
 ## Related Documentation
 
+- [Root README](../../README.md) — repository setup, workspace structure, ports, migrations, and test commands
+- [DEPLOYMENT.md](../../DEPLOYMENT.md) — staging/testnet deployment guide and production limitations
+- [CONTRIBUTING.md](../../CONTRIBUTING.md) — contribution workflow and checklists
 - [Backend README](../backend/README.md)
 - [Contract Overview](../contracts/CONTRACT_OVERVIEW.md)
 - [Design System](./DESIGN_SYSTEM.md)

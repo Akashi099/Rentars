@@ -14,24 +14,30 @@ Rentars is a rental platform that enables property owners to list rentals and te
 ## Prerequisites
 
 - Node.js 20+
-- Yarn or npm
+- npm (the backend workspace uses npm scripts; see `package.json`)
 - Docker and Docker Compose (for local development)
-- A Supabase project
-- Stellar testnet/mainnet account (for blockchain interactions)
+- A Supabase project (or the local Supabase stack via `supabase start`)
+- Stellar testnet account (for blockchain interactions; mainnet is gated, see below)
 
 ## Installation
 
 ```bash
-# Install dependencies
-yarn install
+# From the repository root, install all workspace dependencies
+npm install
 
-# Copy environment file
-cp .env.example .env.local
+# Copy the backend environment template
+cp apps/backend/.env.example apps/backend/.env.local
 
-# Edit .env.local with your configuration
+# Edit apps/backend/.env.local with your configuration
 ```
 
+All commands below are run from `apps/backend/` unless stated otherwise.
+=======
+
 ## Environment Variables
+
+The authoritative list lives in `apps/backend/.env.example`. Copy it to `.env.local`
+and fill in values; never commit real secrets. The table below summarizes the keys.
 
 | Variable | Description | Required |
 |----------|-------------|----------|
@@ -42,7 +48,7 @@ cp .env.example .env.local
 | `JWT_SECRET` | Secret for JWT token signing | Yes |
 | `REDIS_URL` | Redis connection URL | No |
 | `CORS_ORIGIN` | Allowed CORS origins | No |
-| `STELLAR_NETWORK` | Stellar network (testnet/mainnet) | No |
+| `STELLAR_NETWORK` | Stellar network (`testnet`; `mainnet` is gated) | No |
 | `STELLAR_RPC_URL` | Soroban RPC endpoint | No |
 | `PROPERTY_LISTING_CONTRACT_ID` | Property listing smart contract ID | No |
 | `BOOKING_CONTRACT_ID` | Booking smart contract ID | No |
@@ -56,24 +62,25 @@ cp .env.example .env.local
 
 ```bash
 # Development with hot reload
-yarn dev
+npm run dev
 
 # Production build
-yarn build
-yarn start
+npm run build
+npm start
 ```
 
 ### With Docker
 
 ```bash
-# Development
+# Development (from the repository root)
 docker-compose up -d
 
-# Production
+# Production (from the repository root)
 docker-compose -f docker-compose.prod.yml up -d
 ```
 
-The API runs at `http://localhost:3000`
+The API runs at `http://localhost:3000` (port 3000, matching `PORT` in `.env.example`).
+=======
 
 ## API Reference
 
@@ -280,6 +287,24 @@ The backend integrates with two Soroban smart contracts:
      │               │                   │◀─────────────│
 ```
 
+## Database migrations
+
+`database/setup.sql` is the authoritative migration runner. Apply it against the target
+database after starting the local Supabase stack:
+
+```bash
+# Start the local Supabase stack first
+supabase start
+# or, from the repository root
+docker-compose up -d
+
+# Apply the schema/migrations
+psql "$DATABASE_URL" -f database/setup.sql
+```
+
+Migration files must have unique, monotonically increasing numeric prefixes; see
+`database/MIGRATIONS_NAMING.md` for the naming convention.
+
 ## Local development seed data
 
 A seed script populates the local database with a realistic dataset (users, properties,
@@ -287,14 +312,12 @@ availability, bookings, reviews, wishlists, notifications). It is **idempotent**
 to re-run at any time without creating duplicates.
 
 ```bash
-# Start the local Supabase stack first
-supabase start
-# or
-docker-compose up -d
+# Start the local Supabase stack and apply database/setup.sql first (see above)
 
 # Then seed the database
-bun run db:seed
+npm run db:seed
 ```
+=======
 
 Seeded credentials:
 
@@ -309,7 +332,7 @@ Seeded credentials:
 ### Unit Tests
 
 ```bash
-bun run test:unit
+npm run test:unit
 ```
 
 ### RLS (Row Level Security) Tests
@@ -322,7 +345,7 @@ that cross-user data access is blocked by RLS policies.
 supabase start
 
 # Run RLS tests
-bun run test:rls
+npm run test:rls
 ```
 
 ### Migration filename validation
@@ -331,7 +354,7 @@ Validates that all migration files have unique, monotonically increasing numeric
 Run this before committing a new migration:
 
 ```bash
-bun run validate:migrations
+npm run validate:migrations
 ```
 
 See `database/MIGRATIONS_NAMING.md` for the naming convention and documentation of
@@ -340,12 +363,13 @@ existing duplicate prefixes.
 ### Integration Tests
 
 ```bash
-# Start test environment
+# Start test environment (from the repository root)
 docker-compose up -d
 
 # Run integration tests
-bun run test:integration
+npm run test:integration
 ```
+=======
 
 ### Docker Tests
 
@@ -362,25 +386,39 @@ bun run test:integration
 ### Docker Production Build
 
 ```bash
+# From apps/backend/
 docker build -t rentars-backend .
 docker run -d -p 3000:3000 --env-file .env.production rentars-backend
 ```
 
 ### Environment-Specific Configs
 
-- `.env.example` - Template for all environments
+- `.env.example` - Template for all environments (authoritative key list)
 - `.env.test` - Test environment configuration
 - `.env.production.example` - Production environment template
 
-See [SECRETS.md](../../SECRETS.md) for detailed secrets management.
+Never commit real secrets; `.env.production` must be supplied at deploy time.
+
+See [SECRETS.md](../../SECRETS.md) for detailed secrets management and
+[DEPLOYMENT.md](../../DEPLOYMENT.md) for the staging/testnet deployment guide.
+
+### Production limitations
+
+The backend is code-complete for the documented API surface, but production
+deployment is **not yet verified**. Mainnet Stellar/Soroban steps and real-network
+escrow flows are gated and must be validated on testnet first. Treat any production
+claims as unverified until the staging/testnet guide has been executed end to end.
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Run linting: `yarn format-and-lint`
+3. Run linting: `npm run format-and-lint`
 4. Write tests for new functionality
 5. Submit a pull request
+
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) for the full workflow.
+=======
 
 ## License
 

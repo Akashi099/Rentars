@@ -25,8 +25,10 @@ Traditional rental platforms charge 7–20 % in fees, take 1–7 days to process
 ## Implemented features
 
 The following are implemented and tested in the current codebase.
-"Production-certified" means the feature has automated tests and runs in the CI pipeline.
-It does not imply mainnet deployment, which requires the additional steps in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+"Code-complete" means the feature has automated tests and runs in the CI pipeline.
+It does **not** imply deployment-verified or mainnet-ready status — those require the
+additional steps in [`DEPLOYMENT.md`](DEPLOYMENT.md) and are tracked separately in
+[Deployment-verified capabilities](#deployment-verified-capabilities) below.
 
 ### Backend (Node.js / Bun / Express)
 
@@ -85,6 +87,21 @@ It does not imply mainnet deployment, which requires the additional steps in [`D
 | Property listing contract | ✅ Implemented |
 | Booking contract (with escrow lifecycle) | ✅ Implemented |
 | Review contract | ✅ Implemented |
+
+### Deployment-verified capabilities
+
+Code-complete is not the same as deployment-verified. The table below records what has
+actually been exercised against a live environment. Anything not listed here should be
+treated as **unverified in production**.
+
+| Capability | Status | Notes |
+|---|---|---|
+| Local development stack (backend + frontend + Redis) | ✅ Verified | Documented commands in this README |
+| CI pipeline (lint, typecheck, unit/integration tests, build) | ✅ Verified | GitHub Actions on `main` |
+| Staging / testnet deployment | ⚠️ Partially verified | Follow [`DEPLOYMENT.md`](DEPLOYMENT.md); verify each step |
+| Mainnet deployment | ❌ Not performed | Gated — see [`DEPLOYMENT.md`](DEPLOYMENT.md) |
+| Smart contract security audit | ❌ Not performed | Contracts are unaudited |
+| Production load / capacity validation | ❌ Not verified | See [`docs/CAPACITY_PLANNING.md`](docs/CAPACITY_PLANNING.md) |
 
 ### Known limitations
 
@@ -206,16 +223,14 @@ See `apps/backend/.env.example` and `apps/web/.env.example` for the full list of
 
 ### 3. Run the development stack
 
-Option A — individual services:
+Option A — individual services (from the repo root):
 
 ```bash
 # Terminal 1: backend (port 3000)
-cd apps/backend
-bun run dev
+yarn workspace rentars-backend dev
 
-# Terminal 2: frontend (port 3001)
-cd apps/web
-yarn dev
+# Terminal 2: frontend (port 3001, per apps/web next.config)
+yarn workspace rentars-web dev
 ```
 
 Option B — full Docker stack (frontend + backend + Redis):
@@ -236,50 +251,58 @@ docker compose up --build
 ### 4. Apply database migrations
 
 The backend database schema is managed with SQL migration files under
-`apps/backend/database/migrations/`. Apply them to your Supabase project via the
-Supabase SQL editor or using `psql`:
+`apps/backend/database/migrations/`. The authoritative bootstrap entrypoint is
+`apps/backend/database/setup.sql`, which applies the schema and migrations in order.
+Apply it to your Supabase project with `psql` (this is the same path CI uses):
 
 ```bash
-psql -U postgres -d rentars -f apps/backend/database/setup.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f apps/backend/database/setup.sql
 ```
 
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the complete migration procedure.
+`DATABASE_URL` must point at your Supabase Postgres instance (use the connection
+string from the Supabase dashboard; never commit it). See [`DEPLOYMENT.md`](DEPLOYMENT.md)
+for the complete migration procedure, rollback steps, and verification queries.
 
 ---
 
 ## Running tests
 
+All commands below are run from the repo root and use the workspace package scripts.
+
 ### Backend
 
 ```bash
-cd apps/backend
-
 # All tests
-bun test
+yarn workspace rentars-backend test
 
 # Unit tests only
-bun test tests/unit
+yarn workspace rentars-backend test:unit
 
 # Integration tests
-bun test tests/integration
+yarn workspace rentars-backend test:integration
 
 # RLS policy tests
-bun test tests/rls
+yarn workspace rentars-backend test:rls
 ```
 
 ### Frontend
 
 ```bash
-cd apps/web
-
 # Unit and component tests (Vitest)
-yarn test --run
+yarn workspace rentars-web test --run
 
 # End-to-end tests (Playwright — requires a running dev server)
-yarn e2e
+yarn workspace rentars-web e2e
 
 # Visual regression baselines — capture new snapshots
-npx playwright test e2e/visual-regression.spec.ts --update-snapshots
+yarn workspace rentars-web exec playwright test e2e/visual-regression.spec.ts --update-snapshots
+```
+
+### Contracts
+
+```bash
+# Build all Soroban contracts (requires Rust + wasm32-unknown-unknown)
+yarn workspace rentars-contracts build
 ```
 
 ---
@@ -323,6 +346,8 @@ All endpoints are prefixed with `/api/v1`. The full OpenAPI spec is at
 | [`docs/INCIDENT_REVIEW_TEMPLATE.md`](docs/INCIDENT_REVIEW_TEMPLATE.md) | Post-incident review template |
 | [`docs/RECOVERY_RUNBOOK.md`](docs/RECOVERY_RUNBOOK.md) | Cross-component recovery: DB, storage, Redis, contracts, RPC, email, frontend; monthly drill |
 | [`docs/CAPACITY_PLANNING.md`](docs/CAPACITY_PLANNING.md) | Throughput targets, benchmarking, scaling triggers |
+| [`docs/SEARCH.md`](docs/SEARCH.md) | Full-text, geolocation, autocomplete, and analytics search guide |
+| [`docs/WALLET.md`](docs/WALLET.md) | Freighter wallet connection, passkey, and onboarding guide |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 
 ---

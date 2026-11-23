@@ -17,6 +17,11 @@
 | Seed database | `yarn workspace rentars-backend db:seed` |
 | Build all | `yarn build` |
 
+> Operator-facing procedures (staging/testnet deployment, recovery) live outside this
+> guide: see [`DEPLOYMENT.md`](./DEPLOYMENT.md) and
+> [`docs/RECOVERY_RUNBOOK.md`](./docs/RECOVERY_RUNBOOK.md). This file covers local
+> development only.
+
 ---
 
 ## Getting Started
@@ -176,21 +181,14 @@ yarn format
 The `biome.json` at the repo root configures 2-space indentation, single quotes, and
 trailing commas. Run `yarn lint` in CI to catch regressions.
 
-### Pre-commit hook
+### Pre-commit checks
 
-A `.husky/pre-commit` hook exists, but `husky` and `lint-staged` are **not currently
-installed** as root dependencies, so the hook is inert on a clean checkout. Always run
-lint and format yourself before pushing:
+There is **no active pre-commit hook** on a clean checkout (`husky` and `lint-staged`
+are not installed as root dependencies). Run lint and format yourself before pushing:
 
 ```bash
 yarn lint
 yarn format
-```
-
-If you re-enable the hook, install the missing tooling first:
-
-```bash
-yarn add -D husky lint-staged
 ```
 
 ---
@@ -215,15 +213,19 @@ yarn workspace rentars-backend test:integration
 # Booking E2E lifecycle test
 yarn workspace rentars-backend test:e2e
 
-# RLS policy tests (requires a running local Supabase stack)
+# RLS policy tests — PREREQUISITE: running local Supabase stack (`supabase start`)
 yarn workspace rentars-backend test:rls
 
-# Shell-based API smoke tests (requires a running backend on port 3000)
+# Shell-based API smoke tests — PREREQUISITE: backend running on port 3000
+# (`yarn workspace rentars-backend dev` in another terminal)
 yarn workspace rentars-backend test:api
 
 # Generate lcov coverage report
 yarn workspace rentars-backend test:coverage
 ```
+
+Each of these scripts must exist in `apps/backend/package.json`; if a command fails with
+"missing script", check that file rather than guessing an alternative.
 
 > **Watch mode:** Bun's test runner does not have a `--watch` flag that works identically to
 > Vitest. Use `bun run --watch src/index.ts` for the dev server instead.
@@ -242,10 +244,11 @@ yarn workspace web test:watch
 # Coverage
 yarn workspace web test:coverage
 
-# Playwright E2E (requires a built Next.js app)
+# Playwright E2E — PREREQUISITE: a built Next.js app (`yarn workspace web build`)
+# and Playwright browsers installed (`yarn workspace web exec playwright install`)
 yarn workspace web e2e
 
-# Specific E2E suite
+# Specific E2E suite (same prerequisites as `e2e`)
 yarn workspace web e2e:journey
 ```
 
@@ -362,10 +365,17 @@ supabase start
 
 If you see port conflicts, check `supabase status` and stop other services on ports 54321/54322.
 
-### Pre-commit hook fails with "lint-staged not found"
+### A documented command fails with "missing script"
 
-Run `yarn install` from the repo root to ensure all dev dependencies are installed, then try
-committing again.
+The command does not exist in that workspace's `package.json`. Check the actual scripts:
+
+```bash
+node -e "console.log(Object.keys(require('./apps/backend/package.json').scripts))"
+node -e "console.log(Object.keys(require('./apps/web/package.json').scripts))"
+```
+
+If a script listed in this guide is absent, that is a documentation bug — open an issue
+rather than inventing a replacement command.
 
 ### Migration validation fails in CI
 
@@ -379,6 +389,9 @@ number (check the highest existing prefix in `apps/backend/database/migrations/`
 
 Open an issue for discussion before submitting a PR. Tag it `question` if you are unsure
 whether something is a bug or intended behavior.
+
+For deployment, staging/testnet, and incident recovery procedures, see
+[`DEPLOYMENT.md`](./DEPLOYMENT.md) and [`docs/RECOVERY_RUNBOOK.md`](./docs/RECOVERY_RUNBOOK.md).
 one negative test proving a zero or over-limit page size has explicit, bounded behavior, plus a regression test proving normal pages are untouched.
 
  `<angle_brackets>` must be replaced with real names from the contract. Where the contract doesn't answer a question, this spec says to flag it rather than invent a limit.

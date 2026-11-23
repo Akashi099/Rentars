@@ -20,6 +20,7 @@ import {
   createPaymentIntent,
   getPaymentStatus,
   updatePaymentStatus,
+  getPaymentTimeline,
 } from '@/services/payment.service.js';
 import {
   submitTransaction,
@@ -170,6 +171,12 @@ export async function getPaymentQuote(req: AuthRequest, res: Response): Promise<
 
   const breakdown = buildAmountBreakdown(amountStroops, currency);
 
+  // Conversion details are disclosed so support and users can audit the quote
+  // (#950). USDC is the settlement currency, so the rate is 1:1 and no
+  // conversion rounding is applied; the fields are still exposed so the
+  // contract is stable if a non-1:1 currency is ever added.
+  const rateTimestamp = new Date().toISOString();
+
   res.json({
     bookingId,
     amountStroops: amountStroops.toString(),
@@ -178,6 +185,21 @@ export async function getPaymentQuote(req: AuthRequest, res: Response): Promise<
     quoteHash,
     expiresAt,
     quoteVersion: '1',
+    // #950 — precision and conversion disclosure
+    precision: {
+      currencyDecimals: 7, // USDC on Stellar uses 7 decimal places (stroops)
+      displayDecimals: 2,
+      minorUnit: 'stroop',
+    },
+    conversion: {
+      sourceCurrency: currency,
+      targetCurrency: currency,
+      rate: '1',
+      rateSource: 'fixed:usdc-par',
+      rateTimestamp,
+      roundingMode: 'half-up',
+      roundingApplied: false,
+    },
   });
 }
 
@@ -412,6 +434,89 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     updatedAt: payment.updated_at,
     correlationId: ctx.correlationId,
     operationId: ctx.operationId,
+  });
+}
+
+// ─── Payment timeline (#951) ───────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/payments/booking/:bookingId/timeline
+ *
+ * Returns a privacy-safe, ordered payment timeline for a booking.  Visible to
+ * the booking tenant and the booking host (and admins).  Fields are filtered by
+ * role so neither party sees the other's private identifiers.
+ *
+ * The timeline is derived from the canonical payment ledger; provider
+ * processing states are distinguished from final ledger confirmation so the UI
+ * never shows a premature success.
+ *
+ * Returns: { bookingId, terminal, currentStatus, steps: [{ key, label, status, timestamp, detail? }] }
+ */
+export async function getTimeline(req: AuthRequest, res: Response): Promise<void> {
+  const bookingId = req.params.bookingId;
+  if (typeof bookingId !== 'string' || !bookingId.trim()) {
+    res.status(400).json({ error: { code: 'INVALID_BOOKING_ID', message: 'Booking ID is required' } });
+    return;
+  }
+
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { data: booking, error } = await supabase
+    .from('bookings')
+    .select('id, tenant_id, host_id')
+    .eq('id', bookingId)
+    .single();
+
+  if (error || !booking) {
+    res.status(404).json({ error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found' } });
+    return;
+  }
+
+  const bookingRow = booking as { id: string; tenant_id: string; host_id: string | null };
+
+  const isAdmin = req.user?.role === 'admin';
+  const isTenant = bookingRow.tenant_id === userId;
+  const isHost = bookingRow.host_id === userId;
+
+  if (!isAdmin && !isTenant && !isHost) {
+    res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
+    return;
+  }
+
+  const role: 'tenant' | 'host' | 'admin' = isAdmin ? 'admin' : isTenant ? 'tenant' : 'host';
+
+  const timeline = await getPaymentTimeline(bookingId);
+
+  // Role-based field filtering: only expose fields each participant may see.
+  const steps = timeline.steps.map((step) => {
+    const base = {
+      key: step.key,
+      label: step.label,
+      status: step.status,
+      timestamp: step.timestamp,
+      // Distinguish provider processing from final ledger confirmation.
+      phase: step.phase,
+    };
+    if (role === 'admin') {
+      return { ...base, detail: step.detail, txHash: step.txHash };
+    }
+    if (role === 'tenant') {
+      return { ...base, detail: step.tenantDetail ?? step.detail };
+    }
+    // host: never expose the tenant's tx hash or internal detail
+    return { ...base, detail: step.hostDetail ?? null };
+  });
+
+  res.json({
+    bookingId,
+    role,
+    terminal: timeline.terminal,
+    currentStatus: timeline.currentStatus,
+    steps,
   });
 }
 

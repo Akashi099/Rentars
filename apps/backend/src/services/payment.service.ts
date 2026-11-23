@@ -39,6 +39,13 @@
 import { createHash } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
+import {
+  amountUsdcToStroops,
+  assertSupportedPrecision,
+  compareMinorUnits,
+  type CurrencyCode,
+  type QuoteConversionDetails,
+} from './payment.utils.js';
 import type { ServiceResponse } from './index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -96,6 +103,21 @@ export interface Payment {
   escrow_id: string | null;
   /** Quote reference hash signed at intent creation (for amount integrity). */
   quote_hash: string | null;
+  /**
+   * Original amount in the currency the tenant was quoted in, expressed in
+   * that currency's canonical minor units (integer, never floating point).
+   */
+  original_amount_minor: bigint | null;
+  /** Currency of the original quoted amount. */
+  original_currency: CurrencyCode | null;
+  /** Converted amount in USDC stroops (integer minor units). */
+  converted_amount_stroops: bigint | null;
+  /** Identifier of the rate source used for the conversion (e.g. 'coingecko'). */
+  rate_source: string | null;
+  /** ISO-8601 timestamp of when the exchange rate was captured. */
+  rate_timestamp: string | null;
+  /** Rounding mode applied during conversion (e.g. 'half_up'). */
+  rounding_mode: string | null;
   status: PaymentStatus;
   /** Version counter incremented on every transition (optimistic concurrency). */
   version: number;
@@ -115,6 +137,12 @@ export interface CreatePaymentIntentParams {
   quoteHash?: string;
   escrowId?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Conversion details captured at quote time. When provided, the original
+   * currency amount, converted amount, rate source and rate timestamp are
+   * persisted alongside the payment intent for audit and disclosure.
+   */
+  conversion?: QuoteConversionDetails;
 }
 
 export interface TransitionResult {
@@ -643,7 +671,58 @@ export function mapProviderStatus(raw: string): PaymentStatus {
 export async function createPaymentIntent(
   params: CreatePaymentIntentParams,
 ): Promise<Payment> {
-  const { bookingId, tenantId, amountStroops, quoteHash, escrowId, metadata } = params;
+  const {
+    bookingId,
+    tenantId,
+    amountStroops,
+    quoteHash,
+    escrowId,
+    metadata,
+    conversion,
+  } = params;
+
+  // ── Validate precision and conversion consistency (integer minor units) ──
+  if (amountStroops <= 0n) {
+    throw new Error('Payment amount must be a positive integer number of stroops');
+  }
+
+  let originalAmountMinor: bigint | null = null;
+  let originalCurrency: CurrencyCode | null = null;
+  let convertedAmountStroops: bigint | null = null;
+  let rateSource: string | null = null;
+  let rateTimestamp: string | null = null;
+  let roundingMode: string | null = null;
+
+  if (conversion) {
+    originalCurrency = conversion.originalCurrency;
+    originalAmountMinor = conversion.originalAmountMinor;
+    convertedAmountStroops = conversion.convertedAmountStroops;
+    rateSource = conversion.rateSource;
+    rateTimestamp = conversion.rateTimestamp;
+    roundingMode = conversion.roundingMode;
+
+    // Reject values beyond the currency's supported precision.
+    assertSupportedPrecision(originalCurrency, originalAmountMinor);
+
+    if (convertedAmountStroops <= 0n) {
+      throw new Error('Converted amount must be a positive integer number of stroops');
+    }
+
+    // The converted amount must match the amount actually being charged.
+    if (compareMinorUnits(convertedAmountStroops, amountStroops) !== 0) {
+      throw new Error(
+        `Converted amount (${convertedAmountStroops.toString()} stroops) does not match ` +
+          `payment amount (${amountStroops.toString()} stroops)`,
+      );
+    }
+
+    if (!rateSource) {
+      throw new Error('Conversion rate source is required');
+    }
+    if (!rateTimestamp || Number.isNaN(Date.parse(rateTimestamp))) {
+      throw new Error('Conversion rate timestamp is required and must be a valid ISO-8601 date');
+    }
+  }
 
   const { data, error } = await supabase
     .from('payments')
@@ -655,6 +734,12 @@ export async function createPaymentIntent(
       status: 'pending',
       escrow_id: escrowId ?? null,
       quote_hash: quoteHash ?? null,
+      original_amount_minor: originalAmountMinor?.toString() ?? null,
+      original_currency: originalCurrency ?? null,
+      converted_amount_stroops: convertedAmountStroops?.toString() ?? null,
+      rate_source: rateSource ?? null,
+      rate_timestamp: rateTimestamp ?? null,
+      rounding_mode: roundingMode ?? null,
       version: 1,
       last_event_hash: null,
       metadata: metadata ?? null,
@@ -852,6 +937,57 @@ export async function getPaymentByBookingId(bookingId: string): Promise<Payment 
   return data ? rowToPayment(data) : null;
 }
 
+/**
+ * Reconcile a payment against an externally reported amount.
+ *
+ * Comparison is performed exclusively on integer minor units (USDC stroops)
+ * via compareMinorUnits() — binary floating-point values are never used, so
+ * rounding can never silently change the amount transferred.
+ *
+ * @param paymentId       - UUID of the payment to reconcile.
+ * @param reportedStroops - Amount reported by the provider/ledger, in stroops.
+ * @returns Whether the amounts match, plus the canonical payment record.
+ */
+export async function reconcilePaymentAmount(
+  paymentId: string,
+  reportedStroops: bigint,
+): Promise<ServiceResponse<{ payment: Payment; matches: boolean }>> {
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    return { success: false, error: 'Payment not found' };
+  }
+
+  if (reportedStroops < 0n) {
+    return { success: false, error: 'Reported amount must not be negative' };
+  }
+
+  const matches = compareMinorUnits(payment.amount_stroops, reportedStroops) === 0;
+
+  if (!matches) {
+    await auditLogger.log({
+      actorId: payment.tenant_id,
+      action: 'payment.failed',
+      resourceType: 'payment',
+      resourceId: paymentId,
+      meta: {
+        reason: 'amount_mismatch',
+        expectedStroops: payment.amount_stroops.toString(),
+        reportedStroops: reportedStroops.toString(),
+      },
+    });
+  }
+
+  return { success: true, data: { payment, matches } };
+}
+
+/**
+ * Convert a USDC decimal string to integer stroops using decimal-safe helpers.
+ * Exposed here so callers do not reach for floating-point arithmetic.
+ */
+export function toStroops(usdcAmount: string): bigint {
+  return amountUsdcToStroops(usdcAmount);
+}
+
 // ─── Row mapping ──────────────────────────────────────────────────────────────
 
 /**
@@ -868,6 +1004,14 @@ function rowToPayment(row: any): Payment {
     stellar_tx_hash:  row.stellar_tx_hash ?? null,
     escrow_id:        row.escrow_id ?? null,
     quote_hash:       row.quote_hash ?? null,
+    original_amount_minor:
+      row.original_amount_minor != null ? BigInt(row.original_amount_minor) : null,
+    original_currency: (row.original_currency ?? null) as CurrencyCode | null,
+    converted_amount_stroops:
+      row.converted_amount_stroops != null ? BigInt(row.converted_amount_stroops) : null,
+    rate_source:      row.rate_source ?? null,
+    rate_timestamp:   row.rate_timestamp ?? null,
+    rounding_mode:    row.rounding_mode ?? null,
     status:           row.status as PaymentStatus,
     version:          row.version ?? 1,
     last_event_hash:  row.last_event_hash ?? null,
