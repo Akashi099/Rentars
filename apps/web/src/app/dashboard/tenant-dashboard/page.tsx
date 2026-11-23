@@ -5,7 +5,7 @@ import { useDashboard, type BookingStatus, type BookingSort, type BookingOrder }
 import BookingHistory from '@/components/dashboard/BookingHistory';
 import Analytics from '@/components/dashboard/Analytics';
 import NotificationSystem from '@/components/dashboard/NotificationSystem';
-import { BookingListSkeleton, ErrorState, SkeletonRegion } from '@/components/ui';
+import { BookingListSkeleton, EmptyState, ErrorState, SkeletonRegion } from '@/components/ui';
 import WalletTransaction from './components/WalletTransaction';
 import BookingPreferences from './components/BookingPreferences';
 import ExportBookingsButton from './components/ExportBookingsButton';
@@ -19,6 +19,9 @@ export default function TenantDashboard() {
   const order = (searchParams.get('order') as BookingOrder) ?? 'desc';
 
   const { bookings, isLoading, error, refetch } = useDashboard(20, statusFilter, sort, order);
+
+  const hasActiveFilters = statusFilter !== null;
+  const hasBookings = bookings.length > 0;
 
   function updateParam(key: string, value: string | null) {
     const params = new URLSearchParams(searchParams.toString());
@@ -107,15 +110,34 @@ export default function TenantDashboard() {
             {/* Booking History with filters */}
             <div>
               <h2 className="text-2xl font-bold text-gray-900 mb-4">Your Bookings</h2>
-              <BookingHistory
-                bookings={formattedBookings}
-                statusFilter={statusFilter}
-                sort={sort}
-                order={order}
-                onStatusChange={(s) => updateParam('status', s)}
-                onSortChange={(s) => updateParam('sort', s)}
-                onOrderChange={(o) => updateParam('order', o)}
-              />
+              {/* Empty State — a confirmed successful response with zero rows.
+                  Distinguished from the error state above; active filters are
+                  preserved and surfaced so users can widen their search. */}
+              {!hasBookings ? (
+                <EmptyState
+                  title={hasActiveFilters ? 'No bookings match your filters' : 'No bookings yet'}
+                  description={
+                    hasActiveFilters
+                      ? 'Try clearing the status filter to see all of your bookings.'
+                      : 'Once you book a stay, it will appear here.'
+                  }
+                  action={
+                    hasActiveFilters
+                      ? { label: 'Clear filters', onClick: () => updateParam('status', null) }
+                      : undefined
+                  }
+                />
+              ) : (
+                <BookingHistory
+                  bookings={formattedBookings}
+                  statusFilter={statusFilter}
+                  sort={sort}
+                  order={order}
+                  onStatusChange={(s) => updateParam('status', s)}
+                  onSortChange={(s) => updateParam('sort', s)}
+                  onOrderChange={(o) => updateParam('order', o)}
+                />
+              )}
             </div>
 
             {/* Analytics and Transactions */}

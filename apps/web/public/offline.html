@@ -59,6 +59,45 @@
       font-size: 0.75rem;
       color: #9ca3af;
     }
+    .notice {
+      text-align: left;
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-radius: 0.5rem;
+      padding: 0.875rem 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      color: #92400e;
+    }
+    .notice strong { display: block; margin-bottom: 0.25rem; color: #78350f; }
+    .notice.privacy {
+      background: #eff6ff;
+      border-color: #bfdbfe;
+      color: #1e40af;
+    }
+    .notice.privacy strong { color: #1e3a8a; }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      align-items: stretch;
+    }
+    .btn.secondary {
+      background: #e5e7eb;
+      color: #374151;
+    }
+    .btn.secondary:hover { background: #d1d5db; }
+    .btn[disabled] {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn[disabled]:hover { background: #e5e7eb; }
+    .mutation-note {
+      font-size: 0.75rem;
+      color: #9ca3af;
+      margin-top: 0.5rem;
+    }
   </style>
 </head>
 <body>
@@ -69,9 +108,32 @@
       It looks like you lost your internet connection. Check your network settings
       and try again — Rentars will reconnect automatically when you're back online.
     </p>
-    <button class="btn" onclick="window.location.reload()">
-      Try again
-    </button>
+
+    <div class="notice" role="status" aria-live="polite">
+      <strong>Content may be stale</strong>
+      Any page shown from cache was saved earlier and may not reflect the latest
+      bookings, availability, or account activity.
+    </div>
+
+    <div class="notice privacy" role="note">
+      <strong>Your private data is not cached</strong>
+      Bookings, profile details, and other authenticated information are never
+      stored for offline use. Signing out or switching accounts clears any
+      user-specific cached data on this device.
+    </div>
+
+    <div class="actions">
+      <button class="btn" onclick="window.location.reload()">
+        Try again
+      </button>
+      <button class="btn secondary" disabled aria-disabled="true" title="Unavailable while offline">
+        Booking actions unavailable offline
+      </button>
+    </div>
+    <p class="mutation-note">
+      Creating, changing, or cancelling bookings is disabled until you're back online.
+    </p>
+
     <div class="badge">Rentars — Decentralized P2P Rentals on Stellar</div>
   </main>
 </body>

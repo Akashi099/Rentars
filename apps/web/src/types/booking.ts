@@ -19,6 +19,77 @@ export function normaliseStatus(status: string): Lowercase<BookingStatus> {
   return status.toLowerCase() as Lowercase<BookingStatus>;
 }
 
+// ─── Semantic status tokens ──────────────────────────────────────────────────
+
+/**
+ * Semantic status categories shared by badges, alerts and blockchain status
+ * components. These map onto the shared design tokens (success, warning,
+ * error, pending, focus) so state is never communicated by color alone.
+ */
+export type SemanticStatus =
+  | 'success'
+  | 'warning'
+  | 'error'
+  | 'pending'
+  | 'neutral';
+
+/** Human-readable label for each semantic status (used alongside icons). */
+export const SEMANTIC_STATUS_LABELS: Record<SemanticStatus, string> = {
+  success: 'Success',
+  warning: 'Warning',
+  error: 'Error',
+  pending: 'Pending',
+  neutral: 'Neutral',
+};
+
+/**
+ * Map a booking status to its semantic status category. Unknown or
+ * reconciliation-failure states fall back to `error` so they are never
+ * presented as a confirmed success.
+ */
+export function bookingStatusToSemantic(status: string): SemanticStatus {
+  switch (normaliseStatus(status)) {
+    case 'confirmed':
+    case 'completed':
+      return 'success';
+    case 'pending':
+      return 'pending';
+    case 'disputed':
+    case 'escrow_reconcile_failed':
+      return 'error';
+    case 'cancelled':
+      return 'neutral';
+    default:
+      return 'warning';
+  }
+}
+
+// ─── Async state ─────────────────────────────────────────────────────────────
+
+/**
+ * Typed async state used by data hooks (booking history, notifications,
+ * wishlists, analytics, search). Distinguishes initial loading from
+ * background refresh and never represents stale data as confirmed success.
+ */
+export type AsyncState<T> =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; data: T; isStale: boolean; refreshedAt: string | null }
+  | { status: 'error'; error: Error; isRecoverable: boolean; previousData: T | null };
+
+/** Metadata describing a refresh of already-loaded data. */
+export interface RefreshMeta {
+  /** True while a background refresh is in flight over existing data. */
+  isRefreshing: boolean;
+  /** ISO timestamp of the last confirmed successful response. */
+  refreshedAt: string | null;
+  /** True when the displayed data predates the latest successful fetch. */
+  isStale: boolean;
+}
+
+/** Initial async state before any request has been made. */
+export const IDLE_ASYNC_STATE: AsyncState<never> = { status: 'idle' };
+
 // ─── Allowed lifecycle transitions ───────────────────────────────────────────
 
 /**

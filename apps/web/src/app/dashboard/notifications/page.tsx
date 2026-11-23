@@ -2,7 +2,7 @@
 
 import NotificationPreferences from '@/components/shared/NotificationPreferences';
 import { type AppNotification, useNotifications } from '@/hooks/useNotifications';
-import { Bell, CheckCheck, Settings, Trash2 } from 'lucide-react';
+import { Bell, CheckCheck, RefreshCw, Settings, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 
 const TYPE_LABELS: Record<string, string> = {
@@ -22,12 +22,22 @@ const TYPE_LABELS: Record<string, string> = {
 type FilterType = 'all' | 'unread';
 
 export default function NotificationsPage() {
-  const { notifications, isLoading, unreadCount, markRead, markAllRead, removeNotification } =
-    useNotifications();
+  const {
+    notifications,
+    isLoading,
+    error,
+    unreadCount,
+    markRead,
+    markAllRead,
+    removeNotification,
+    refetch,
+  } = useNotifications();
   const [filter, setFilter] = useState<FilterType>('all');
   const [showSettings, setShowSettings] = useState(false);
 
   const displayed = filter === 'unread' ? notifications.filter((n) => !n.read) : notifications;
+  const hasError = Boolean(error) && !isLoading;
+  const showEmpty = !isLoading && !hasError && displayed.length === 0;
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -88,7 +98,17 @@ export default function NotificationsPage() {
         )}
       </div>
 
-      <div className="space-y-2">
+      <div className="space-y-2" aria-live="polite" aria-busy={isLoading}>
+        <p className="sr-only">
+          {isLoading
+            ? 'Loading notifications'
+            : hasError
+              ? 'Failed to load notifications'
+              : showEmpty
+                ? 'No notifications to display'
+                : `${displayed.length} notifications loaded`}
+        </p>
+
         {isLoading && (
           <div className="space-y-2">
             {[1, 2, 3].map((i) => (
@@ -97,24 +117,62 @@ export default function NotificationsPage() {
           </div>
         )}
 
-        {!isLoading && displayed.length === 0 && (
-          <div className="text-center py-16 text-gray-500 dark:text-gray-400">
+        {hasError && (
+          <div
+            role="alert"
+            className="text-center py-16 text-gray-500 dark:text-gray-400"
+          >
             <Bell size={40} className="mx-auto mb-3 opacity-30" />
-            <p className="font-medium">No notifications</p>
-            <p className="text-sm mt-1">
-              {filter === 'unread' ? 'All caught up!' : "You're all set."}
+            <p className="font-medium text-gray-900 dark:text-white">
+              We couldn&apos;t load your notifications
             </p>
+            <p className="text-sm mt-1">
+              {error instanceof Error ? error.message : 'Something went wrong. Please try again.'}
+            </p>
+            <button
+              type="button"
+              onClick={() => refetch()}
+              className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition"
+            >
+              <RefreshCw size={16} />
+              Retry
+            </button>
           </div>
         )}
 
-        {displayed.map((n) => (
-          <NotificationItem
-            key={n.id}
-            notification={n}
-            onRead={markRead}
-            onRemove={removeNotification}
-          />
-        ))}
+        {showEmpty && (
+          <div className="text-center py-16 text-gray-500 dark:text-gray-400">
+            <Bell size={40} className="mx-auto mb-3 opacity-30" />
+            <p className="font-medium">
+              {filter === 'unread' ? 'No unread notifications' : 'No notifications yet'}
+            </p>
+            <p className="text-sm mt-1">
+              {filter === 'unread'
+                ? 'All caught up! Switch to All to see your notification history.'
+                : "You're all set. New activity will appear here."}
+            </p>
+            {filter === 'unread' && (
+              <button
+                type="button"
+                onClick={() => setFilter('all')}
+                className="mt-4 text-sm text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                View all notifications
+              </button>
+            )}
+          </div>
+        )}
+
+        {!isLoading &&
+          !hasError &&
+          displayed.map((n) => (
+            <NotificationItem
+              key={n.id}
+              notification={n}
+              onRead={markRead}
+              onRemove={removeNotification}
+            />
+          ))}
       </div>
     </div>
   );

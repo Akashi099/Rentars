@@ -77,17 +77,40 @@ export default async function RootLayout({ children }: { children: React.ReactNo
         </AuthProvider>
       </I18nProvider>
 
-      {/* Register service worker */}
+      {/* Register privacy-aware service worker and purge user-specific caches on logout/account switch */}
       <script
           dangerouslySetInnerHTML={{
             __html: `
-              if ('serviceWorker' in navigator) {
+              (function() {
+                if (!('serviceWorker' in navigator)) return;
+
+                // Ask the active service worker to drop all user-specific caches.
+                function purgeUserCaches(reason) {
+                  try {
+                    var controller = navigator.serviceWorker.controller;
+                    if (controller) {
+                      controller.postMessage({ type: 'PURGE_USER_CACHES', reason: reason });
+                    }
+                  } catch (err) {
+                    console.warn('SW cache purge failed:', err);
+                  }
+                }
+                window.__rentarsPurgeUserCaches = purgeUserCaches;
+
+                // Listen for logout / account-switch events dispatched by the app.
+                window.addEventListener('rentars:logout', function() {
+                  purgeUserCaches('logout');
+                });
+                window.addEventListener('rentars:account-switch', function() {
+                  purgeUserCaches('account-switch');
+                });
+
                 window.addEventListener('load', function() {
                   navigator.serviceWorker.register('/sw.js').catch(function(err) {
                     console.warn('SW registration failed:', err);
                   });
                 });
-              }
+              })();
             `,
           }}
       />

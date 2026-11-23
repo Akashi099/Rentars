@@ -52,5 +52,27 @@
   ],
   "screenshots": [],
   "related_applications": [],
-  "prefer_related_applications": false
+  "prefer_related_applications": false,
+  "cache_policy": {
+    "description": "Public cache policy for the Rentars PWA. Only the entry points listed below are eligible for persistent offline caching. Authenticated routes (dashboards, bookings, profile, account settings) and all authenticated API responses are network-only and must never be stored in persistent caches. User-specific caches are cleared on logout or account switch.",
+    "public_cacheable": [
+      "/",
+      "/search",
+      "/list",
+      "/offline",
+      "/manifest.json",
+      "/icons/icon-192.png",
+      "/icons/icon-192-maskable.png",
+      "/icons/icon-512.png",
+      "/icons/icon-512-maskable.png"
+    ],
+    "network_only": [
+      "/dashboard",
+      "/bookings",
+      "/profile",
+      "/account",
+      "/settings",
+      "/api/*"
+    ]
+  }
 }

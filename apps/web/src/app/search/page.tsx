@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useId } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Loader2, AlertCircle, ChevronDown } from 'lucide-react';
+import { Loader2, AlertCircle, ChevronDown, SlidersHorizontal, Map as MapIcon } from 'lucide-react';
 import FilterSidebar, { type FilterState } from '@/components/search/FilterSidebar';
 import PropertyMap, { type MapSelectSource } from '@/components/search/PropertyMap';
 import PropertyGrid from '@/components/search/PropertyGrid';
@@ -12,6 +12,62 @@ import { useOnlineStatus } from '@/hooks/useOnlineStatus';
 import { useNearbyProperties, geocodeAddress } from '@/hooks/useLocationSearch';
 import { ErrorState } from '@/components/ui/async-states';
 import type { LatLngBounds } from 'leaflet';
+
+// ─── Responsive disclosure ────────────────────────────────────────────────────
+// Collapses secondary content (filters, map) into an accessible disclosure on
+// narrow viewports while keeping it always-visible on desktop. The trigger is a
+// real button with aria-expanded/aria-controls so keyboard and touch users can
+// operate it, and the panel is hidden from the a11y tree when collapsed.
+
+function ResponsiveDisclosure({
+  title,
+  icon,
+  open,
+  onToggle,
+  children,
+  className = '',
+}: {
+  title: string;
+  icon: React.ReactNode;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const panelId = useId();
+  return (
+    <div className={className}>
+      {/* Mobile trigger — hidden at lg and up where content is always shown */}
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-controls={panelId}
+        className="lg:hidden w-full flex items-center justify-between gap-2 px-4 py-3
+          rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900
+          text-sm font-medium text-gray-700 dark:text-gray-300
+          hover:bg-gray-50 dark:hover:bg-gray-800 transition
+          focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+      >
+        <span className="flex items-center gap-2">
+          {icon}
+          {title}
+        </span>
+        <ChevronDown
+          size={16}
+          aria-hidden="true"
+          className={`transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      <div
+        id={panelId}
+        className={`${open ? 'block' : 'hidden'} lg:block mt-3 lg:mt-0`}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
 
 // ─── URL ↔ filter helpers ─────────────────────────────────────────────────────
 
@@ -99,6 +155,10 @@ export default function SearchPage() {
   const [filters, setFilters] = useState<FilterState>(() => paramsToFilters(searchParams));
   const [searchQuery, setSearchQuery] = useState(() => searchParams.get('q') ?? '');
   const [showMap, setShowMap] = useState(false);
+  // Mobile disclosures — filters and map are collapsed by default on narrow
+  // viewports so the results grid gets the limited viewport space.
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [mapPanelOpen, setMapPanelOpen] = useState(false);
   // Selected listing — synchronised between map pins and the accessible
   // results list (and announced via the list's live region).
   const [selectedPropertyId, setSelectedPropertyId] = useState<string | undefined>();
@@ -194,6 +254,38 @@ export default function SearchPage() {
   const displayLoading = nearbyParams ? nearbyLoading : loading;
   const displayError = nearbyParams ? null : error;
 
+  // ── Derived async state ────────────────────────────────────────────────────
+  // Distinguish the four states explicitly so "no results" is never conflated
+  // with "failed to load". A failed request always wins over empty.
+  const asyncState: 'loading' | 'error' | 'empty' | 'success' = displayError
+    ? 'error'
+    : displayLoading && displayResults.length === 0
+      ? 'loading'
+      : displayResults.length === 0
+        ? 'empty'
+        : 'success';
+
+  // Human-readable announcement for the results live region.
+  const statusMessage =
+    asyncState === 'loading'
+      ? 'Searching…'
+      : asyncState === 'error'
+        ? 'Search failed to load. You can retry.'
+        : asyncState === 'empty'
+          ? 'No properties match your current filters.'
+          : `${total.toLocaleString()} propert${total !== 1 ? 'ies' : 'y'} found`;
+
+  // Retry handler shared by the offline notice and the error state. Guarded so
+  // an impatient double click cannot fire two requests.
+  const retryInFlight = useRef(false);
+  const handleRetry = useCallback(() => {
+    if (retryInFlight.current) return;
+    retryInFlight.current = true;
+    Promise.resolve(retry()).finally(() => {
+      retryInFlight.current = false;
+    });
+  }, [retry]);
+
   // Map-driven selection: pin activation (keyboard or pointer) and list
   // activation both funnel here so the pin, the list, and the details stay
   // synchronised. Pointer selections leave focus alone; keyboard selections
@@ -212,21 +304,26 @@ export default function SearchPage() {
             Find your next stay
           </h1>
 
-          {/* Search form */}
-          <form onSubmit={handleInputSubmit} role="search" className="flex gap-2">
+          {/* Search form — stacks on narrow viewports so the input and the
+              primary action never overflow horizontally. */}
+          <form
+            onSubmit={handleInputSubmit}
+            role="search"
+            className="flex flex-col sm:flex-row gap-2"
+          >
             <input
               type="search"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               placeholder="Search by city, country, or property name…"
               aria-label="Search properties"
-              className="flex-1 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2
+              className="w-full min-w-0 flex-1 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2
                 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100
                 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
             <button
               type="submit"
-              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium
+              className="w-full sm:w-auto px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium
                 rounded-lg transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
             >
               Search
@@ -238,14 +335,12 @@ export default function SearchPage() {
       <div className="max-w-7xl mx-auto px-6 py-6">
 
         {/* ── Toolbar ───────────────────────────────────────────────────────── */}
-        <div className="mb-4 flex justify-between items-center flex-wrap gap-3">
+        <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
           <p className="text-sm text-gray-600 dark:text-gray-400" aria-live="polite" aria-atomic="true">
-            {displayLoading
-              ? 'Searching…'
-              : `${total.toLocaleString()} propert${total !== 1 ? 'ies' : 'y'} found`}
+            {statusMessage}
           </p>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             {/* Near me */}
             <button
               type="button"
@@ -319,7 +414,13 @@ export default function SearchPage() {
 
         {/* ── Map view ───────────────────────────────────────────────────────── */}
         {showMap && (
-          <div className="mb-6">
+          <ResponsiveDisclosure
+            className="mb-6"
+            title="Map"
+            icon={<MapIcon size={16} aria-hidden="true" />}
+            open={mapPanelOpen}
+            onToggle={() => setMapPanelOpen((v) => !v)}
+          >
             <PropertyMap
               properties={displayResults as any[]}
               selectedPropertyId={selectedPropertyId}
@@ -328,7 +429,7 @@ export default function SearchPage() {
               onBoundsChanged={handleBoundsChanged}
               onUserLocation={handleUserLocation}
             />
-          </div>
+          </ResponsiveDisclosure>
         )}
 
         {/* Offline notice — search terms and filters are preserved; retry is
@@ -338,7 +439,7 @@ export default function SearchPage() {
             <ErrorState
               variant="inline"
               message="You appear to be offline. Your search terms and filters are preserved — retry when your connection returns."
-              onRetry={retry}
+              onRetry={handleRetry}
               retryLabel="Retry now"
             />
           </div>
@@ -347,16 +448,24 @@ export default function SearchPage() {
         {/* ── Content grid ──────────────────────────────────────────────────── */}
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
 
-          {/* Sidebar */}
+          {/* Sidebar — collapses into a disclosure on mobile */}
           <aside className="lg:col-span-1">
-            <FilterSidebar filters={filters} onFilterChange={setFilters} />
+            <ResponsiveDisclosure
+              title="Filters"
+              icon={<SlidersHorizontal size={16} aria-hidden="true" />}
+              open={filtersOpen}
+              onToggle={() => setFiltersOpen((v) => !v)}
+            >
+              <FilterSidebar filters={filters} onFilterChange={setFilters} />
+            </ResponsiveDisclosure>
           </aside>
 
           {/* Results */}
           <div className="lg:col-span-3 space-y-6">
 
-            {/* Zero-result suggestions */}
-            {!displayLoading && !displayError && displayResults.length === 0 && (
+            {/* Zero-result suggestions — only for a confirmed empty result,
+                never while loading or after a failure. */}
+            {asyncState === 'empty' && (
               <ZeroResultSuggestions
                 suggestions={zeroResultSuggestions}
                 filters={filters}
@@ -371,11 +480,11 @@ export default function SearchPage() {
               properties={displayResults as any[]}
               loading={displayLoading}
               error={displayError}
-              onRetry={retry}
+              onRetry={handleRetry}
             />
 
             {/* Load more */}
-            {hasMore && !displayLoading && (
+            {hasMore && !displayLoading && asyncState === 'success' && (
               <div className="flex justify-center pt-2">
                 <button
                   type="button"

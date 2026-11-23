@@ -18,6 +18,18 @@ import { redirect } from 'next/navigation';
 import PropertyDetail from '@/components/features/properties/PropertyDetail';
 import type { Property } from '@/types/property';
 
+/**
+ * Responsive contract for the property detail page (see docs/design-system/responsive.md):
+ *   narrow  < 640px   — single column; gallery → calendar → summary stacked; booking CTA
+ *                       sticky at the bottom of the viewport; secondary summaries
+ *                       (booking summary, map, filters) collapsed into disclosures.
+ *   medium  640–1024px — two columns; gallery full width, calendar + summary side by side.
+ *   wide    > 1024px  — three columns; gallery, calendar and sticky summary rail.
+ *
+ * The page shell below enforces `overflow-x-hidden` and `min-w-0` so no child can
+ * introduce horizontal scrolling at narrow widths.
+ */
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
 // Static 1200×630 placeholder used for OG/Twitter previews and JSON-LD image
@@ -158,7 +170,11 @@ export default async function PropertyPage({
   const property = await resolveProperty(params.id);
 
   if (!property) {
-    return <div className="p-8 text-center">Property not found</div>;
+    return (
+      <div className="mx-auto w-full max-w-screen-sm overflow-x-hidden p-6 text-center sm:p-8">
+        Property not found
+      </div>
+    );
   }
 
   const siteUrl = getSiteUrl();
@@ -230,13 +246,21 @@ export default async function PropertyPage({
   };
 
   return (
-    <>
+    <div className="w-full min-w-0 overflow-x-hidden">
       <script
         type="application/ld+json"
         // eslint-disable-next-line react/no-danger
         dangerouslySetInnerHTML={{ __html: JSON.stringify(ldJsonLd) }}
       />
+      {/*
+        PropertyDetail owns the responsive layout:
+          - narrow:  stacked gallery/calendar/summary, sticky booking CTA,
+                     secondary summaries inside ResponsiveDisclosure.
+          - medium:  two-column grid.
+          - wide:    three-column grid with a sticky summary rail.
+        It must never exceed the viewport width (no horizontal scrolling).
+      */}
       <PropertyDetail property={property} />
-    </>
+    </div>
   );
 }
