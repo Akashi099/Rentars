@@ -111,12 +111,43 @@ require_env() {
       missing=1
     fi
   done
-  if [ "$missing" -ne 0 ]; then exit 1; fi
+  if [ "$missing" -ne 0 ]; then
+    err "Aborting: required environment is incomplete (phase=${PHASE}). See docs/RECOVERY_RUNBOOK.md §6 for the full env list."
+    exit 1
+  fi
 }
 
-require_env STAGING_API_URL ADMIN_JWT
+# Validate the env required by the selected phase(s) up front so a missing
+# prerequisite fails fast with a clear message instead of tripping the ERR
+# trap mid-phase (which previously produced a confusing partial report).
+validate_env_for_phase() {
+  case "$PHASE" in
+    db-restore)
+      require_env PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD \
+                  VERIFY_DB_HOST VERIFY_DB_USER VERIFY_DB_PASSWORD ;;
+    cache-rebuild)
+      require_env STAGING_API_URL ;;
+    sync-resume)
+      require_env STAGING_API_URL ADMIN_JWT PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD ;;
+    core-reads)
+      require_env STAGING_API_URL ADMIN_JWT ;;
+    booking-lookup)
+      require_env STAGING_API_URL ADMIN_JWT PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD ;;
+    reconciliation)
+      require_env STAGING_API_URL ADMIN_JWT PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD ;;
+    report)
+      require_env STAGING_API_URL ADMIN_JWT ;;
+    all)
+      require_env STAGING_API_URL ADMIN_JWT \
+                  PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD \
+                  VERIFY_DB_HOST VERIFY_DB_USER VERIFY_DB_PASSWORD ;;
+    *) err "Unknown phase: $PHASE"; exit 2 ;;
+  esac
+}
 
-REDIS_HOST="${REDIS_HOST:-$(echo "$REDIS_URL" | sed -E 's#redis://([^:@/]+).*#\1#' 2>/dev/null || true)}"
+validate_env_for_phase
+
+REDIS_HOST="${REDIS_HOST:-$(echo "${REDIS_URL:-}" | sed -E 's#redis://([^:@/]+).*#\1#' 2>/dev/null || true)}"
 
 # Run a SQL query against the staging source DB and print the result.
 # Used for booking-lookup and reconciliation phases, which need fields the
@@ -197,7 +228,9 @@ phase_db_restore() {
   rto=$((t1 - t0))
   log "Restore completed in ${rto}s (target ${RTO_DB}s)"
 
-  # Validate critical tables
+  # Validate critical tables. A missing table is a real failure; a transient
+  # psql error is logged but does not abort the phase (set -e is disabled for
+  # these checks so a single hiccup does not trip the ERR trap).
   local tables=("users" "properties" "bookings" "payments"
                 "notifications" "audit_logs" "sync_log")
   local missing=0
@@ -212,15 +245,19 @@ phase_db_restore() {
       log "  table $t: $count rows"
     fi
   done
-  [ $missing -ne 0 ] && { RESULTS["db_restore"]="fail"; NOTES["db_restore"]="missing tables"; }
+  if [ $missing -ne 0 ]; then
+    RESULTS["db_restore"]="fail"
+    NOTES["db_restore"]="missing tables"
+  fi
 
-  # Validate extensions
+  # Validate extensions (informational — a missing extension is a warning, not
+  # a drill failure, since pg_restore may legitimately skip unused ones).
   local exts=("uuid-ossp" "pgcrypto" "pgtrgm")
   for e in "${exts[@]}"; do
     local c
     c=$(psql -h "$VERIFY_DB_HOST" -U "$VERIFY_DB_USER" -d "$verify_db" \
       -t -A -c "SELECT COUNT(*) FROM pg_extension WHERE extname='$e';" 2>>"$LOG_FILE" || echo 0)
-    [ "$c" -gt 0 ] && log "  extension $e: present" || warn "  extension $e: MISSING"
+    if [ "${c:-0}" -gt 0 ]; then log "  extension $e: present"; else warn "  extension $e: MISSING"; fi
   done
 
   # Validate RLS policies
@@ -231,7 +268,7 @@ phase_db_restore() {
 
   # Cleanup
   psql -h "$VERIFY_DB_HOST" -U "$VERIFY_DB_USER" -d postgres \
-    -c "DROP DATABASE IF EXISTS $verify_db;" >>"$LOG_FILE" 2>&1
+    -c "DROP DATABASE IF EXISTS $verify_db;" >>"$LOG_FILE" 2>&1 || warn "Could not drop verification DB $verify_db"
   rm -f "$backup_file"
 
   if [ "${RESULTS[db_restore]:-pass}" != "fail" ] && [ "$rto" -le "$RTO_DB" ]; then
@@ -239,7 +276,9 @@ phase_db_restore() {
     NOTES["db_restore"]="rto=${rto}s backup_size=${size} policies=${policy_count}"
   else
     RESULTS["db_restore"]="fail"
-    [ "$rto" -gt "$RTO_DB" ] && NOTES["db_restore"]="rto=${rto}s exceeds ${RTO_DB}s"
+    if [ "$rto" -gt "$RTO_DB" ]; then
+      NOTES["db_restore"]="rto=${rto}s exceeds ${RTO_DB}s"
+    fi
   fi
   log "Phase db_restore: ${RESULTS[db_restore]}"
 }
@@ -255,7 +294,13 @@ phase_cache_rebuild() {
   if [ -z "$REDIS_HOST" ]; then err "REDIS_HOST or REDIS_URL required"; exit 1; fi
 
   log "Flushing staging Redis (DB 0 only)..."
-  redis-cli -h "$REDIS_HOST" -n 0 FLUSHDB >>"$LOG_FILE" 2>&1
+  if ! redis-cli -h "$REDIS_HOST" -n 0 FLUSHDB >>"$LOG_FILE" 2>&1; then
+    err "Redis flush failed against $REDIS_HOST"
+    RESULTS["cache_rebuild"]="fail"
+    NOTES["cache_rebuild"]="redis flush failed host=$REDIS_HOST"
+    log "Phase cache_rebuild: ${RESULTS[cache_rebuild]}"
+    return
+  fi
   local t0 t1 rto
   t0=$(date +%s)
 
@@ -279,27 +324,43 @@ phase_cache_rebuild() {
   t1=$(date +%s)
   rto=$((t1 - t0))
 
-  # Verify hit rate on next 100 requests
-  local hits=0 total=100
-  for i in $(seq 1 $total); do
-    local id
-    id=$(echo "$ids" | sed -n "$((i % 10 + 1))p")
-    [ -z "$id" ] && id="${ids%% *}"
-    if [ -n "$id" ]; then
-      curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1 && hits=$((hits + 1))
-    fi
-  done
+  # Verify hit rate on next 100 requests. Only count requests for which we
+  # actually have a property id; otherwise the denominator is wrong and the
+  # hit rate is artificially deflated (a source of flaky failures).
+  local hits=0 attempts=0
+  local id_list=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && id_list+=("$line")
+  done <<< "$ids"
+  if [ "${#id_list[@]}" -eq 0 ]; then
+    warn "No property ids available for cache hit-rate check — skipping hit-rate assertion."
+  else
+    for i in $(seq 1 100); do
+      local id="${id_list[$(( (i - 1) % ${#id_list[@]} ))]}"
+      attempts=$((attempts + 1))
+      if curl -sf "$STAGING_API_URL/properties/$id" -o /dev/null >>"$LOG_FILE" 2>&1; then
+        hits=$((hits + 1))
+      fi
+    done
+  fi
   local hit_rate=0
-  [ "$total" -gt 0 ] && hit_rate=$((hits * 100 / total))
-  log "Cache hit rate on next $total requests: ${hit_rate}% (target > 50%)"
+  if [ "$attempts" -gt 0 ]; then
+    hit_rate=$((hits * 100 / attempts))
+    log "Cache hit rate on next $attempts requests: ${hit_rate}% (target > 50%)"
+  else
+    log "Cache hit rate: not measured (no sample ids)"
+  fi
   log "Cache rebuild completed in ${rto}s (target ${RTO_CACHE}s)"
 
-  if [ "$rto" -le "$RTO_CACHE" ] && [ "$hit_rate" -gt 50 ]; then
+  local hit_ok=1
+  if [ "$attempts" -gt 0 ] && [ "$hit_rate" -le 50 ]; then hit_ok=0; fi
+
+  if [ "$rto" -le "$RTO_CACHE" ] && [ "$hit_ok" -eq 1 ]; then
     RESULTS["cache_rebuild"]="pass"
-    NOTES["cache_rebuild"]="rto=${rto}s hit_rate=${hit_rate}%"
+    NOTES["cache_rebuild"]="rto=${rto}s hit_rate=${hit_rate}% attempts=${attempts}"
   else
     RESULTS["cache_rebuild"]="fail"
-    NOTES["cache_rebuild"]="rto=${rto}s hit_rate=${hit_rate}% (target rto<=${RTO_CACHE}s hit>50%)"
+    NOTES["cache_rebuild"]="rto=${rto}s hit_rate=${hit_rate}% attempts=${attempts} (target rto<=${RTO_CACHE}s hit>50%)"
   fi
   log "Phase cache_rebuild: ${RESULTS[cache_rebuild]}"
 }
@@ -336,12 +397,14 @@ phase_sync_resume() {
   # entry". A direct ledger-lag check would need stellar-cli (not installed in
   # the drill runner); the sync_log age is a sufficient freshness proxy for
   # the drill and is recorded as a known gap in §7.2.
-  local last_sync age converged=0
+  local last_sync="" age=0 converged=0
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 15
     last_sync=$(db_query "SELECT COALESCE(MAX(synced_at), 'epoch'::timestamptz) FROM sync_log WHERE entity_type='booking';" || echo "")
-    if [[ "$last_sync" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] && [ "$last_sync" != "" ]; then
-      age=$(($(date +%s) - $(date -u -d "$last_sync" +%s 2>/dev/null || echo 0)))
+    if [[ "$last_sync" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+      local sync_epoch
+      sync_epoch=$(date -u -d "$last_sync" +%s 2>/dev/null || echo 0)
+      age=$(($(date +%s) - sync_epoch))
       log "  poll $i: last booking sync ${age}s ago"
       # 120s freshness target — far tighter than the §2 30-ledger (~150s) target
       if [ "$age" -ge 0 ] && [ "$age" -le 120 ]; then converged=1; break; fi
@@ -549,11 +612,17 @@ phase_reconciliation() {
   #   A) Completed/Cancelled bookings with no escrow_id (orphaned escrow absence)
   #   B) Quarantined bookings stuck in escrow_reconcile_failed
   #   C) Pending/Confirmed bookings whose escrow_id is null (escrow never locked)
+  # Each query is guarded so a transient DB error is logged as a warning and
+  # treated as 0 rather than aborting the whole drill via the ERR trap.
   local disc_a disc_b disc_c discrepancies
-  disc_a=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Completed','Cancelled') AND (escrow_id IS NULL OR escrow_id = '');" || echo 0)
-  disc_b=$(db_query "SELECT COUNT(*) FROM bookings WHERE status = 'escrow_reconcile_failed';" || echo 0)
-  disc_c=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Pending','Confirmed') AND (escrow_id IS NULL OR escrow_id = '');" || echo 0)
-  discrepancies=$(( ${disc_a:-0} + ${disc_b:-0} + ${disc_c:-0} ))
+  disc_a=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Completed','Cancelled') AND (escrow_id IS NULL OR escrow_id = '');" 2>/dev/null || echo 0)
+  disc_b=$(db_query "SELECT COUNT(*) FROM bookings WHERE status = 'escrow_reconcile_failed';" 2>/dev/null || echo 0)
+  disc_c=$(db_query "SELECT COUNT(*) FROM bookings WHERE status IN ('Pending','Confirmed') AND (escrow_id IS NULL OR escrow_id = '');" 2>/dev/null || echo 0)
+  disc_a="${disc_a:-0}"; disc_b="${disc_b:-0}"; disc_c="${disc_c:-0}"
+  [[ "$disc_a" =~ ^[0-9]+$ ]] || { warn "disc_a query failed ('$disc_a'), treating as 0"; disc_a=0; }
+  [[ "$disc_b" =~ ^[0-9]+$ ]] || { warn "disc_b query failed ('$disc_b'), treating as 0"; disc_b=0; }
+  [[ "$disc_c" =~ ^[0-9]+$ ]] || { warn "disc_c query failed ('$disc_c'), treating as 0"; disc_c=0; }
+  discrepancies=$(( disc_a + disc_b + disc_c ))
 
   t1=$(date +%s)
   rto=$((t1 - t0))
@@ -603,6 +672,9 @@ phase_report() {
   fi
 
   write_report
+  # Disarm the ERR trap so the final exit status reflects only the drill
+  # result, not a stray non-zero command during report writing.
+  trap - ERR
 }
 
 # ---------------------------------------------------------------------------
@@ -634,5 +706,10 @@ case "$PHASE" in
   *) err "Unknown phase: $PHASE"; exit 2 ;;
 esac
 
-# Exit non-zero on failure so CI can gate
-[ "${RESULTS[overall]:-pass}" = "pass" ] && exit 0 || exit 1
+# Exit non-zero on failure so CI can gate. Only a real drill failure (overall
+# != pass) yields a non-zero exit; missing env / bad args already exited above.
+if [ "${RESULTS[overall]:-pass}" = "pass" ]; then
+  exit 0
+else
+  exit 1
+fi

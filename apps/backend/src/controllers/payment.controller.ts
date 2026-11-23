@@ -20,6 +20,7 @@ import {
   createPaymentIntent,
   getPaymentStatus,
   updatePaymentStatus,
+  getPaymentTimeline,
 } from '@/services/payment.service.js';
 import {
   submitTransaction,
@@ -38,6 +39,57 @@ import {
   type SupportedCurrency,
 } from '@/utils/payment.utils.js';
 import { supabase } from '@/config/supabase.js';
+import { randomUUID } from 'node:crypto';
+
+// ─── Correlation context (#993) ────────────────────────────────────────────────
+
+/**
+ * Correlation identifiers propagated through API responses, service logs,
+ * queue records, and provider calls. Only non-secret IDs are exposed.
+ */
+interface CorrelationContext {
+  correlationId: string;
+  bookingId?: string;
+  operationId?: string;
+}
+
+/**
+ * Reads the inbound correlation id (set by the correlation middleware) or
+ * generates a new one. The value is echoed back on every response so an
+ * operator can trace a user-visible failure through backend and worker events.
+ */
+function resolveCorrelation(req: AuthRequest, bookingId?: string, operationId?: string): CorrelationContext {
+  const inbound = (req as AuthRequest & { correlationId?: string }).correlationId;
+  const correlationId =
+    typeof inbound === 'string' && inbound.trim() ? inbound.trim() : randomUUID();
+  return { correlationId, bookingId, operationId };
+}
+
+/** Attaches correlation headers so clients/operators can reference the request. */
+function applyCorrelationHeaders(res: Response, ctx: CorrelationContext): void {
+  res.setHeader('X-Correlation-Id', ctx.correlationId);
+  if (ctx.bookingId) res.setHeader('X-Booking-Id', ctx.bookingId);
+  if (ctx.operationId) res.setHeader('X-Operation-Id', ctx.operationId);
+}
+
+/** Builds an error body that always carries the correlation context. */
+function correlatedError(
+  ctx: CorrelationContext,
+  code: string,
+  message: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    error: {
+      code,
+      message,
+      correlationId: ctx.correlationId,
+      bookingId: ctx.bookingId,
+      operationId: ctx.operationId,
+      ...extra,
+    },
+  };
+}
 
 // ─── Quote generation ──────────────────────────────────────────────────────────
 
@@ -70,6 +122,8 @@ export async function getPaymentQuote(req: AuthRequest, res: Response): Promise<
   }
 
   const { bookingId } = parsed.data;
+  const ctx = resolveCorrelation(req, bookingId);
+  applyCorrelationHeaders(res, ctx);
 
   // Booking total_price is the server-computed, persisted price agreed at
   // booking time. Repricing here could change a quote after policy updates.
@@ -119,6 +173,12 @@ export async function getPaymentQuote(req: AuthRequest, res: Response): Promise<
 
   const breakdown = buildAmountBreakdown(amountStroops, currency);
 
+  // Conversion details are disclosed so support and users can audit the quote
+  // (#950). USDC is the settlement currency, so the rate is 1:1 and no
+  // conversion rounding is applied; the fields are still exposed so the
+  // contract is stable if a non-1:1 currency is ever added.
+  const rateTimestamp = new Date().toISOString();
+
   res.json({
     bookingId,
     amountStroops: amountStroops.toString(),
@@ -127,6 +187,21 @@ export async function getPaymentQuote(req: AuthRequest, res: Response): Promise<
     quoteHash,
     expiresAt,
     quoteVersion: '1',
+    // #950 — precision and conversion disclosure
+    precision: {
+      currencyDecimals: 7, // USDC on Stellar uses 7 decimal places (stroops)
+      displayDecimals: 2,
+      minorUnit: 'stroop',
+    },
+    conversion: {
+      sourceCurrency: currency,
+      targetCurrency: currency,
+      rate: '1',
+      rateSource: 'fixed:usdc-par',
+      rateTimestamp,
+      roundingMode: 'half-up',
+      roundingApplied: false,
+    },
   });
 }
 
@@ -213,19 +288,12 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
   } = parsed.data;
   const tenantId = req.userId!;
 
-  // ── 0. Validate wallet/backend network agreement before anything else ──────
-  const networkCheck = validateNetworkAgreement(network, networkPassphrase);
-  if (!networkCheck.ok) {
-    res.status(422).json({
-      error: {
-        code: 'NETWORK_MISMATCH',
-        message: networkCheck.message,
-        activeNetwork: getActiveNetwork(),
-        walletNetwork: network,
-      },
-    });
-    return;
-  }
+  // ── 0. Establish correlation context (#993) ────────────────────────────────
+  // The operation key is derived from the booking + quote so retries of the
+  // same submission map to the same operation record.
+  const operationId = `pay:${bookingId}:${quoteHash.slice(0, 16)}`;
+  const ctx = resolveCorrelation(req, bookingId, operationId);
+  applyCorrelationHeaders(res, ctx);
 
   // ── 1. Validate amount and currency (#768) ──────────────────────────────────
   const errors = validatePaymentAmount(amountStroops, currency);
@@ -319,7 +387,9 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     tenantId,
     amountStroops: stroops,
     quoteHash,
-    metadata: { ...metadata, network: getActiveNetwork() },
+    metadata,
+    correlationId: ctx.correlationId,
+    operationId: ctx.operationId,
   });
 
   // ── 4. Submit signed XDR to Stellar ─────────────────────────────────────────
@@ -332,32 +402,39 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
   } catch (err) {
     await updatePaymentStatus(payment.id, null, 'failed');
     await recordFailure('stellar_horizon');
-    res.status(502).json({
-      error: {
-        code: 'TX_SUBMIT_FAILED',
-        message: err instanceof Error ? err.message : 'Transaction submission failed',
-        // A submission error is ambiguous: the transaction may still be
-        // included in a ledger. Do not encourage a blind retry.
-        retryGuidance: 'do_not_retry_until_reconciled',
-      },
-    });
+    res.status(502).json(
+      correlatedError(
+        ctx,
+        'TX_SUBMIT_FAILED',
+        err instanceof Error ? err.message : 'Transaction submission failed',
+      ),
+    );
     return;
   }
 
   // ── 5. Kick off async confirmation polling (does not block the response) ───
-  confirmTransaction(payment.id, txHash).catch((err) => {
-    console.error('[Payment] Confirmation polling failed for', payment.id, err);
+  // Correlation context is handed to the worker so deferred work retains it.
+  confirmTransaction(payment.id, txHash, {
+    correlationId: ctx.correlationId,
+    bookingId,
+    operationId: ctx.operationId,
+  }).catch((err) => {
+    console.error('[Payment] Confirmation polling failed', {
+      paymentId: payment.id,
+      correlationId: ctx.correlationId,
+      bookingId,
+      operationId: ctx.operationId,
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 
-  // 'submitted' means the transaction was broadcast — NOT confirmed on-ledger.
-  // Clients must poll the status endpoint until 'confirmed' or 'failed'.
   res.status(202).json({
     paymentId: payment.id,
     status: 'submitted',
     txHash,
-    network: getActiveNetwork(),
-    confirmed: false,
-    retryGuidance: 'poll_status',
+    correlationId: ctx.correlationId,
+    bookingId,
+    operationId: ctx.operationId,
   });
 }
 
@@ -378,13 +455,18 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
   const payment = await getPaymentStatus(id);
 
   if (!payment) {
-    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Payment not found' } });
+    const ctx = resolveCorrelation(req);
+    applyCorrelationHeaders(res, ctx);
+    res.status(404).json(correlatedError(ctx, 'NOT_FOUND', 'Payment not found'));
     return;
   }
 
+  const ctx = resolveCorrelation(req, payment.booking_id, `pay:${payment.booking_id}:${payment.id}`);
+  applyCorrelationHeaders(res, ctx);
+
   // Only the owning tenant or an admin may query
   if (payment.tenant_id !== req.userId && req.user?.role !== 'admin') {
-    res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
+    res.status(403).json(correlatedError(ctx, 'FORBIDDEN', 'Access denied'));
     return;
   }
 
@@ -422,6 +504,91 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     currency: payment.currency,
     retryGuidance,
     updatedAt: payment.updated_at,
+    correlationId: ctx.correlationId,
+    operationId: ctx.operationId,
+  });
+}
+
+// ─── Payment timeline (#951) ───────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/payments/booking/:bookingId/timeline
+ *
+ * Returns a privacy-safe, ordered payment timeline for a booking.  Visible to
+ * the booking tenant and the booking host (and admins).  Fields are filtered by
+ * role so neither party sees the other's private identifiers.
+ *
+ * The timeline is derived from the canonical payment ledger; provider
+ * processing states are distinguished from final ledger confirmation so the UI
+ * never shows a premature success.
+ *
+ * Returns: { bookingId, terminal, currentStatus, steps: [{ key, label, status, timestamp, detail? }] }
+ */
+export async function getTimeline(req: AuthRequest, res: Response): Promise<void> {
+  const bookingId = req.params.bookingId;
+  if (typeof bookingId !== 'string' || !bookingId.trim()) {
+    res.status(400).json({ error: { code: 'INVALID_BOOKING_ID', message: 'Booking ID is required' } });
+    return;
+  }
+
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const { data: booking, error } = await supabase
+    .from('bookings')
+    .select('id, tenant_id, host_id')
+    .eq('id', bookingId)
+    .single();
+
+  if (error || !booking) {
+    res.status(404).json({ error: { code: 'BOOKING_NOT_FOUND', message: 'Booking not found' } });
+    return;
+  }
+
+  const bookingRow = booking as { id: string; tenant_id: string; host_id: string | null };
+
+  const isAdmin = req.user?.role === 'admin';
+  const isTenant = bookingRow.tenant_id === userId;
+  const isHost = bookingRow.host_id === userId;
+
+  if (!isAdmin && !isTenant && !isHost) {
+    res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
+    return;
+  }
+
+  const role: 'tenant' | 'host' | 'admin' = isAdmin ? 'admin' : isTenant ? 'tenant' : 'host';
+
+  const timeline = await getPaymentTimeline(bookingId);
+
+  // Role-based field filtering: only expose fields each participant may see.
+  const steps = timeline.steps.map((step) => {
+    const base = {
+      key: step.key,
+      label: step.label,
+      status: step.status,
+      timestamp: step.timestamp,
+      // Distinguish provider processing from final ledger confirmation.
+      phase: step.phase,
+    };
+    if (role === 'admin') {
+      return { ...base, detail: step.detail, txHash: step.txHash };
+    }
+    if (role === 'tenant') {
+      return { ...base, detail: step.tenantDetail ?? step.detail };
+    }
+    // host: never expose the tenant's tx hash or internal detail
+    return { ...base, detail: step.hostDetail ?? null };
+  });
+
+  res.json({
+    bookingId,
+    role,
+    terminal: timeline.terminal,
+    currentStatus: timeline.currentStatus,
+    steps,
   });
 }
 
@@ -465,12 +632,19 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
 
   const payment = await getPaymentStatus(id);
   if (!payment) {
-    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Payment not found' } });
+    const ctx = resolveCorrelation(req);
+    applyCorrelationHeaders(res, ctx);
+    res.status(404).json(correlatedError(ctx, 'NOT_FOUND', 'Payment not found'));
     return;
   }
 
+  // Retries reuse the original operation key so idempotency records and
+  // worker events stay tied to the same booking + operation (#949, #993).
+  const ctx = resolveCorrelation(req, payment.booking_id, `pay:${payment.booking_id}:${payment.id}`);
+  applyCorrelationHeaders(res, ctx);
+
   if (payment.tenant_id !== req.userId) {
-    res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
+    res.status(403).json(correlatedError(ctx, 'FORBIDDEN', 'Access denied'));
     return;
   }
 
@@ -522,23 +696,22 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
   }
 
   try {
-    const result = await retryTransaction(id, parsed.data.signedXdr);
-    const status = String(result.status).toLowerCase();
+    const result = await retryTransaction(id, parsed.data.signedXdr, {
+      correlationId: ctx.correlationId,
+      bookingId: payment.booking_id,
+      operationId: ctx.operationId,
+    });
     res.json({
       paymentId: id,
       txHash: result.txHash,
       status: result.status,
-      confirmed: status === 'confirmed',
-      network: getActiveNetwork(),
-      retryGuidance: status === 'confirmed' ? 'none' : 'poll_status',
+      correlationId: ctx.correlationId,
+      bookingId: payment.booking_id,
+      operationId: ctx.operationId,
     });
   } catch (err) {
-    res.status(422).json({
-      error: {
-        code: 'RETRY_FAILED',
-        message: err instanceof Error ? err.message : 'Retry failed',
-        retryGuidance: 'do_not_retry_until_reconciled',
-      },
-    });
+    res.status(422).json(
+      correlatedError(ctx, 'RETRY_FAILED', err instanceof Error ? err.message : 'Retry failed'),
+    );
   }
 }

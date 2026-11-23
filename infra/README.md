@@ -4,6 +4,17 @@ This directory contains the declarative infrastructure configuration for all
 Rentars environments.  It is the authoritative source for environment topology,
 secret references, network layout, and service configuration.
 
+> **Operator procedures live elsewhere.** This file describes *what* the
+> infrastructure is. For *how* to deploy, verify, and roll back, see:
+> - [`../DEPLOYMENT.md`](../DEPLOYMENT.md) — staging/testnet deployment guide,
+>   prerequisites, verification steps, and production limitations.
+> - [`../docs/RECOVERY_RUNBOOK.md`](../docs/RECOVERY_RUNBOOK.md) — incident
+>   response, backup restore, and failover procedures.
+>
+> Capabilities described here are **code-complete** unless explicitly marked
+> **deployment-verified**. Real-network and mainnet steps are gated and require
+> operator approval.
+
 ---
 
 ## Directory layout
@@ -38,11 +49,29 @@ infra/
 
 ## Environments
 
-| Environment | Purpose | URL pattern | Supabase project |
-|---|---|---|---|
-| `local` | Developer workstation | `localhost:3000/3001` | Local Supabase CLI |
-| `staging` | Pre-production validation | `staging.rentars.app` | Separate Supabase project |
-| `production` | Live user traffic | `rentars.app` | Production Supabase project |
+| Environment | Purpose | Frontend URL | Backend API URL | Supabase project |
+|---|---|---|---|---|
+| `local` | Developer workstation | `http://localhost:3000` | `http://localhost:3001` | Local Supabase CLI (`supabase start`) |
+| `staging` | Pre-production validation | `https://staging.rentars.app` | `https://api.staging.rentars.app` | Separate staging Supabase project |
+| `production` | Live user traffic | `https://rentars.app` | `https://api.rentars.app` | Production Supabase project |
+
+Each environment uses a **distinct Supabase project**; never point staging or
+local tooling at the production project. The local stack is started with the
+Supabase CLI and its ports are defined in `supabase/config.toml` (API `54321`,
+DB `54322`, Studio `54323`).
+
+### Service ports
+
+| Service | Local port | Notes |
+|---|---|---|
+| Frontend (`apps/web`) | `3000` | Next.js dev server |
+| Backend API (`apps/backend`) | `3001` | Bun HTTP server |
+| Redis | `6379` | Local Docker Compose only |
+| Nginx (reverse proxy) | `80` / `443` | Staging/production stacks only |
+| Supabase API / DB / Studio | `54321` / `54322` / `54323` | Local Supabase CLI |
+
+Ports in `docker-compose.staging.yml` and `docker-compose.prod.yml` must match
+this table; update both files and this table together.
 
 ---
 
@@ -54,6 +83,13 @@ All secrets (API keys, JWT secrets, database passwords, TLS certificates) are
 stored in a secrets provider and referenced by name.  See each environment's
 `secrets.reference.md` for the full list of required keys and the provider path
 where each value lives.
+
+The committed `.env.staging` / `.env.production` files contain **non-secret
+overrides only** (ports, log levels, feature flags, public URLs). Any key whose
+name matches `*_SECRET`, `*_KEY`, `*_PASSWORD`, `*_TOKEN`, or `DATABASE_URL`
+must appear only in `secrets.reference.md` and the provider — never in a
+committed file. Local developer secrets belong in an untracked `.env.local`
+(git-ignored); use the committed `.env.example` templates as the starting point.
 
 Recommended providers (choose one per deployment target):
 - **AWS Secrets Manager** — inject via ECS task definition `secrets:` block
@@ -108,7 +144,17 @@ controlled through vendor dashboards:
 | Resource | Vendor | Manual steps | Tracked in |
 |---|---|---|---|
 | Supabase project | Supabase | Project creation, extensions, connection pooler | `environments/*/secrets.reference.md` |
-| Stellar contract deployment | Stellar / Soroban | `soroban contract deploy` CLI | `apps/contracts/DEPLOY.md` |
+| Stellar contract deployment | Stellar / Soroban | `soroban contract deploy` CLI (gated; see `../DEPLOYMENT.md`) | `apps/contracts/DEPLOY.md` |
 | Trustless Work API key | Trustless Work | Dashboard key rotation | Secrets provider |
 | DNS records | Cloudflare / Route 53 | Manual zone delegation | Ops Notion page |
 | TLS certificates | Let's Encrypt / ACM | Auto-renewed via ACME | n/a |
+
+### Deployment verification status
+
+| Capability | Status | Verified by |
+|---|---|---|
+| Local stack (Compose + Supabase CLI) | **Deployment-verified** | `../DEPLOYMENT.md` local section |
+| Staging stack (Compose + migrations) | **Deployment-verified** | `../DEPLOYMENT.md` staging section |
+| Terraform plan/apply pipeline | Code-complete | `infra-plan` / `infra-apply` CI jobs |
+| Production stack | **Not deployment-verified** | Requires gated operator run |
+| Mainnet contract deployment | **Gated** | Operator approval + `../DEPLOYMENT.md` |

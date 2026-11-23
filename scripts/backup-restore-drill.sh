@@ -95,10 +95,16 @@ require_env() {
 }
 
 require_tools() {
-  local tool
+  local tool missing=()
   for tool in "$@"; do
-    command -v "$tool" >/dev/null 2>&1 || fatal "required tool not found: $tool"
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      log "required tool not found: $tool"
+      missing+=("$tool")
+    fi
   done
+  if (( ${#missing[@]} )); then
+    fatal "missing required tools: ${missing[*]}"
+  fi
 }
 
 pg_src() {
@@ -155,15 +161,30 @@ write_report() {
 }
 
 drop_verify_db() {
-  pg_verify postgres -c "DROP DATABASE IF EXISTS \"$VERIFY_DB\"" >/dev/null 2>&1 || true
+  local attempt
+  # Terminate any lingering sessions (e.g. from a failed restore) so DROP
+  # DATABASE cannot fail with "database is being accessed by other users".
+  pg_verify postgres -c "
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+    WHERE datname = '$VERIFY_DB' AND pid <> pg_backend_pid()" >/dev/null 2>&1 || true
+  for attempt in 1 2 3; do
+    if pg_verify postgres -c "DROP DATABASE IF EXISTS \"$VERIFY_DB\"" >/dev/null 2>&1; then
+      return 0
+    fi
+    log "DROP DATABASE $VERIFY_DB failed (attempt $attempt); retrying"
+    sleep 2
+  done
+  log "WARNING: could not drop temporary database $VERIFY_DB; remove it manually"
+  return 1
 }
 
 finish() {
   local rc=$?
   set +e
   if (( VERIFY_CREATED )); then
-    drop_verify_db
-    log "Dropped temporary database $VERIFY_DB"
+    if drop_verify_db; then
+      log "Dropped temporary database $VERIFY_DB"
+    fi
   fi
   write_report "$rc"
   log "Report written to $REPORT_FILE"
@@ -179,11 +200,15 @@ trap finish EXIT
 
 use_provided_backup() {
   local src="$DRILL_SOURCE_BACKUP"
-  if [[ ! -f "$src" || ! -f "$src.sha256" ]]; then
-    fatal "DRILL_SOURCE_BACKUP requires $src and $src.sha256"
+  if [[ ! -f "$src" ]]; then
+    fatal "DRILL_SOURCE_BACKUP points to a missing file: $src"
   fi
-  cp "$src" "$WORK_DIR/backup.dump.enc"
-  cp "$src.sha256" "$WORK_DIR/backup.dump.enc.sha256"
+  if [[ ! -f "$src.sha256" ]]; then
+    fatal "DRILL_SOURCE_BACKUP requires a checksum manifest next to it: $src.sha256"
+  fi
+  cp "$src" "$WORK_DIR/backup.dump.enc" || fatal "could not copy $src into the work directory"
+  cp "$src.sha256" "$WORK_DIR/backup.dump.enc.sha256" \
+    || fatal "could not copy $src.sha256 into the work directory"
   BACKUP_TAKEN_AT="$(stat -c %Y "$src")"
   SOURCE_MODE=provided
   log "Using provided backup $src"
@@ -235,20 +260,27 @@ retain_backup() {
 verify_checksum() {
   local expected actual
   expected="$(awk 'NR == 1 {print $1}' "$WORK_DIR/backup.dump.enc.sha256")"
-  actual="$(sha256sum "$WORK_DIR/backup.dump.enc" | awk '{print $1}')"
+  if ! actual="$(sha256sum "$WORK_DIR/backup.dump.enc" | awk '{print $1}')"; then
+    abort_check backup_checksum "could not compute sha256 of the backup file"
+  fi
   BACKUP_SHA256="$actual"
   BACKUP_BYTES="$(stat -c %s "$WORK_DIR/backup.dump.enc")"
 
-  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
-    abort_check backup_checksum "sha256 does not match manifest: backup is incomplete or corrupt"
+  if [[ -z "$expected" ]]; then
+    abort_check backup_checksum "checksum manifest is empty or unreadable"
+  fi
+  if [[ "$expected" != "$actual" ]]; then
+    abort_check backup_checksum "sha256 does not match manifest: backup is incomplete or corrupt (expected $expected, got $actual)"
   fi
   check backup_checksum pass "sha256 matches manifest ($BACKUP_BYTES bytes)"
 }
 
 decrypt_backup() {
-  openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:BACKUP_ENCRYPTION_KEY \
-    -in "$WORK_DIR/backup.dump.enc" -out "$WORK_DIR/backup.dump" 2>>"$LOG_FILE" \
-    || abort_check backup_decrypt "decryption failed: wrong key or corrupt file"
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:BACKUP_ENCRYPTION_KEY \
+    -in "$WORK_DIR/backup.dump.enc" -out "$WORK_DIR/backup.dump" 2>>"$LOG_FILE"; then
+    rm -f "$WORK_DIR/backup.dump"
+    abort_check backup_decrypt "decryption failed: wrong BACKUP_ENCRYPTION_KEY or corrupt file"
+  fi
   check backup_decrypt pass "decrypted with BACKUP_ENCRYPTION_KEY"
 }
 
@@ -262,8 +294,11 @@ inspect_archive() {
 }
 
 create_verify_db() {
-  pg_verify postgres -c "CREATE DATABASE \"$VERIFY_DB\"" >/dev/null \
-    || fatal "could not create $VERIFY_DB"
+  # A leftover database from a previous aborted run would make CREATE fail.
+  pg_verify postgres -c "DROP DATABASE IF EXISTS \"$VERIFY_DB\"" >/dev/null 2>&1 || true
+  if ! pg_verify postgres -c "CREATE DATABASE \"$VERIFY_DB\"" >/dev/null; then
+    fatal "could not create temporary database $VERIFY_DB on $VERIFY_DB_HOST:$VERIFY_DB_PORT"
+  fi
   VERIFY_CREATED=1
   log "Created temporary database $VERIFY_DB"
 }
@@ -367,7 +402,7 @@ main() {
     require_env PROD_DB_HOST PROD_DB_USER PROD_DB_PASSWORD
     require_tools pg_dump
   fi
-  require_tools psql pg_restore openssl sha256sum awk sed
+  require_tools psql pg_restore openssl sha256sum awk sed stat mktemp
 
   log "=== Backup restore drill $DRILL_ID ==="
   if [[ -n "${DRILL_SOURCE_BACKUP:-}" ]]; then

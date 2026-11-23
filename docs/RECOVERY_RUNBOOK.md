@@ -696,6 +696,34 @@ closure. Retrospectives append further rows in the same format.
 Retrospective-added rows are appended below the pre-identified rows, never
 above them, so the history of pre-identified gaps stays auditable.
 
+#### 7.2.1 Follow-up risks — recovery drill 2026-10-25 (FAILED)
+
+The recovery drill run on **2026-10-25** failed. The full logs are in the
+workflow run for
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml)
+and the machine-readable results are in the uploaded `recovery_drill_*.json`
+artifact attached to that run. The risks below are derived from that report
+and from the §6.8 sign-off table for the run.
+
+**Closure rule.** This drill's issue **cannot be closed** until every risk in
+the table below has an owner (A) and a due date, and each row's status is
+either `Closed` or has a linked tracking issue. A row with a blank owner or a
+blank due date blocks closure. The Incident Commander verifies this at the
+retrospective (§7) and records the verification in the drill issue.
+
+| # | Risk / gap (from the 2026-10-25 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| D1 | Sync routes returned 404 during the drill: `sync.routes.ts` is not mounted in `apps/backend/src/routes/index.ts`, so §6.4 sync resume could not run and the phase failed. | §6.4 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| D2 | Reconcile trigger returned 404: `reconcileAllPendingEscrows` is not exposed via HTTP, so §6.7 could only verify state, not a fresh reconcile run. | §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| D3 | Sync freshness was measured via `sync_log` age only; no direct ledger-lag check, so §6.4 freshness could not be independently confirmed. | §6.4 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| D4 | Booking lookup (§6.6) used the last synced on-chain status rather than a fresh contract read; on-chain agreement could not be proven live. | §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| D5 | Aggregate target not met: booking lookup and payment reconciliation did not complete within 45 min of detection (see §6.8 aggregate row in the drill report). | §6.8 | Incident Commander | 2026-11-08 | (issue link) | Open |
+
+Rows D1–D5 are appended below the pre-identified rows (#1, #2) so the history
+of pre-identified gaps stays auditable. If the retrospective identifies
+additional gaps from the 2026-10-25 run, append them here in the same format
+with an owner and a due date before the issue is closed.
+
 ### 7.3 Drill history
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |

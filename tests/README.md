@@ -8,11 +8,17 @@ Complete testing strategy for Rentars: unit, integration, E2E, contract, perform
 
 | Layer | Tool | Location | Runner |
 |---|---|---|---|
-| Backend unit tests | Bun test | `apps/backend/tests/unit/` | `bun test tests/unit` |
-| Backend integration tests | Bun test + Supertest | `apps/backend/tests/integration/` | `bun test tests/integration` |
-| Frontend unit tests | Vitest + Testing Library | `apps/web/src/**/*.test.tsx` | `vitest run` |
-| Frontend E2E tests | Playwright | `apps/web/e2e/` | `playwright test` |
-| Visual regression | Playwright snapshots | `apps/web/e2e/visual-regression.spec.ts` | `playwright test --update-snapshots` |
+| Backend unit tests | Bun test | `apps/backend/tests/unit/` | `bun run test:unit` |
+| Backend integration tests | Bun test + Supertest | `apps/backend/tests/integration/` | `bun run test:integration` |
+| Backend RLS tests | Bun test | `apps/backend/tests/rls/` | `bun run test:rls` |
+| Backend contract tests | Bun test | `apps/backend/tests/contract/` | `bun run test:contract` |
+| Backend property-based tests | Bun test | `apps/backend/tests/property-based/` | `bun run test:property-based` |
+| Backend concurrency tests | Bun test | `apps/backend/tests/concurrency/` | `bun run test:concurrency` |
+| Backend journey tests | Bun test | `apps/backend/tests/journey/` | `bun run test:journey` |
+| Backend performance tests | Bun test | `apps/backend/tests/performance/` | `bun run test:performance` |
+| Frontend unit tests | Vitest + Testing Library | `apps/web/src/**/*.test.tsx` | `yarn test --run` |
+| Frontend E2E tests | Playwright | `apps/web/e2e/` | `yarn e2e` |
+| Visual regression | Playwright snapshots | `apps/web/e2e/visual-regression.spec.ts` | `yarn e2e --update-snapshots` |
 | Soroban contract tests | cargo test | `apps/contracts/contracts/*/src/test.rs` | `cargo test` |
 | Performance tests | K6 | `tests/performance/k6/` | `k6 run` |
 | Security scanning | OWASP ZAP + Gitleaks + CodeQL | CI only | Automated |
@@ -30,10 +36,28 @@ cd apps/backend
 bun test
 
 # Unit only
-bun test tests/unit
+bun run test:unit
 
 # Integration only
-bun test tests/integration
+bun run test:integration
+
+# RLS policies
+bun run test:rls
+
+# Contract tests
+bun run test:contract
+
+# Property-based tests
+bun run test:property-based
+
+# Concurrency tests
+bun run test:concurrency
+
+# Journey tests
+bun run test:journey
+
+# Performance tests
+bun run test:performance
 
 # With coverage (lcov + text)
 bun test --coverage --coverage-reporter=lcov --coverage-dir=./coverage
@@ -45,22 +69,22 @@ bun test --coverage --coverage-reporter=lcov --coverage-dir=./coverage
 cd apps/web
 
 # All tests
-npx vitest run
+yarn test --run
 
 # Watch mode
-npx vitest
+yarn test
 
 # With coverage
-npx vitest run --coverage
+yarn test --run --coverage
 
-# E2E tests (requires app running on :3001)
-npx playwright test
+# E2E tests (requires the dev server running on :3000)
+yarn e2e
 
 # E2E specific browser
-npx playwright test --project=chromium
+yarn e2e --project=chromium
 
 # Visual regression (update snapshots)
-npx playwright test e2e/visual-regression.spec.ts --update-snapshots
+yarn e2e e2e/visual-regression.spec.ts --update-snapshots
 ```
 
 ### Smart Contracts

@@ -55,6 +55,7 @@ erDiagram
     date check_in NOT NULL
     date check_out NOT NULL
     decimal total_price NOT NULL
+    varchar display_currency
     varchar status
     varchar escrow_id
     varchar blockchain_booking_id
@@ -107,6 +108,7 @@ Indexes:
 | check_in | DATE | NOT NULL | Check-in date |
 | check_out | DATE | NOT NULL, CHECK > check_in | Check-out date |
 | total_price | DECIMAL(10,2) | NOT NULL, CHECK > 0 | Total booking price |
+| display_currency | VARCHAR(3) | NOT NULL, DEFAULT 'USD' | Display currency for the booking total (added by `00029_add_display_currency_to_bookings.sql`) |
 | status | VARCHAR(50) | DEFAULT 'pending' | Booking status |
 | escrow_id | VARCHAR(255) | Nullable | Escrow contract identifier |
 | blockchain_booking_id | VARCHAR(255) | Nullable | On-chain booking identifier |
@@ -271,6 +273,9 @@ bun run validate:migrations
 bun run validate:migrations --dry-run
 ```
 
+Both scripts are defined in `apps/backend/package.json`; run them from
+`apps/backend` (or via `bun run --cwd apps/backend <script>` from the repo root).
+
 ### Seed local data
 
 ```bash
@@ -278,7 +283,21 @@ cd apps/backend && bun run db:seed
 ```
 
 Populates a realistic local dataset (users, properties, availability, bookings, reviews, wishlists,
-notifications) using stable UUIDs — idempotent and safe to re-run.
+notifications) using stable UUIDs — idempotent and safe to re-run. The `db:seed`
+script is also defined in `apps/backend/package.json`.
+
+### Schema changes in this repository
+
+The schema is the cumulative result of the numbered files in
+`apps/backend/database/migrations/`. Notable recent additions:
+
+- `00029_add_display_currency_to_bookings.sql` — adds `bookings.display_currency`
+  (`VARCHAR(3)`, `NOT NULL`, default `'USD'`), used to render booking totals in the
+  user's chosen display currency.
+
+When adding a migration, follow `MIGRATIONS_NAMING.md`, append the file to
+`setup.sql` in order, and re-run the authoritative command above to verify a fresh
+database still builds cleanly.
 
 ### Rollback strategy
 

@@ -18,12 +18,17 @@
 
 import { useCurrency } from '@/hooks/useCurrency';
 import type { DisplayCurrency } from '@/hooks/useCurrency';
+import { formatMinorUnits, getCurrencyPrecision } from '@/lib/currency';
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
 export interface PriceDisplayProps {
-  /** Amount in USDC (the authoritative charge amount). */
-  amountUsdc: number;
+  /**
+   * Amount in USDC (the authoritative charge amount), expressed in USDC
+   * minor units (6 decimals) as an integer string or number. Never a
+   * floating-point dollar value — this keeps the primary figure exact.
+   */
+  amountUsdc: number | string;
   /** Optional suffix appended after the USDC figure, e.g. "/ night". */
   suffix?: string;
   /** Extra class names for the wrapper element. */
@@ -47,6 +52,22 @@ function sizeClasses(size: PriceDisplayProps['size']) {
   }
 }
 
+/** USDC is always denominated in 6-decimal minor units. */
+const USDC_PRECISION = 6;
+
+/** Format a rate age in milliseconds as a short human-readable string. */
+function formatRateAge(ageMs: number): string {
+  if (!Number.isFinite(ageMs) || ageMs < 0) return 'unknown age';
+  const seconds = Math.floor(ageMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function PriceDisplay({
@@ -56,27 +77,42 @@ export default function PriceDisplay({
   currencyOverride,
   size = 'md',
 }: PriceDisplayProps) {
-  const { formatEstimate, displayCurrency, ratesStale, setDisplayCurrency, supportedCurrencies } =
-    useCurrency();
+  const {
+    formatEstimate,
+    displayCurrency,
+    ratesStale,
+    ratesUnavailable,
+    rateTimestamp,
+    roundingMode,
+    supportedCurrencies,
+  } = useCurrency();
 
   const activeCurrency = currencyOverride ?? displayCurrency;
 
-  // Build the local-currency estimate string (null → omit)
+  // Primary USDC figure — always rendered exactly from minor units.
+  const usdcDisplay = formatMinorUnits(amountUsdc, USDC_PRECISION);
+
+  // Build the local-currency estimate string (null → omit).
+  // Never show a converted value when rates are stale or unavailable.
   let estimate: string | null = null;
-  if (activeCurrency !== 'USD') {
+  if (activeCurrency !== 'USD' && !ratesStale && !ratesUnavailable) {
     estimate = formatEstimate(amountUsdc);
   }
+
+  // Per-currency precision used for the estimate (for disclosure).
+  const estimatePrecision = getCurrencyPrecision(activeCurrency);
+
+  // Rate age for support/user disclosure.
+  const rateAge =
+    rateTimestamp != null ? formatRateAge(Date.now() - rateTimestamp) : null;
 
   const sc = sizeClasses(size);
 
   return (
     <span className={`inline-flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 ${className}`}>
-      {/* Primary: USDC amount — always shown */}
+      {/* Primary: USDC amount — always shown, exact from minor units */}
       <span className={`${sc.primary} text-blue-600 dark:text-blue-400 tabular-nums`}>
-        {amountUsdc.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2,
-        })}{' '}
+        {usdcDisplay}{' '}
         USDC
       </span>
 
@@ -96,16 +132,39 @@ export default function PriceDisplay({
           {estimate}
           {' '}
           <span className="text-gray-400 dark:text-gray-500 italic">(estimate)</span>
-          {ratesStale && (
-            <abbr
-              title="Exchange rate may be outdated — charges are always in USDC"
-              className="ml-1 cursor-help text-amber-500 dark:text-amber-400 no-underline"
-              aria-label="Exchange rate may be outdated"
-            >
-              ⚠
-            </abbr>
-          )}
+          <abbr
+            title={[
+              `Converted at ${estimatePrecision}-decimal precision (${roundingMode ?? 'half-up'} rounding).`,
+              rateAge ? `Rate updated ${rateAge}.` : null,
+              'Charges are always in USDC.',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            className="ml-1 cursor-help text-gray-400 dark:text-gray-500 no-underline"
+            aria-label={`Conversion details: ${estimatePrecision}-decimal precision, ${
+              roundingMode ?? 'half-up'
+            } rounding${rateAge ? `, rate updated ${rateAge}` : ''}`}
+          >
+            ⓘ
+          </abbr>
         </span>
+      )}
+
+      {/* Stale / unavailable rate warning — shown without a converted value */}
+      {activeCurrency !== 'USD' && (ratesStale || ratesUnavailable) && (
+        <abbr
+          title={
+            ratesUnavailable
+              ? 'Exchange rate unavailable — charges are always in USDC'
+              : `Exchange rate may be outdated${rateAge ? ` (updated ${rateAge})` : ''} — charges are always in USDC`
+          }
+          className={`${sc.estimate} ml-1 cursor-help text-amber-500 dark:text-amber-400 no-underline`}
+          aria-label={
+            ratesUnavailable ? 'Exchange rate unavailable' : 'Exchange rate may be outdated'
+          }
+        >
+          ⚠
+        </abbr>
       )}
     </span>
   );

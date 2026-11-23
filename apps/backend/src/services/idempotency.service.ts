@@ -25,6 +25,14 @@
  * or whitespace differences in a textually-equivalent body are treated as the
  * same request.  The hash is stored as a 64-character hex string that fits
  * cleanly into `VARCHAR(64)`.
+ *
+ * Correlation
+ * -----------
+ * Each record also persists the originating `correlation_id`, `booking_id`
+ * and `operation_id` so that deferred work (queue records, retries, workers)
+ * can restore the operation context after a restart.  These are non-secret
+ * identifiers only — auth headers, wallet secrets and full payment payloads
+ * are never persisted or logged here.
  */
 
 import { createHash } from 'node:crypto';
@@ -38,6 +46,19 @@ export const IDEMPOTENCY_RETENTION_HOURS = 24;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Non-secret identifiers that tie a request to its asynchronous work.
+ * All fields are optional so callers that do not yet have them can omit them.
+ */
+export interface CorrelationContext {
+  /** Request-scoped correlation id (e.g. from `X-Correlation-Id`). */
+  correlation_id?: string | null;
+  /** Booking id created or referenced by the request, if any. */
+  booking_id?: string | null;
+  /** Operation id for the deferred unit of work, if any. */
+  operation_id?: string | null;
+}
+
 export interface IdempotencyRecord {
   id: string;
   key: string;
@@ -48,6 +69,12 @@ export interface IdempotencyRecord {
   status_code: number;
   /** 'processing' = request in flight; 'completed' = safe to replay. */
   status: 'processing' | 'completed';
+  /** Correlation id of the originating request (nonsecret). */
+  correlation_id: string | null;
+  /** Booking id associated with the request, if any (nonsecret). */
+  booking_id: string | null;
+  /** Operation id for deferred work, if any (nonsecret). */
+  operation_id: string | null;
   created_at: string;
 }
 
@@ -62,6 +89,56 @@ export interface IdempotencyRecord {
 export function hashRequestBody(body: unknown): string {
   const stable = JSON.stringify(body, Object.keys(body as object).sort());
   return createHash('sha256').update(stable).digest('hex');
+}
+
+/** Keys whose values must never be persisted or logged. */
+const SENSITIVE_KEYS = new Set([
+  'authorization',
+  'auth',
+  'token',
+  'access_token',
+  'refresh_token',
+  'id_token',
+  'secret',
+  'wallet_secret',
+  'private_key',
+  'seed_phrase',
+  'mnemonic',
+  'password',
+  'card_number',
+  'cvv',
+  'cvc',
+  'payment_payload',
+  'payment_credentials',
+]);
+
+/**
+ * Recursively redact sensitive values from a response body before it is
+ * persisted.  Auth headers, wallet secrets and full payment payloads are
+ * replaced with `'[REDACTED]'` so they can never leak into the idempotency
+ * store (and therefore never into replay responses or logs).
+ */
+export function redactForStorage(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactForStorage(item));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = SENSITIVE_KEYS.has(k.toLowerCase()) ? '[REDACTED]' : redactForStorage(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Normalise a correlation context, coercing missing values to `null`. */
+function normaliseCorrelation(ctx?: CorrelationContext): Required<CorrelationContext> {
+  return {
+    correlation_id: ctx?.correlation_id ?? null,
+    booking_id: ctx?.booking_id ?? null,
+    operation_id: ctx?.operation_id ?? null,
+  };
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -106,13 +183,17 @@ export async function lookup(
  * @param userId      - Authenticated user ID (scopes the key).
  * @param key         - Value of the `Idempotency-Key` header.
  * @param requestHash - SHA-256 hex digest of the canonical request body.
+ * @param correlation - Nonsecret correlation identifiers to persist so that
+ *                      deferred work can restore the operation context.
  */
 export async function lockKey(
   userId: string,
   key: string,
   requestHash: string,
+  correlation?: CorrelationContext,
 ): Promise<ServiceResponse<{ claimed: true; id: string } | { claimed: false; existing: IdempotencyRecord }>> {
   const cutoff = new Date(Date.now() - IDEMPOTENCY_RETENTION_HOURS * 60 * 60 * 1000).toISOString();
+  const ctx = normaliseCorrelation(correlation);
 
   const { data: inserted, error: insertError } = await supabase
     .from('idempotency_keys')
@@ -123,6 +204,9 @@ export async function lockKey(
       response_body: {},
       status_code: 0,
       status: 'processing',
+      correlation_id: ctx.correlation_id,
+      booking_id: ctx.booking_id,
+      operation_id: ctx.operation_id,
     })
     .select('id')
     .single();
@@ -153,15 +237,31 @@ export async function lockKey(
  * @param id          - UUID of the record returned by lockKey.
  * @param responseBody - The JSON-serialisable response body that was sent.
  * @param statusCode  - The HTTP status code that was sent (e.g. 201).
+ * @param correlation - Optional correlation identifiers to persist/update
+ *                      (e.g. a booking_id discovered while handling the request).
  */
 export async function completeKey(
   id: string,
   responseBody: Record<string, unknown>,
   statusCode: number,
+  correlation?: CorrelationContext,
 ): Promise<ServiceResponse<void>> {
+  const update: Record<string, unknown> = {
+    status: 'completed',
+    response_body: redactForStorage(responseBody),
+    status_code: statusCode,
+  };
+
+  if (correlation) {
+    const ctx = normaliseCorrelation(correlation);
+    if (ctx.correlation_id !== null) update.correlation_id = ctx.correlation_id;
+    if (ctx.booking_id !== null) update.booking_id = ctx.booking_id;
+    if (ctx.operation_id !== null) update.operation_id = ctx.operation_id;
+  }
+
   const { error } = await supabase
     .from('idempotency_keys')
-    .update({ status: 'completed', response_body: responseBody, status_code: statusCode })
+    .update(update)
     .eq('id', id);
 
   if (error) {
@@ -192,6 +292,7 @@ export async function releaseKey(id: string): Promise<void> {
  * @param requestHash - SHA-256 hex digest of the canonical request body.
  * @param responseBody - The JSON-serialisable response body that was sent.
  * @param statusCode  - The HTTP status code that was sent (e.g. 201).
+ * @param correlation - Nonsecret correlation identifiers to persist.
  */
 export async function store(
   userId: string,
@@ -199,16 +300,22 @@ export async function store(
   requestHash: string,
   responseBody: Record<string, unknown>,
   statusCode: number,
+  correlation?: CorrelationContext,
 ): Promise<ServiceResponse<IdempotencyRecord>> {
+  const ctx = normaliseCorrelation(correlation);
+
   const { data, error } = await supabase
     .from('idempotency_keys')
     .insert({
       key,
       user_id: userId,
       request_hash: requestHash,
-      response_body: responseBody,
+      response_body: redactForStorage(responseBody),
       status_code: statusCode,
       status: 'completed',
+      correlation_id: ctx.correlation_id,
+      booking_id: ctx.booking_id,
+      operation_id: ctx.operation_id,
     })
     .select()
     .single();
@@ -218,6 +325,44 @@ export async function store(
   }
 
   return { success: true, data: data as IdempotencyRecord };
+}
+
+/**
+ * Restore the correlation context for a previously stored record.
+ *
+ * Workers and retry jobs call this to reattach the originating request,
+ * booking and operation identifiers after a restart, without needing access to
+ * the original request (and therefore without touching auth headers or
+ * payment payloads).
+ *
+ * @returns `{ success: true, data: CorrelationContext }` when the record
+ *          exists, or `{ success: false, error }` otherwise.
+ */
+export async function getCorrelation(
+  id: string,
+): Promise<ServiceResponse<CorrelationContext>> {
+  const { data, error } = await supabase
+    .from('idempotency_keys')
+    .select('correlation_id, booking_id, operation_id')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) {
+    return { success: false, error: `Idempotency correlation lookup failed: ${error.message}` };
+  }
+  if (!data) {
+    return { success: false, error: 'Idempotency record not found' };
+  }
+
+  const row = data as Pick<IdempotencyRecord, 'correlation_id' | 'booking_id' | 'operation_id'>;
+  return {
+    success: true,
+    data: {
+      correlation_id: row.correlation_id ?? null,
+      booking_id: row.booking_id ?? null,
+      operation_id: row.operation_id ?? null,
+    },
+  };
 }
 
 /**
