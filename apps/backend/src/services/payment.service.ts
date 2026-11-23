@@ -99,6 +99,10 @@ export interface Payment {
   /** Supported currency token — currently only USDC. */
   currency: 'USDC';
   stellar_tx_hash: string | null;
+  /** Stellar network the transaction was signed/submitted on (e.g. 'testnet'). */
+  network: string | null;
+  /** Stellar account (public key) that signed the transaction. */
+  source_account: string | null;
   /** TrustlessWork escrow contract ID, if applicable. */
   escrow_id: string | null;
   /** Quote reference hash signed at intent creation (for amount integrity). */
@@ -136,6 +140,10 @@ export interface CreatePaymentIntentParams {
   /** Quote hash produced by payment.utils.ts#hashQuote() and verified server-side. */
   quoteHash?: string;
   escrowId?: string;
+  /** Stellar network the intent is bound to (validated before signing/submission). */
+  network?: string;
+  /** Stellar account expected to sign the transaction. */
+  sourceAccount?: string;
   metadata?: Record<string, unknown>;
   /**
    * Conversion details captured at quote time. When provided, the original
@@ -769,6 +777,99 @@ export async function createPaymentIntent(
 }
 
 /**
+ * Record the network and signing account on an existing payment intent.
+ * Called before signing so a wrong-network or wrong-account transaction can
+ * never be attached to the booking.
+ */
+export async function bindPaymentNetwork(
+  paymentId: string,
+  network: string,
+  sourceAccount: string,
+): Promise<ServiceResponse<Payment>> {
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    return { success: false, error: 'Payment not found' };
+  }
+
+  // Once a network is bound it must not silently change (account switching /
+  // network switching would invalidate the signed transaction).
+  if (payment.network && payment.network !== network) {
+    return {
+      success: false,
+      error: `Network mismatch: payment bound to ${payment.network}, got ${network}`,
+    };
+  }
+  if (payment.source_account && payment.source_account !== sourceAccount) {
+    return {
+      success: false,
+      error: `Account mismatch: payment bound to ${payment.source_account}, got ${sourceAccount}`,
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('payments')
+    .update({ network, source_account: sourceAccount, updated_at: new Date().toISOString() })
+    .eq('id', paymentId)
+    .select()
+    .single();
+
+  if (error || !data) {
+    return { success: false, error: `Failed to bind payment network: ${error?.message ?? 'unknown error'}` };
+  }
+
+  return { success: true, data: rowToPayment(data) };
+}
+
+/**
+ * Record a submitted transaction hash. Idempotent: if a hash is already
+ * recorded, the existing hash is returned and no duplicate broadcast is
+ * implied. Callers must re-poll the existing hash rather than re-submitting.
+ */
+export async function recordSubmittedTx(
+  paymentId: string,
+  txHash: string,
+  network: string,
+  sourceAccount: string,
+): Promise<ServiceResponse<{ payment: Payment; duplicate: boolean }>> {
+  const payment = await getPaymentStatus(paymentId);
+  if (!payment) {
+    return { success: false, error: 'Payment not found' };
+  }
+
+  if (payment.network && payment.network !== network) {
+    return { success: false, error: `Network mismatch: payment bound to ${payment.network}, got ${network}` };
+  }
+  if (payment.source_account && payment.source_account !== sourceAccount) {
+    return { success: false, error: `Account mismatch: payment bound to ${payment.source_account}, got ${sourceAccount}` };
+  }
+
+  // Duplicate submission: a different tx hash already recorded → do not
+  // overwrite; surface the existing hash so the caller re-polls it.
+  if (payment.stellar_tx_hash && payment.stellar_tx_hash !== txHash) {
+    return {
+      success: true,
+      data: { payment, duplicate: true },
+    };
+  }
+
+  const result = await transitionPaymentStatus(
+    paymentId,
+    'submitted',
+    { txHash, network, sourceAccount, _source: 'submit' },
+    txHash,
+  );
+
+  if (!result.success || !result.data) {
+    return { success: false, error: result.error ?? 'Failed to record submitted tx' };
+  }
+
+  return {
+    success: true,
+    data: { payment: result.data.payment, duplicate: result.data.replayed },
+  };
+}
+
+/**
  * Transition a payment to a new status with full idempotency and conflict
  * quarantine.
  *
@@ -1002,6 +1103,8 @@ function rowToPayment(row: any): Payment {
     amount_stroops:   BigInt(row.amount_stroops ?? row.amount_usdc ?? 0),
     currency:         row.currency ?? 'USDC',
     stellar_tx_hash:  row.stellar_tx_hash ?? null,
+    network:          row.network ?? null,
+    source_account:   row.source_account ?? null,
     escrow_id:        row.escrow_id ?? null,
     quote_hash:       row.quote_hash ?? null,
     original_amount_minor:

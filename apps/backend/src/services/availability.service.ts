@@ -263,7 +263,11 @@ export async function checkDateRangeAvailability(
     };
   }
 
-  // Check booking conflicts (active bookings, not cancelled)
+  // Check booking conflicts. Uses the canonical reserving status set (pending
+  // payment holds, confirmed, etc.) and half-open [check_in, check_out)
+  // semantics: a stay ending on checkInDay or starting on checkOutDay does not
+  // overlap, so adjacent bookings are allowed. This is only a preflight check;
+  // the authoritative guarantee is enforced atomically at booking creation.
   let conflictQuery = supabase
     .from('bookings')
     .select('id')
@@ -288,7 +292,9 @@ export async function checkDateRangeAvailability(
         check_out: checkOut,
         nights,
         is_available: false,
-        unavailable_reason: 'Property already booked for these dates',
+        // Stable, non-disclosing reason: never reveals the other tenant's
+        // identity or booking details.
+        unavailable_reason: 'Dates are no longer available',
         settings,
       },
     };

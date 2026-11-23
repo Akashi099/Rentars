@@ -71,11 +71,6 @@ function isExclusionViolation(error: unknown): boolean {
 }
 
 /**
- * Standard, tenant-safe 409 response for a date-overlap conflict. Never
- * includes the identity or details of the other booking/tenant holding the
- * conflicting dates — only that the requested interval is no longer free.
- */
-/**
  * True when a 'pending' modification proposal's TTL has passed but the
  * cleanup sweep hasn't yet flipped its status to 'expired'. Callers must
  * treat this the same as an already-expired proposal: a host cannot approve
@@ -90,6 +85,11 @@ function isLazilyExpiredModification(modification: BookingModification): boolean
   );
 }
 
+/**
+ * Standard, tenant-safe 409 response for a date-overlap conflict. Never
+ * includes the identity or details of the other booking/tenant holding the
+ * conflicting dates — only that the requested interval is no longer free.
+ */
 function dateConflictResponse(): ServiceResponse<never> {
   return {
     success: false,
@@ -98,6 +98,23 @@ function dateConflictResponse(): ServiceResponse<never> {
     statusCode: 409,
     code: 'BOOKING_OVERLAP',
   } as ServiceResponse<never>;
+}
+
+/**
+ * Booking states that reserve inventory (block the property's dates).
+ *
+ * This is the single source of truth mirrored by the DB exclusion constraint
+ * `bookings_no_date_overlap` (migration 00062): a row in one of these states
+ * holds its [check_in, check_out) interval against every other active row for
+ * the same property. Terminal states (Cancelled, Expired, Completed) release
+ * the dates. `Pending` is included because a pending-payment hold must block
+ * competing tenants until it expires or is cancelled.
+ */
+export const RESERVING_BOOKING_STATUSES = ['Pending', 'Confirmed', 'Disputed'] as const;
+
+/** True when a booking status holds inventory. */
+export function isReservingStatus(status: string | null | undefined): boolean {
+  return !!status && (RESERVING_BOOKING_STATUSES as readonly string[]).includes(status);
 }
 
 // ─── State machine ────────────────────────────────────────────────────────────
@@ -319,7 +336,16 @@ export class BookingService {
       .select()
       .maybeSingle();
 
-    if (error) return { success: false, error: error.message };
+    if (error) {
+      // A status flip that re-enters a reserving state (e.g. a late-confirmation
+      // Pending → Confirmed) can trip the exclusion constraint if another
+      // booking claimed the dates after this hold was (incorrectly) considered
+      // released. Surface the same tenant-safe 409 rather than the raw error.
+      if (isExclusionViolation(error)) {
+        return dateConflictResponse();
+      }
+      return { success: false, error: error.message };
+    }
 
     // Durable audit trail: await the history write (rather than fire-and-forget)
     // so a crash between these two statements is the only way to lose a history
@@ -428,6 +454,12 @@ export class BookingService {
           );
         }
 
+        // Payment state is resolved (unpaid) before this write: the escrow
+        // cancel above has been attempted and the status flip to Expired —
+        // a non-reserving terminal state — is what releases the dates. If the
+        // escrow cancel failed we still expire the hold (the payment provider
+        // will not settle an unfunded escrow), but the transition is atomic and
+        // conditioned on the booking still being Pending.
         const result = await this.transitionStatus(
           b.id,
           'Pending',
@@ -893,12 +925,25 @@ export class BookingService {
     );
 
     if (reservationError) {
+      // The atomic RPC takes a per-property advisory lock and inserts under the
+      // exclusion constraint, so a competing request for overlapping dates
+      // either sees BOOKING_CONFLICT or trips the constraint (23P01). Both map
+      // to the same stable, tenant-safe 409 — never the raw DB error.
+      if (isExclusionViolation(reservationError)) {
+        return dateConflictResponse();
+      }
       const msg = reservationError.message ?? '';
       if (msg.includes('BOOKING_CONFLICT')) {
-        return { success: false, error: 'Booking conflict: the requested dates overlap with an existing booking', conflict: true };
+        return dateConflictResponse();
       }
       if (msg.includes('BOOKING_BLOCKED')) {
-        return { success: false, error: 'These dates are blocked by the host', conflict: true };
+        return {
+          success: false,
+          error: 'These dates are blocked by the host',
+          conflict: true,
+          statusCode: 409,
+          code: 'BOOKING_BLOCKED',
+        };
       }
       return { success: false, error: reservationError.message };
     }
@@ -1355,7 +1400,13 @@ export class BookingService {
     );
 
     if (!transitionResult.success) return transitionResult;
-    const updatedData = transitionResult.data!
+    const updatedData = transitionResult.data!;
+
+    // The Cancelled status is terminal and not in RESERVING_BOOKING_STATUSES,
+    // so the exclusion constraint no longer covers this row: the dates are
+    // released by the same UPDATE that flipped the status. This only happens
+    // after the escrow/refund state above has been resolved, so a hold is never
+    // freed while its payment outcome is still in flight.
 
     // 7. Notify both parties
     const notificationData = {
@@ -2342,12 +2393,30 @@ export class BookingService {
       bookingPatch.guest_count = modification.requested_guest_count;
     }
 
-    const { data: updatedBooking, error: updateError } = await supabase
-      .from('bookings')
-      .update(bookingPatch)
-      .eq('id', bookingId)
-      .select()
-      .single();
+    // Apply the date change and mark the proposal accepted in one transaction.
+    // The RPC re-checks availability under a per-property advisory lock and
+    // writes under the exclusion constraint, so a competing booking or
+    // modification that claimed the interval after the preflight read above
+    // cannot slip through. On conflict the whole transaction rolls back and
+    // the proposal stays pending.
+    const { data: updatedBooking, error: updateError } = await supabase.rpc(
+      'accept_booking_modification_atomic',
+      {
+        p_booking_id: bookingId,
+        p_modification_id: modificationId,
+        p_check_in: modification.requested_start,
+        p_check_out: modification.requested_end,
+        p_total_price: newTotalPrice,
+        p_guest_count:
+          modification.requested_guest_count !== undefined &&
+          modification.requested_guest_count !== null
+            ? modification.requested_guest_count
+            : null,
+        p_new_total_price: newTotalPrice,
+        p_price_delta: priceDelta,
+        p_requires_additional_payment: requiresAdditionalPayment,
+      },
+    );
 
     if (updateError || !updatedBooking) {
       // The exclusion constraint is the authoritative, transactional guard against
@@ -2359,20 +2428,21 @@ export class BookingService {
       if (isExclusionViolation(updateError)) {
         return dateConflictResponse();
       }
+      const msg = updateError?.message ?? '';
+      if (msg.includes('BOOKING_CONFLICT')) {
+        return dateConflictResponse();
+      }
+      if (msg.includes('MODIFICATION_NOT_PENDING')) {
+        return {
+          success: false,
+          error: 'This modification proposal is no longer pending',
+          conflict: true,
+          statusCode: 409,
+          code: 'MODIFICATION_NOT_PENDING',
+        };
+      }
       return { success: false, error: updateError?.message ?? 'Failed to update booking dates' };
     }
-
-    // Persist repricing outcome in the modification record.
-    await supabase
-      .from('booking_modifications')
-      .update({
-        status: 'accepted',
-        new_total_price: newTotalPrice,
-        price_delta: priceDelta,
-        requires_additional_payment: requiresAdditionalPayment,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', modificationId);
 
     if (booking.tenant_id) {
       createNotification(booking.tenant_id, 'booking_modification_accepted', {
@@ -2459,15 +2529,27 @@ export class BookingService {
       };
     }
 
+    // Condition the decline on the proposal still being pending so a decline
+    // racing an accept (or the expiry sweep) cannot clobber the winner.
     const { data: updatedModification, error: updateError } = await supabase
       .from('booking_modifications')
       .update({ status: 'declined', updated_at: new Date().toISOString() })
       .eq('id', modificationId)
+      .eq('status', 'pending')
       .select()
-      .single();
+      .maybeSingle();
 
-    if (updateError || !updatedModification) {
-      return { success: false, error: updateError?.message ?? 'Failed to decline modification' };
+    if (updateError) {
+      return { success: false, error: updateError.message };
+    }
+    if (!updatedModification) {
+      return {
+        success: false,
+        error: 'This modification proposal is no longer pending',
+        conflict: true,
+        statusCode: 409,
+        code: 'MODIFICATION_NOT_PENDING',
+      };
     }
 
     if (booking.tenant_id) {

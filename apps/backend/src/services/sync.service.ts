@@ -14,6 +14,7 @@ import {
   BOOKING_CONTRACT_ID,
   NETWORK_PASSPHRASE,
   PROPERTY_LISTING_CONTRACT_ID,
+  STELLAR_NETWORK,
   STELLAR_RPC_URL,
 } from '@/blockchain/config.js';
 import { randomUUID } from 'node:crypto';
@@ -235,6 +236,13 @@ const PERMANENT_ERROR_PATTERNS = [
 
 type ErrorCategory = 'transient' | 'permanent' | 'ambiguous';
 
+/**
+ * Classify an error message into one of three categories:
+ *  - `transient`: retryable (network/RPC/timeout issues)
+ *  - `permanent`: a positively-identified terminal on-chain rejection
+ *  - `ambiguous`: we cannot tell whether retrying is safe — route to manual
+ *    review rather than blindly retrying or declaring final failure.
+ */
 export function classifyError(message: string): ErrorCategory {
   if (TRANSIENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'transient';
   if (PERMANENT_ERROR_PATTERNS.some((p) => p.test(message))) return 'permanent';
@@ -330,6 +338,9 @@ async function writeBlockchainLog(entry: {
 }): Promise<void> {
   const { error } = await supabase.from('blockchain_logs').insert({
     ...entry,
+    // Tie every log entry to the network it was observed on so state can never
+    // be confused across mainnet/testnet.
+    network: STELLAR_NETWORK,
     created_at: new Date().toISOString(),
   });
   if (error) throw new Error(`Failed to persist blockchain log: ${error.message}`);
@@ -399,7 +410,7 @@ async function notifyEscrowFailure(
   const notificationPayload: Record<string, unknown> = {
     bookingId,
     // Privacy-safe: no internal error details, no wallet addresses
-    message: 'Your booking escrow could not be confirmed after multiple attempts. Our support team has been alerted.',
+    message: messages.tenant,
     supportLink: '/support',
     attempt,
     ...(ctx ? { correlationId: ctx.correlation_id, operationId: ctx.operation_id } : {}),
@@ -445,6 +456,73 @@ async function notifyEscrowFailure(
   if (error) throw new Error(`Failed to mark booking as notified: ${error.message}`);
 }
 
+/**
+ * Notify tenant and host of a non-failure escrow outcome (recovery or manual
+ * review). Idempotent per outcome via the notification outbox dedup key.
+ */
+async function notifyEscrowOutcome(
+  bookingId: string,
+  outcome: EscrowOutcome,
+  attempt: number,
+): Promise<void> {
+  if (outcome === 'failed') {
+    await notifyEscrowFailure(bookingId, attempt);
+    return;
+  }
+
+  const tenantId = await getTenantId(bookingId);
+  const hostId = await getHostId(bookingId);
+
+  const message = outcome === 'recovered' ? messages.recovered : messages.manualReview;
+  const supportLink = outcome === 'recovered' ? '/bookings' : '/support';
+
+  const deliveries: Array<Promise<ServiceResponse<void>>> = [];
+  if (tenantId) {
+    deliveries.push(
+      enqueueNotificationOutbox(tenantId, 'system_alert', {
+        bookingId,
+        message,
+        supportLink,
+        attempt,
+        audience: 'tenant',
+      }, `escrow-${outcome}:${bookingId}:tenant`),
+    );
+  }
+  if (hostId) {
+    deliveries.push(
+      enqueueNotificationOutbox(hostId, 'system_alert', {
+        bookingId,
+        message,
+        supportLink: outcome === 'recovered' ? '/host/bookings' : '/host/support',
+        attempt,
+        audience: 'host',
+      }, `escrow-${outcome}:${bookingId}:host`),
+    );
+  }
+
+  if (deliveries.length === 0) return;
+
+  const results = await Promise.all(deliveries);
+  const failed = results.find((result) => !result.success);
+  if (failed) throw new Error(failed.error ?? `Failed to enqueue escrow ${outcome} notification`);
+}
+
+/**
+ * Schedule the next bounded reconciliation attempt for a booking. Uses
+ * exponential backoff capped at MAX_RECONCILE_BACKOFF_MS. When the attempt
+ * ceiling is reached the booking is handed to manual review instead of being
+ * retried forever.
+ */
+async function scheduleNextAttempt(bookingId: string, attempt: number): Promise<void> {
+  if (attempt >= MAX_RECONCILE_ATTEMPTS) return;
+  const nextRetryAt = new Date(Date.now() + getReconciliationBackoffMs(attempt)).toISOString();
+  const { error } = await supabase
+    .from('bookings')
+    .update({ next_reconcile_at: nextRetryAt })
+    .eq('id', bookingId);
+  if (error) throw new Error(`Failed to schedule next reconciliation attempt: ${error.message}`);
+}
+
 // ─── Core reconcile function ──────────────────────────────────────────────────
 
 /**
@@ -480,6 +558,7 @@ async function reconcilePendingEscrow(
   });
 
   const currentAttempt = (booking.reconcile_attempts ?? 0) + 1;
+  const wasFailing = currentAttempt > 1;
   const attemptId = randomUUID();
   const { error: attemptInsertError } = await supabase
     .from('escrow_reconciliation_attempts')
@@ -488,6 +567,10 @@ async function reconcilePendingEscrow(
       booking_id: booking.id,
       attempt_number: currentAttempt,
       provider_event_id: booking.escrow_hash,
+      // Tie the attempt to the network and tx hash so state is bound to the
+      // correct booking, network, and account.
+      network: STELLAR_NETWORK,
+      tx_hash: booking.escrow_hash,
       status: 'pending',
       correlation_id: ctx.correlation_id,
       operation_id: ctx.operation_id,
@@ -574,7 +657,10 @@ async function reconcilePendingEscrow(
           .update({ status: 'manual_review', next_retry_at: null })
           .eq('id', attemptId);
         if (attemptError) throw new Error(`Failed to mark pending attempt for manual review: ${attemptError.message}`);
-        await quarantineBooking(
+        // A perpetually-pending tx is ambiguous, not a confirmed failure —
+        // hand it to the reconciliation/manual-review path rather than
+        // declaring final failure or encouraging blind retries.
+        await routeToManualReview(
           booking.id,
           booking.escrow_hash,
           currentAttempt,
@@ -637,7 +723,7 @@ async function reconcilePendingEscrow(
         })
         .eq('id', attemptId);
       if (attemptError) throw new Error(`Failed to record terminal escrow failure: ${attemptError.message}`);
-      await quarantineBooking(
+      await transitionBookingState(
         booking.id,
         booking.escrow_hash,
         currentAttempt,
@@ -928,7 +1014,7 @@ export async function reconcileAllPendingEscrows(): Promise<ServiceResponse<{ re
       .eq('status', 'pending')
       .not('escrow_hash', 'is', null)
       .lt('reconcile_attempts', MAX_RECONCILE_ATTEMPTS)
-      .or(`next_reconcile_at.is.null,next_reconcile_at.lte.${new Date().toISOString()}`);
+      .or(`next_reconcile_at.is.null,next_reconcile_at.lte.${nowIso}`);
 
     if (error) {
       return { success: false, error: error.message };

@@ -25,6 +25,18 @@
  *
  * Environment:
  *   The script reads from .env.test by default in NODE_ENV=test, or .env otherwise.
+ *
+ * Performance / staging dataset:
+ *   Set SEED_PROFILE=perf (or pass --profile=perf) to additionally generate a
+ *   deterministic, reproducible staging dataset sized for k6 performance runs:
+ *     - SEED_PERF_PROPERTIES (default 500) properties spread across several
+ *       geospatial clusters with varied prices, cities, amenities and statuses
+ *     - SEED_PERF_BOOKINGS (default 1000) bookings, with a configurable share
+ *       (SEED_PERF_CONTENTION_SHARE, default 0.2) concentrated on a small set of
+ *       "hot" properties to exercise high-contention booking paths
+ *   All generated rows use stable, derived UUIDs so re-runs are idempotent and
+ *   results are comparable across environments. The perf profile refuses to run
+ *   against production targets (see guard below).
  */
 
 import { createClient } from '@supabase/supabase-js';
@@ -59,6 +71,66 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   );
   process.exit(1);
 }
+
+// ─── Seed profile configuration ──────────────────────────────────────────────
+
+const cliArgs = process.argv.slice(2);
+const cliProfileArg = cliArgs.find((a) => a.startsWith('--profile='));
+const SEED_PROFILE = (cliProfileArg?.split('=')[1] ?? process.env.SEED_PROFILE ?? 'dev').toLowerCase();
+const IS_PERF_PROFILE = SEED_PROFILE === 'perf' || SEED_PROFILE === 'performance';
+
+function intFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const PERF_CONFIG = {
+  properties: intFromEnv('SEED_PERF_PROPERTIES', 500),
+  bookings: intFromEnv('SEED_PERF_BOOKINGS', 1000),
+  contentionShare: Math.min(
+    1,
+    Math.max(0, Number.parseFloat(process.env.SEED_PERF_CONTENTION_SHARE ?? '0.2') || 0.2),
+  ),
+  // Number of "hot" properties that receive the contended bookings.
+  hotProperties: Math.max(1, intFromEnv('SEED_PERF_HOT_PROPERTIES', 5)),
+};
+
+/**
+ * Guard: the perf profile must never write to a production target.
+ * Rejects when NODE_ENV=production, when the URL looks like a hosted
+ * production project, or when the explicit opt-in flag is missing.
+ */
+function assertNonProductionTarget() {
+  if (!IS_PERF_PROFILE) return;
+
+  const allowOverride = process.env.SEED_PERF_ALLOW_NON_LOCAL === 'true';
+  const url = (SUPABASE_URL ?? '').toLowerCase();
+  const looksLocal =
+    url.includes('localhost') ||
+    url.includes('127.0.0.1') ||
+    url.includes('0.0.0.0') ||
+    url.includes('host.docker.internal') ||
+    url.includes('supabase_kong') ||
+    url.includes(':5432');
+
+  if (process.env.NODE_ENV === 'production') {
+    console.error('❌  Refusing to run the perf seed profile with NODE_ENV=production.');
+    process.exit(1);
+  }
+
+  if (!looksLocal && !allowOverride) {
+    console.error(
+      '❌  Refusing to run the perf seed profile against a non-local Supabase target.\n' +
+        `    SUPABASE_URL=${SUPABASE_URL}\n` +
+        '    Set SEED_PERF_ALLOW_NON_LOCAL=true only for an isolated staging project.',
+    );
+    process.exit(1);
+  }
+}
+
+assertNonProductionTarget();
 
 const db = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -100,6 +172,36 @@ const IDS = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Deterministic pseudo-random generator (mulberry32) so the perf dataset is
+ * byte-for-byte reproducible across environments and runs.
+ */
+function createRng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Build a stable, valid UUID (v4-shaped) from a namespace + index. */
+function stableUuid(namespace: string, index: number): string {
+  const ns = namespace
+    .replace(/[^a-z0-9]/gi, '')
+    .toLowerCase()
+    .padEnd(8, '0')
+    .slice(0, 8);
+  const idx = index.toString(16).padStart(12, '0');
+  return `${ns}-0000-4000-8000-${idx}`;
+}
+
+function pick<T>(rng: () => number, arr: readonly T[]): T {
+  return arr[Math.floor(rng() * arr.length)];
+}
 
 function ok(label: string) {
   console.log(`  ✅  ${label}`);
@@ -476,6 +578,188 @@ async function seedNotifications() {
   );
 }
 
+// ─── Performance / staging dataset ───────────────────────────────────────────
+
+// Geospatial clusters used to spread perf properties across regions so
+// geospatial search filters (bounding box / radius) are representative.
+const GEO_CLUSTERS = [
+  { city: 'Miami', country: 'US', lat: 25.7617, lng: -80.1918 },
+  { city: 'New York', country: 'US', lat: 40.7484, lng: -74.0045 },
+  { city: 'Aspen', country: 'US', lat: 39.1911, lng: -106.8175 },
+  { city: 'Charlottesville', country: 'US', lat: 38.0293, lng: -78.4767 },
+  { city: 'Lisbon', country: 'PT', lat: 38.7223, lng: -9.1393 },
+  { city: 'Barcelona', country: 'ES', lat: 41.3874, lng: 2.1686 },
+  { city: 'Berlin', country: 'DE', lat: 52.52, lng: 13.405 },
+  { city: 'Tokyo', country: 'JP', lat: 35.6762, lng: 139.6503 },
+] as const;
+
+const PERF_AMENITIES = [
+  'wifi',
+  'air_conditioning',
+  'kitchen',
+  'parking',
+  'pool',
+  'fireplace',
+  'hot_tub',
+  'gym',
+  'washer_dryer',
+  'garden',
+  'bbq',
+  'elevator',
+] as const;
+
+const PERF_STATUSES = ['available', 'available', 'available', 'unavailable', 'maintenance'] as const;
+
+function perfPropertyId(i: number): string {
+  return stableUuid('beef', i);
+}
+
+function perfBookingId(i: number): string {
+  return stableUuid('b00c', i);
+}
+
+function perfAvailabilityId(i: number): string {
+  return stableUuid('a711', i);
+}
+
+function buildPerfProperties() {
+  const rng = createRng(0x5eed_0001);
+  const rows: Record<string, unknown>[] = [];
+
+  for (let i = 0; i < PERF_CONFIG.properties; i++) {
+    const cluster = GEO_CLUSTERS[i % GEO_CLUSTERS.length];
+    // Jitter within ~0.5 degrees so radius/bbox filters return varied subsets.
+    const lat = Number((cluster.lat + (rng() - 0.5)).toFixed(6));
+    const lng = Number((cluster.lng + (rng() - 0.5)).toFixed(6));
+    const price = 50 + Math.floor(rng() * 450);
+    const bedrooms = 1 + Math.floor(rng() * 5);
+    const bathrooms = 1 + Math.floor(rng() * 3);
+    const maxGuests = bedrooms * 2;
+    const amenityCount = 2 + Math.floor(rng() * 5);
+    const amenities = Array.from(
+      new Set(Array.from({ length: amenityCount }, () => pick(rng, PERF_AMENITIES))),
+    );
+
+    rows.push({
+      id: perfPropertyId(i),
+      owner_id: IDS.users.host,
+      title: `Perf Property ${i} — ${cluster.city}`,
+      description: `Deterministic perf dataset property #${i} in ${cluster.city}. Used for k6 search/booking benchmarks.`,
+      price_per_night: price,
+      status: pick(rng, PERF_STATUSES),
+      city: cluster.city,
+      country: cluster.country,
+      address: `${100 + i} Perf Street, ${cluster.city}`,
+      latitude: lat,
+      longitude: lng,
+      bedrooms,
+      bathrooms,
+      max_guests: maxGuests,
+      amenities,
+      images: [`https://images.unsplash.com/photo-1502672260266-1c1ef2d93688?w=800`],
+      pets_allowed: rng() > 0.5,
+      smoking_allowed: false,
+      events_allowed: rng() > 0.8,
+      quiet_hours_start: '22:00',
+      quiet_hours_end: '08:00',
+      additional_rules: 'Perf dataset row — not a real listing.',
+    });
+  }
+
+  return rows;
+}
+
+function buildPerfAvailability() {
+  const today = new Date();
+  const sixMonths = new Date(today);
+  sixMonths.setMonth(sixMonths.getMonth() + 6);
+  const fmt = (d: Date) => d.toISOString().split('T')[0];
+
+  return Array.from({ length: PERF_CONFIG.properties }, (_, i) => ({
+    id: perfAvailabilityId(i),
+    property_id: perfPropertyId(i),
+    start_date: fmt(today),
+    end_date: fmt(sixMonths),
+    is_available: true,
+    reason: null,
+  }));
+}
+
+function buildPerfBookings() {
+  const rng = createRng(0x5eed_0002);
+  const tenants = [IDS.users.tenantA, IDS.users.tenantB];
+  const rows: Record<string, unknown>[] = [];
+
+  const contendedCount = Math.floor(PERF_CONFIG.bookings * PERF_CONFIG.contentionShare);
+
+  for (let i = 0; i < PERF_CONFIG.bookings; i++) {
+    // First `contendedCount` bookings target a small set of hot properties to
+    // create realistic high-contention booking scenarios.
+    const propertyIndex =
+      i < contendedCount
+        ? i % PERF_CONFIG.hotProperties
+        : Math.floor(rng() * Math.max(1, PERF_CONFIG.properties));
+
+    const checkInOffset = Math.floor(rng() * 180);
+    const nights = 1 + Math.floor(rng() * 7);
+    const checkIn = new Date();
+    checkIn.setDate(checkIn.getDate() + checkInOffset);
+    const checkOut = new Date(checkIn);
+    checkOut.setDate(checkOut.getDate() + nights);
+    const fmt = (d: Date) => d.toISOString().split('T')[0];
+
+    rows.push({
+      id: perfBookingId(i),
+      property_id: perfPropertyId(propertyIndex),
+      tenant_id: tenants[i % tenants.length],
+      check_in: fmt(checkIn),
+      check_out: fmt(checkOut),
+      total_price: nights * (50 + Math.floor(rng() * 450)),
+      guest_count: 1 + Math.floor(rng() * 4),
+      status: i < contendedCount ? 'Pending' : pick(rng, ['Confirmed', 'Pending', 'Cancelled'] as const),
+      rules_acknowledged_at: new Date().toISOString(),
+    });
+  }
+
+  return rows;
+}
+
+async function seedPerfDataset() {
+  console.log('\n⚡  Seeding performance dataset (profile=perf)…');
+  console.log(
+    `    properties=${PERF_CONFIG.properties} bookings=${PERF_CONFIG.bookings} ` +
+      `contention_share=${PERF_CONFIG.contentionShare} hot_properties=${PERF_CONFIG.hotProperties}`,
+  );
+
+  const properties = buildPerfProperties();
+  const availability = buildPerfAvailability();
+  const bookings = buildPerfBookings();
+
+  // Chunk large upserts to keep request payloads reasonable.
+  const CHUNK = 500;
+  for (let i = 0; i < properties.length; i += CHUNK) {
+    await upsert(
+      'properties',
+      properties.slice(i, i + CHUNK),
+      `perf properties (${i}–${Math.min(i + CHUNK, properties.length)})`,
+    );
+  }
+  for (let i = 0; i < availability.length; i += CHUNK) {
+    await upsert(
+      'availability_ranges',
+      availability.slice(i, i + CHUNK),
+      `perf availability_ranges (${i}–${Math.min(i + CHUNK, availability.length)})`,
+    );
+  }
+  for (let i = 0; i < bookings.length; i += CHUNK) {
+    await upsert(
+      'bookings',
+      bookings.slice(i, i + CHUNK),
+      `perf bookings (${i}–${Math.min(i + CHUNK, bookings.length)})`,
+    );
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -493,7 +777,19 @@ async function main() {
   await seedWishlists();
   await seedNotifications();
 
+  if (IS_PERF_PROFILE) {
+    await seedPerfDataset();
+  }
+
   console.log('\n🎉  Seed complete!\n');
+  if (IS_PERF_PROFILE) {
+    console.log('    Performance dataset seeded (profile=perf).');
+    console.log(
+      `      properties=${PERF_CONFIG.properties} bookings=${PERF_CONFIG.bookings} ` +
+        `contention_share=${PERF_CONFIG.contentionShare}`,
+    );
+    console.log('');
+  }
   console.log('    Local credentials:');
   console.log('      Host:      seed-host@rentars-dev.local     / SeedHost@Dev2024!');
   console.log('      Tenant A:  seed-tenant-a@rentars-dev.local / SeedTenantA@Dev2024!');

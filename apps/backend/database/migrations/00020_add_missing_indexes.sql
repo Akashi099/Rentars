@@ -63,6 +63,13 @@ CREATE INDEX IF NOT EXISTS idx_bookings_check_out
 CREATE INDEX IF NOT EXISTS idx_bookings_property_dates
   ON bookings (property_id, check_in, check_out);
 
+-- Composite: property + status + dates — supports the high-contention booking
+-- stress scenario (concurrent availability checks on the same property) and
+-- the owner dashboard, letting the planner satisfy status + range predicates
+-- from a single index instead of bitmap-combining two indexes.
+CREATE INDEX IF NOT EXISTS idx_bookings_property_status_dates
+  ON bookings (property_id, status, check_in, check_out);
+
 -- ─── properties ───────────────────────────────────────────────────────────────
 
 -- Filter by status (available/draft/pending) — used heavily in search + featured listings
@@ -78,6 +85,25 @@ CREATE INDEX IF NOT EXISTS idx_properties_owner_status
 -- Price range filtering — used by search endpoint min_price/max_price params
 CREATE INDEX IF NOT EXISTS idx_properties_price_per_night
   ON properties (price_per_night);
+
+-- Full-text search vector — advanced search uses to_tsvector('english', title || description)
+-- matched with @@ plainto_tsquery. Without this GIN index the search budget would
+-- measure a sequential scan over the whole properties table.
+CREATE INDEX IF NOT EXISTS idx_properties_search_vector
+  ON properties
+  USING GIN (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(description, '')));
+
+-- Geospatial search — "near me" / bounding-box queries filter on latitude/longitude.
+-- A GiST index over the point expression lets the planner do an index scan for
+-- radius and bounding-box predicates instead of a full table scan.
+CREATE INDEX IF NOT EXISTS idx_properties_geolocation
+  ON properties
+  USING GIST (point(longitude, latitude));
+
+-- Composite: status + price — the most common advanced-search combination
+-- (available listings within a price range), avoids a bitmap AND of two indexes.
+CREATE INDEX IF NOT EXISTS idx_properties_status_price
+  ON properties (status, price_per_night);
 
 -- ─── reviews ──────────────────────────────────────────────────────────────────
 

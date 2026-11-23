@@ -27,6 +27,8 @@ import {
   confirmTransaction,
   retryTransaction,
   validateSignedPaymentTransaction,
+  getActiveNetwork,
+  getNetworkPassphrase,
 } from '@/services/stellar.service.js';
 import {
   validatePaymentAmount,
@@ -213,8 +215,42 @@ const submitSchema = z.object({
   currency: z.enum(['USDC']),
   quoteHash: z.string().min(1, 'quoteHash is required'),
   expiresAt: z.string().datetime('expiresAt must be an ISO-8601 datetime'),
+  // Network the wallet was configured for when it signed the transaction.
+  // Required so the backend can reject a wallet/backend network mismatch
+  // before the signed XDR is ever broadcast (#881).
+  network: z.enum(['mainnet', 'testnet']),
+  networkPassphrase: z.string().min(1, 'networkPassphrase is required'),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
+
+/**
+ * Verifies that the wallet that produced the signature is on the same Stellar
+ * network as the backend. A mismatch means the transaction is unusable (or
+ * unsafe) on the active network, so it must never be signed off or accepted.
+ */
+function validateNetworkAgreement(
+  walletNetwork: string,
+  walletPassphrase: string,
+): { ok: true } | { ok: false; message: string } {
+  const activeNetwork = getActiveNetwork();
+  const activePassphrase = getNetworkPassphrase();
+
+  if (walletNetwork !== activeNetwork) {
+    return {
+      ok: false,
+      message: `Wallet is configured for ${walletNetwork} but the backend is on ${activeNetwork}. Switch your wallet network and request a new quote.`,
+    };
+  }
+
+  if (walletPassphrase !== activePassphrase) {
+    return {
+      ok: false,
+      message: 'Wallet network passphrase does not match the active Stellar network. Switch your wallet network and request a new quote.',
+    };
+  }
+
+  return { ok: true };
+}
 
 /**
  * POST /api/v1/payments/submit
@@ -227,6 +263,7 @@ const submitSchema = z.object({
  *
  * Error codes:
  *   400 VALIDATION_ERROR          — malformed request body
+ *   422 NETWORK_MISMATCH          — wallet and backend are on different networks
  *   429 PAYMENT_ATTEMPT_LIMIT_EXCEEDED — booking or actor attempt limit hit
  *   503 PAYMENT_CIRCUIT_OPEN      — provider unavailable (circuit tripped)
  *   502 TX_SUBMIT_FAILED          — Stellar submission error
@@ -238,7 +275,17 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     return;
   }
 
-  const { bookingId, signedXdr, amountStroops, currency, quoteHash, expiresAt, metadata } = parsed.data;
+  const {
+    bookingId,
+    signedXdr,
+    amountStroops,
+    currency,
+    quoteHash,
+    expiresAt,
+    network,
+    networkPassphrase,
+    metadata,
+  } = parsed.data;
   const tenantId = req.userId!;
 
   // ── 0. Establish correlation context (#993) ────────────────────────────────
@@ -333,6 +380,8 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
   }
 
   // ── 3. Create payment intent in 'pending' state ─────────────────────────────
+  // Persist the network alongside the intent so the transaction state is
+  // always tied to the correct booking, network, and account (#881).
   const payment = await createPaymentIntent({
     bookingId,
     tenantId,
@@ -423,14 +472,37 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
 
   const breakdown = buildAmountBreakdown(payment.amount_stroops, payment.currency);
 
+  // Distinguish submitted (broadcast, not yet on-ledger) from confirmed
+  // (final ledger inclusion). 'pending'/'submitted' are non-final states.
+  const status = String(payment.status).toLowerCase();
+  const confirmed = status === 'confirmed';
+  const pending = status === 'pending' || status === 'submitted';
+
+  // Safe retry guidance: never encourage a blind re-broadcast while a
+  // transaction may still be in flight or awaiting reconciliation (#881).
+  let retryGuidance: 'none' | 'poll_status' | 'safe_to_retry' | 'do_not_retry_until_reconciled';
+  if (confirmed) {
+    retryGuidance = 'none';
+  } else if (pending) {
+    retryGuidance = 'poll_status';
+  } else if (status === 'failed' && !payment.stellar_tx_hash) {
+    retryGuidance = 'safe_to_retry';
+  } else {
+    retryGuidance = 'do_not_retry_until_reconciled';
+  }
+
   res.json({
     paymentId: payment.id,
     bookingId: payment.booking_id,
     status: payment.status,
+    confirmed,
+    pending,
     txHash: payment.stellar_tx_hash,
+    network: getActiveNetwork(),
     amountStroops: payment.amount_stroops.toString(),
     amountDisplay: breakdown.amountDisplay,
     currency: payment.currency,
+    retryGuidance,
     updatedAt: payment.updated_at,
     correlationId: ctx.correlationId,
     operationId: ctx.operationId,
@@ -606,6 +678,21 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
       return;
     }
     throw err;
+  }
+
+  // ── Guard against blind re-broadcast ───────────────────────────────────────
+  // If a txHash already exists the transaction may still be in flight or
+  // awaiting reconciliation. Re-polling is safe; re-submitting is not.
+  if (payment.stellar_tx_hash && parsed.data.signedXdr) {
+    res.status(409).json({
+      error: {
+        code: 'RETRY_NOT_SAFE',
+        message: 'A transaction has already been broadcast for this payment. It will be reconciled rather than re-submitted.',
+        retryGuidance: 'do_not_retry_until_reconciled',
+        txHash: payment.stellar_tx_hash,
+      },
+    });
+    return;
   }
 
   try {
